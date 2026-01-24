@@ -1,0 +1,107 @@
+#version 450
+
+// GPU Frustum Culling Compute Shader
+// Tests cluster bounding spheres against frustum planes
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// Bounding sphere structure
+struct BoundingSphere {
+    vec3 center;
+    float radius;
+};
+
+// Cluster info
+struct ClusterInfo {
+    uint meshlet_start;
+    uint meshlet_count;
+    float error;
+    uint _padding;
+};
+
+// Input: bounding spheres for each cluster
+layout(std430, binding = 0) readonly buffer BoundsBuffer {
+    BoundingSphere bounds[];
+};
+
+// Input: cluster information
+layout(std430, binding = 1) readonly buffer ClusterBuffer {
+    ClusterInfo clusters[];
+};
+
+// Output: visible cluster indices
+layout(std430, binding = 2) writeonly buffer VisibleBuffer {
+    uint visible_indices[];
+};
+
+// Output: count of visible clusters
+layout(std430, binding = 3) buffer CountBuffer {
+    uint visible_count;
+};
+
+// Push constants with frustum and camera data
+layout(push_constant) uniform PushConstants {
+    vec4 frustum_planes[6];  // (nx, ny, nz, d) - normal pointing inward
+    vec3 camera_pos;
+    float error_threshold;
+    uint cluster_count;
+    float screen_height;
+    float cot_half_fov;
+    uint _padding;
+};
+
+// Test if a sphere is visible in the frustum
+bool is_sphere_visible(BoundingSphere sphere) {
+    for (int i = 0; i < 6; i++) {
+        // Distance from sphere center to plane
+        float dist = dot(frustum_planes[i].xyz, sphere.center) + frustum_planes[i].w;
+
+        // If sphere is completely outside this plane, cull it
+        if (dist < -sphere.radius) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Compute screen-space error for LOD selection
+float compute_screen_error(float world_error, float distance) {
+    if (distance < 0.001) {
+        return 10000.0;  // Very close, always select highest LOD
+    }
+    return (world_error / distance) * cot_half_fov * screen_height * 0.5;
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+
+    // Bounds check
+    if (idx >= cluster_count) {
+        return;
+    }
+
+    BoundingSphere sphere = bounds[idx];
+    ClusterInfo cluster = clusters[idx];
+
+    // Skip if cluster has no meshlets
+    if (cluster.meshlet_count == 0) {
+        return;
+    }
+
+    // Frustum culling
+    if (!is_sphere_visible(sphere)) {
+        return;
+    }
+
+    // LOD selection based on screen-space error
+    float distance = length(sphere.center - camera_pos);
+    float screen_error = compute_screen_error(cluster.error, distance);
+
+    // For now, accept all clusters that pass frustum test
+    // More sophisticated LOD would check parent/child relationships
+    // and only select clusters at the appropriate cut level
+
+    // Atomically add to visible list
+    uint slot = atomicAdd(visible_count, 1);
+    visible_indices[slot] = idx;
+}
