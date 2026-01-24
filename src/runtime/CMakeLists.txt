@@ -11,6 +11,11 @@ add_library(vgeo_runtime STATIC
 target_link_libraries(vgeo_runtime PUBLIC
     vgeo_core
     Vulkan::Vulkan
+    glfw
+)
+
+target_include_directories(vgeo_runtime PUBLIC
+    ${CMAKE_SOURCE_DIR}/src/viewer
 )
 
 target_include_directories(vgeo_runtime PUBLIC
