@@ -27,19 +27,47 @@ VGEO (Virtualized Geometry) is a Nanite-class geometry virtualization system for
 
 ## Revised Architecture
 
-### Core Principle: Layered & Decoupled
+### Core Principle: Hybrid Rendering Pipeline
+
+Two rendering paths from the same virtualized geometry:
+
+```
+                         ┌─────────────────────────────────────┐
+                         │        Blender Addon (Python)       │
+                         │   Export, Sync, UI, Mode Toggle     │
+                         └──────────────┬──────────────────────┘
+                                        │
+                    ┌───────────────────┴───────────────────┐
+                    ▼                                       ▼
+    ┌───────────────────────────────┐     ┌───────────────────────────────┐
+    │   VIEWPORT PATH (Real-time)   │     │   FINAL RENDER PATH (Cycles)  │
+    │                               │     │                               │
+    │  VGEO Runtime (Vulkan)        │     │  LOD Mesh Generator           │
+    │  - GPU cluster culling        │     │  - Camera-based LOD selection │
+    │  - Screen-space LOD           │     │  - Bake visible clusters      │
+    │  - PBR shading + shadows      │     │  - Export optimized mesh      │
+    │  - 60fps with billions tris   │     │  - Feed to Cycles             │
+    │                               │     │  - Faster BVH, less memory    │
+    └───────────────────────────────┘     └───────────────────────────────┘
+                    │                                       │
+                    ▼                                       ▼
+           Fast Interactive Preview              High-Quality Final Render
+           (Eevee+ quality, massive geo)         (Cycles quality, practical scenes)
+```
+
+### Detailed Component Stack
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                    Blender Addon (Python)                   │
-│              Export, Sync, UI, Preview Toggle               │
+│         Export │ Viewport Sync │ Cycles Bridge │ UI         │
 ├─────────────────────────────────────────────────────────────┤
 │                    Integration Layer                        │
 │         Socket/SharedMem ──or── Native C Extension          │
-├─────────────────────────────────────────────────────────────┤
-│                   VGEO Runtime (C++/Vulkan)                 │
-│     Scene Graph │ Cluster Manager │ Renderer │ Streaming    │
-├─────────────────────────────────────────────────────────────┤
+├──────────────────────────────┬──────────────────────────────┤
+│   VGEO Runtime (C++/Vulkan)  │    Cycles LOD Bridge (C++)   │
+│   Culling │ LOD │ Rendering  │    LOD Select │ Mesh Bake    │
+├──────────────────────────────┴──────────────────────────────┤
 │                   VGEO Preprocessing (C++)                  │
 │        Mesh Import │ Meshlet Gen │ Hierarchy │ Export       │
 ├─────────────────────────────────────────────────────────────┤
@@ -47,6 +75,15 @@ VGEO (Virtualized Geometry) is a Nanite-class geometry virtualization system for
 │              .vgeo (clusters) │ .vscene (manifest)          │
 └─────────────────────────────────────────────────────────────┘
 ```
+
+### Why Hybrid?
+
+| Scenario | Path | Result |
+|----------|------|--------|
+| Artist orbiting 500M tri sculpt | Viewport | 60fps, instant feedback |
+| Final beauty render | Cycles | Path-traced quality, but scene actually loads |
+| Animation preview | Viewport | Real-time playback |
+| Final animation frames | Cycles + LOD | Tractable render times |
 
 ### Design Decisions (Locked)
 
@@ -154,7 +191,7 @@ VGEO (Virtualized Geometry) is a Nanite-class geometry virtualization system for
 
 ---
 
-### Phase 4: Blender Integration
+### Phase 4: Blender Integration (Viewport)
 
 **4.1 Addon Foundation**
 - [ ] Blender addon skeleton (Python)
@@ -172,6 +209,29 @@ VGEO (Virtualized Geometry) is a Nanite-class geometry virtualization system for
 - [ ] Stats panel (clusters visible, VRAM)
 
 **Exit Criteria:** User can export mesh, click preview, orbit in synced viewer
+
+---
+
+### Phase 4B: Cycles Integration (Final Render)
+
+**4B.1 LOD Mesh Extraction**
+- [ ] Select appropriate LOD clusters for camera
+- [ ] Merge visible clusters into single mesh
+- [ ] Preserve UVs and material assignments
+
+**4B.2 Cycles Bridge**
+- [ ] Create temporary Blender mesh from LOD data
+- [ ] Replace original high-poly with LOD proxy
+- [ ] Trigger Cycles render
+- [ ] Restore original after render
+
+**4B.3 Smart LOD Selection**
+- [ ] Distance-based LOD (further = coarser)
+- [ ] Screen coverage estimation
+- [ ] Memory budget awareness
+- [ ] Optional: per-object LOD override
+
+**Exit Criteria:** 1B triangle scene renders in Cycles using ~10M triangle LOD proxy
 
 ---
 
@@ -263,6 +323,8 @@ VGEO (Virtualized Geometry) is a Nanite-class geometry virtualization system for
 
 ## Success Metrics
 
+### Viewport (Real-time Renderer)
+
 | Metric | Target | Stretch |
 |--------|--------|---------|
 | Viewport FPS (10M tri) | 60 | 120 |
@@ -272,6 +334,16 @@ VGEO (Virtualized Geometry) is a Nanite-class geometry virtualization system for
 | Max triangles/mesh | 50M | 100M |
 | Export time (1M tri) | <5s | <2s |
 | Streaming latency | <50ms | <20ms |
+
+### Cycles Integration (Final Render)
+
+| Metric | Target | Stretch |
+|--------|--------|---------|
+| LOD mesh generation | <10s | <3s |
+| Memory reduction | 10x | 50x |
+| BVH build speedup | 5x | 10x |
+| Render quality | Indistinguishable at final res | - |
+| Scene load (1B tri → LOD) | <30s | <10s |
 
 ## Dependencies
 
