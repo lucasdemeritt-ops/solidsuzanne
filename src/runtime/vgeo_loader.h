@@ -26,6 +26,7 @@ struct VGeoAsset {
 
     // Hierarchy
     std::vector<ClusterNode> clusters;
+    std::vector<BoundingSphere> cluster_bounds;  // Bounding spheres for clusters (LOD traversal)
 };
 
 // Load .vgeo file from disk

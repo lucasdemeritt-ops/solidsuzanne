@@ -140,7 +140,8 @@ bool write_vgeo(
     chunk_count++;  // INDX
     chunk_count++;  // MSLT
     chunk_count++;  // CLST
-    chunk_count++;  // BVOL
+    chunk_count++;  // BVOL (meshlet bounds)
+    if (!hierarchy.cluster_bounds.empty()) chunk_count++;  // CBND (cluster bounds)
     chunk_count++;  // CONE
 
     // Calculate sizes
@@ -242,13 +243,23 @@ bool write_vgeo(
         chunk_idx++;
     }
 
-    // BVOL chunk - bounding spheres
+    // BVOL chunk - meshlet bounding spheres
     {
         chunk_types[chunk_idx] = ChunkType::BVOL;
         auto& data = chunk_data[chunk_idx];
         uint32_t bounds_count = static_cast<uint32_t>(meshlets.bounds.size());
         data.resize(bounds_count * sizeof(BoundingSphere));
         memcpy(data.data(), meshlets.bounds.data(), data.size());
+        chunk_idx++;
+    }
+
+    // CBND chunk - cluster bounding spheres (for LOD hierarchy traversal)
+    if (!hierarchy.cluster_bounds.empty()) {
+        chunk_types[chunk_idx] = ChunkType::CBND;
+        auto& data = chunk_data[chunk_idx];
+        uint32_t bounds_count = static_cast<uint32_t>(hierarchy.cluster_bounds.size());
+        data.resize(bounds_count * sizeof(BoundingSphere));
+        memcpy(data.data(), hierarchy.cluster_bounds.data(), data.size());
         chunk_idx++;
     }
 
