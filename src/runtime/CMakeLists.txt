@@ -2,7 +2,6 @@
 # Vulkan renderer, culling, streaming
 
 add_library(vgeo_runtime STATIC
-    vgeo_loader.cpp
     cluster_manager.cpp
     culling.cpp
     renderer.cpp
