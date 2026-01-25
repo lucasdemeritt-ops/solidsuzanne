@@ -6,6 +6,5 @@ add_executable(vgeo_validate
 )
 
 target_link_libraries(vgeo_validate PRIVATE
-    vgeo_runtime
     vgeo_core
 )
