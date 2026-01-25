@@ -10,14 +10,62 @@
 #include <GLFW/glfw3.h>
 
 #include <iostream>
+#include <fstream>
 #include <cstring>
 #include <set>
 #include <algorithm>
 #include <array>
+#include <filesystem>
 
 namespace vgeo {
 
-// Embedded SPIR-V shaders (pre-compiled)
+// Helper function to find shader directory
+static std::string find_shader_dir() {
+    // Try common locations relative to executable
+    std::vector<std::string> search_paths = {
+        "shaders",
+        "../shaders",
+        "../../shaders",
+        "../../../shaders",
+#ifdef VGEO_SHADER_DIR
+        VGEO_SHADER_DIR,
+#endif
+    };
+
+    for (const auto& path : search_paths) {
+        if (std::filesystem::exists(path) && std::filesystem::is_directory(path)) {
+            return path;
+        }
+    }
+
+    return "shaders";  // Default
+}
+
+// Load shader from file
+static std::vector<uint32_t> load_shader_file(const std::string& filename) {
+    std::string shader_dir = find_shader_dir();
+    std::string full_path = shader_dir + "/" + filename;
+
+    std::cout << "    Loading shader: " << full_path << "\n" << std::flush;
+
+    std::ifstream file(full_path, std::ios::ate | std::ios::binary);
+
+    if (!file.is_open()) {
+        std::cerr << "Failed to open shader file: " << full_path << "\n";
+        return {};
+    }
+
+    size_t file_size = static_cast<size_t>(file.tellg());
+    std::vector<uint32_t> buffer(file_size / sizeof(uint32_t));
+
+    file.seekg(0);
+    file.read(reinterpret_cast<char*>(buffer.data()), file_size);
+    file.close();
+
+    return buffer;
+}
+
+// Fallback embedded SPIR-V shaders (minimal, for testing only)
 // These are minimal shaders for testing - will be replaced with file loading
 
 // Vertex shader for basic rendering
@@ -181,16 +229,27 @@ bool Renderer::init(void* window_handle, uint32_t width, uint32_t height) {
     m_width = width;
     m_height = height;
 
+    std::cout << "  Creating instance...\n" << std::flush;
     if (!create_instance()) return false;
+    std::cout << "  Creating surface...\n" << std::flush;
     if (!create_surface(window_handle)) return false;
+    std::cout << "  Selecting physical device...\n" << std::flush;
     if (!select_physical_device()) return false;
+    std::cout << "  Creating logical device...\n" << std::flush;
     if (!create_device()) return false;
+    std::cout << "  Creating swapchain...\n" << std::flush;
     if (!create_swapchain()) return false;
+    std::cout << "  Creating render pass...\n" << std::flush;
     if (!create_render_pass()) return false;
+    std::cout << "  Creating framebuffers...\n" << std::flush;
     if (!create_framebuffers()) return false;
+    std::cout << "  Creating command pool...\n" << std::flush;
     if (!create_command_pool()) return false;
+    std::cout << "  Creating sync objects...\n" << std::flush;
     if (!create_sync_objects()) return false;
+    std::cout << "  Creating pipeline...\n" << std::flush;
     if (!create_pipeline()) return false;
+    std::cout << "  Creating triangle buffers...\n" << std::flush;
     if (!create_triangle_buffers()) return false;
 
     std::cout << "Vulkan renderer initialized successfully\n";
@@ -779,13 +838,37 @@ VkShaderModule Renderer::create_shader_module(const uint32_t* code, size_t size)
 }
 
 bool Renderer::create_pipeline() {
-    // Create shader modules
-    VkShaderModule vert_shader = create_shader_module(basic_vert_spv, sizeof(basic_vert_spv));
-    VkShaderModule frag_shader = create_shader_module(basic_frag_spv, sizeof(basic_frag_spv));
+    // Try to load shaders from files first
+    std::cout << "    Loading shaders from files...\n" << std::flush;
+
+    std::vector<uint32_t> vert_code = load_shader_file("basic.vert.spv");
+    std::vector<uint32_t> frag_code = load_shader_file("basic.frag.spv");
+
+    VkShaderModule vert_shader = VK_NULL_HANDLE;
+    VkShaderModule frag_shader = VK_NULL_HANDLE;
+
+    if (!vert_code.empty() && !frag_code.empty()) {
+        std::cout << "    Creating vertex shader module from file...\n" << std::flush;
+        vert_shader = create_shader_module(vert_code.data(), vert_code.size() * sizeof(uint32_t));
+        std::cout << "    Creating fragment shader module from file...\n" << std::flush;
+        frag_shader = create_shader_module(frag_code.data(), frag_code.size() * sizeof(uint32_t));
+    }
+
+    // Fallback to embedded shaders if file loading failed
+    if (vert_shader == VK_NULL_HANDLE) {
+        std::cout << "    Falling back to embedded vertex shader...\n" << std::flush;
+        vert_shader = create_shader_module(basic_vert_spv, sizeof(basic_vert_spv));
+    }
+    if (frag_shader == VK_NULL_HANDLE) {
+        std::cout << "    Falling back to embedded fragment shader...\n" << std::flush;
+        frag_shader = create_shader_module(basic_frag_spv, sizeof(basic_frag_spv));
+    }
 
     if (vert_shader == VK_NULL_HANDLE || frag_shader == VK_NULL_HANDLE) {
+        std::cerr << "    Shader module creation failed!\n" << std::flush;
         return false;
     }
+    std::cout << "    Shader modules created successfully\n" << std::flush;
 
     VkPipelineShaderStageCreateInfo vert_stage_info{};
     vert_stage_info.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
@@ -906,13 +989,16 @@ bool Renderer::create_pipeline() {
     layout_info.pushConstantRangeCount = 1;
     layout_info.pPushConstantRanges = &push_constant;
 
+    std::cout << "    Creating pipeline layout...\n" << std::flush;
     if (vkCreatePipelineLayout(m_device, &layout_info, nullptr, &m_render_layout) != VK_SUCCESS) {
         std::cerr << "Failed to create pipeline layout\n";
         vkDestroyShaderModule(m_device, vert_shader, nullptr);
         vkDestroyShaderModule(m_device, frag_shader, nullptr);
         return false;
     }
+    std::cout << "    Pipeline layout created\n" << std::flush;
 
+    std::cout << "    Setting up graphics pipeline...\n" << std::flush;
     VkGraphicsPipelineCreateInfo pipeline_info{};
     pipeline_info.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
     pipeline_info.stageCount = 2;
@@ -929,16 +1015,22 @@ bool Renderer::create_pipeline() {
     pipeline_info.renderPass = m_render_pass;
     pipeline_info.subpass = 0;
 
-    if (vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipeline_info, nullptr, &m_render_pipeline) != VK_SUCCESS) {
-        std::cerr << "Failed to create graphics pipeline\n";
+    std::cout << "    Calling vkCreateGraphicsPipelines...\n" << std::flush;
+    VkResult result = vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipeline_info, nullptr, &m_render_pipeline);
+    std::cout << "    vkCreateGraphicsPipelines returned: " << result << "\n" << std::flush;
+
+    if (result != VK_SUCCESS) {
+        std::cerr << "Failed to create graphics pipeline (error: " << result << ")\n";
         vkDestroyShaderModule(m_device, vert_shader, nullptr);
         vkDestroyShaderModule(m_device, frag_shader, nullptr);
         return false;
     }
 
+    std::cout << "    Cleaning up shader modules...\n" << std::flush;
     vkDestroyShaderModule(m_device, vert_shader, nullptr);
     vkDestroyShaderModule(m_device, frag_shader, nullptr);
 
+    std::cout << "    Pipeline created successfully!\n" << std::flush;
     return true;
 }
 
