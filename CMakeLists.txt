@@ -39,6 +39,7 @@ endif()
 # Subdirectories
 add_subdirectory(src/core)
 add_subdirectory(src/preprocess)
+add_subdirectory(src/scene)
 
 # Runtime and viewer require Vulkan
 if(VGEO_HAS_VULKAN)

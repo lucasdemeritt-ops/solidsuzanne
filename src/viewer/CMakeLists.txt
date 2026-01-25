@@ -9,6 +9,7 @@ add_executable(vgeo_viewer
 
 target_link_libraries(vgeo_viewer PRIVATE
     vgeo_runtime
+    vgeo_scene
     vgeo_core
     glfw
     Vulkan::Vulkan
@@ -17,4 +18,5 @@ target_link_libraries(vgeo_viewer PRIVATE
 target_include_directories(vgeo_viewer PRIVATE
     ${CMAKE_SOURCE_DIR}/src/runtime
     ${CMAKE_SOURCE_DIR}/src/core
+    ${CMAKE_SOURCE_DIR}/src/scene
 )

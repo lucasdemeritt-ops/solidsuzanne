@@ -1385,6 +1385,142 @@ void Renderer::render(const Camera& camera, const ClusterManager& clusters) {
     m_current_frame = (m_current_frame + 1) % MAX_FRAMES_IN_FLIGHT;
 }
 
+void Renderer::render(const Camera& camera, const ClusterManager& clusters, const float* model_matrix) {
+    // Same as render() but with a model transform applied
+
+    if (!m_has_asset) {
+        render_triangle(camera);
+        return;
+    }
+
+    // Compute MVP = Projection * View * Model
+    float mvp[16];
+    if (model_matrix) {
+        // Multiply view_projection * model
+        for (int col = 0; col < 4; col++) {
+            for (int row = 0; row < 4; row++) {
+                mvp[col * 4 + row] = 0.0f;
+                for (int k = 0; k < 4; k++) {
+                    mvp[col * 4 + row] += camera.view_projection[k * 4 + row] * model_matrix[col * 4 + k];
+                }
+            }
+        }
+    } else {
+        std::memcpy(mvp, camera.view_projection, 16 * sizeof(float));
+    }
+
+    // Wait for previous frame
+    vkWaitForFences(m_device, 1, &m_in_flight_fences[m_current_frame], VK_TRUE, UINT64_MAX);
+
+    uint32_t image_index;
+    VkResult result = vkAcquireNextImageKHR(m_device, m_swapchain, UINT64_MAX,
+        m_image_available_semaphores[m_current_frame], VK_NULL_HANDLE, &image_index);
+
+    if (result == VK_ERROR_OUT_OF_DATE_KHR) {
+        recreate_swapchain();
+        return;
+    }
+
+    vkResetFences(m_device, 1, &m_in_flight_fences[m_current_frame]);
+
+    VkCommandBuffer cmd = m_command_buffers[m_current_frame];
+    vkResetCommandBuffer(cmd, 0);
+
+    VkCommandBufferBeginInfo begin_info{};
+    begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    vkBeginCommandBuffer(cmd, &begin_info);
+
+    VkRenderPassBeginInfo render_pass_info{};
+    render_pass_info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+    render_pass_info.renderPass = m_render_pass;
+    render_pass_info.framebuffer = m_framebuffers[image_index];
+    render_pass_info.renderArea.offset = {0, 0};
+    render_pass_info.renderArea.extent = m_swapchain_extent;
+
+    std::array<VkClearValue, 2> clear_values{};
+    clear_values[0].color = {{0.1f, 0.1f, 0.15f, 1.0f}};
+    clear_values[1].depthStencil = {1.0f, 0};
+    render_pass_info.clearValueCount = static_cast<uint32_t>(clear_values.size());
+    render_pass_info.pClearValues = clear_values.data();
+
+    vkCmdBeginRenderPass(cmd, &render_pass_info, VK_SUBPASS_CONTENTS_INLINE);
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_render_pipeline);
+
+    VkViewport viewport{};
+    viewport.x = 0.0f;
+    viewport.y = 0.0f;
+    viewport.width = static_cast<float>(m_swapchain_extent.width);
+    viewport.height = static_cast<float>(m_swapchain_extent.height);
+    viewport.minDepth = 0.0f;
+    viewport.maxDepth = 1.0f;
+    vkCmdSetViewport(cmd, 0, 1, &viewport);
+
+    VkRect2D scissor{};
+    scissor.offset = {0, 0};
+    scissor.extent = m_swapchain_extent;
+    vkCmdSetScissor(cmd, 0, 1, &scissor);
+
+    // Use computed MVP with model matrix
+    vkCmdPushConstants(cmd, m_render_layout, VK_SHADER_STAGE_VERTEX_BIT, 0,
+        sizeof(float) * 16, mvp);
+
+    // Draw visible clusters
+    const auto& visible = clusters.visible_clusters();
+
+    if (!visible.empty() && m_vertex_buffer != VK_NULL_HANDLE) {
+        VkBuffer vertex_buffers[] = {m_vertex_buffer};
+        VkDeviceSize offsets[] = {0};
+        vkCmdBindVertexBuffers(cmd, 0, 1, vertex_buffers, offsets);
+
+        if (m_index_buffer != VK_NULL_HANDLE) {
+            vkCmdBindIndexBuffer(cmd, m_index_buffer, 0, VK_INDEX_TYPE_UINT32);
+            vkCmdDrawIndexed(cmd, m_index_count, 1, 0, 0, 0);
+        } else {
+            vkCmdDraw(cmd, m_vertex_count, 1, 0, 0);
+        }
+    }
+
+    vkCmdEndRenderPass(cmd);
+    vkEndCommandBuffer(cmd);
+
+    VkSubmitInfo submit_info{};
+    submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+
+    VkSemaphore wait_semaphores[] = {m_image_available_semaphores[m_current_frame]};
+    VkPipelineStageFlags wait_stages[] = {VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT};
+    submit_info.waitSemaphoreCount = 1;
+    submit_info.pWaitSemaphores = wait_semaphores;
+    submit_info.pWaitDstStageMask = wait_stages;
+    submit_info.commandBufferCount = 1;
+    submit_info.pCommandBuffers = &cmd;
+
+    VkSemaphore signal_semaphores[] = {m_render_finished_semaphores[m_current_frame]};
+    submit_info.signalSemaphoreCount = 1;
+    submit_info.pSignalSemaphores = signal_semaphores;
+
+    vkQueueSubmit(m_graphics_queue, 1, &submit_info, m_in_flight_fences[m_current_frame]);
+
+    VkPresentInfoKHR present_info{};
+    present_info.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+    present_info.waitSemaphoreCount = 1;
+    present_info.pWaitSemaphores = signal_semaphores;
+
+    VkSwapchainKHR swapchains[] = {m_swapchain};
+    present_info.swapchainCount = 1;
+    present_info.pSwapchains = swapchains;
+    present_info.pImageIndices = &image_index;
+
+    result = vkQueuePresentKHR(m_present_queue, &present_info);
+
+    if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR || m_framebuffer_resized) {
+        m_framebuffer_resized = false;
+        recreate_swapchain();
+    }
+
+    m_current_frame = (m_current_frame + 1) % MAX_FRAMES_IN_FLIGHT;
+}
+
 void Renderer::upload_asset(const VGeoAsset& asset) {
     // Create vertex buffer with interleaved pos + normal
     size_t vertex_count = asset.positions.size() / 3;
