@@ -3,6 +3,7 @@
 
 add_library(vgeo_core STATIC
     vgeo_loader.cpp
+    camera.cpp
 )
 
 target_include_directories(vgeo_core PUBLIC

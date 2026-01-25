@@ -4,7 +4,6 @@
 add_executable(vgeo_viewer
     main.cpp
     window.cpp
-    camera.cpp
 )
 
 target_link_libraries(vgeo_viewer PRIVATE

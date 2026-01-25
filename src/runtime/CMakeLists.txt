@@ -13,9 +13,7 @@ target_link_libraries(vgeo_runtime PUBLIC
     glfw
 )
 
-target_include_directories(vgeo_runtime PUBLIC
-    ${CMAKE_SOURCE_DIR}/src/viewer
-)
+# Camera.h is now in core, which is linked publicly
 
 target_include_directories(vgeo_runtime PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}

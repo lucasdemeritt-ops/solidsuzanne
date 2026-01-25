@@ -9,6 +9,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 option(VGEO_BUILD_VIEWER "Build standalone viewer (requires Vulkan)" ON)
 option(VGEO_BUILD_TOOLS "Build CLI tools" ON)
 option(VGEO_BUILD_TESTS "Build tests" ON)
+option(VGEO_BUILD_PYTHON "Build Python bindings for Blender" ON)
 
 # Find Vulkan (optional - only needed for viewer/runtime)
 find_package(Vulkan QUIET)
@@ -57,4 +58,9 @@ endif()
 if(VGEO_BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests)
+endif()
+
+# Python bindings for Blender integration
+if(VGEO_BUILD_PYTHON)
+    add_subdirectory(src/python)
 endif()

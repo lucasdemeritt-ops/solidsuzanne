@@ -2,8 +2,8 @@
 // Frustum, occlusion, and backface culling on GPU using compute shaders
 
 #include "culling.h"
-#include "../viewer/camera.h"
-#include "../core/vgeo_format.h"
+#include "camera.h"
+#include "vgeo_format.h"
 
 #include <iostream>
 #include <cstring>

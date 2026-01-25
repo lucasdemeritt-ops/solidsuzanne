@@ -2,7 +2,7 @@
 // Manage cluster visibility and LOD selection using DAG traversal
 
 #include "cluster_manager.h"
-#include "../viewer/camera.h"
+#include "camera.h"
 
 #include <cmath>
 #include <algorithm>
