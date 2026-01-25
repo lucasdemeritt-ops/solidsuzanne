@@ -1331,6 +1331,7 @@ void Renderer::render(const Camera& camera, const ClusterManager& clusters) {
 
     // Draw visible clusters
     const auto& visible = clusters.visible_clusters();
+
     if (!visible.empty() && m_vertex_buffer != VK_NULL_HANDLE) {
         VkBuffer vertex_buffers[] = {m_vertex_buffer};
         VkDeviceSize offsets[] = {0};
