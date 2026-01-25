@@ -251,7 +251,7 @@ bool generate_meshlets(
 
         add_triangle(seed_triangle);
 
-        // Greedily add adjacent triangles
+        // Greedily add adjacent triangles first
         bool added = true;
         while (added && meshlet_triangle_count < max_triangles && meshlet_vertices.size() < max_vertices) {
             added = false;
@@ -294,6 +294,29 @@ bool generate_meshlets(
             if (best_triangle != UINT32_MAX) {
                 if (add_triangle(best_triangle)) {
                     added = true;
+                }
+            }
+        }
+
+        // If there's still capacity, add any remaining triangles (even non-adjacent)
+        // This ensures small meshes fit in a single meshlet
+        if (meshlet_triangle_count < max_triangles && meshlet_vertices.size() < max_vertices) {
+            for (uint32_t t = 0; t < triangle_count && meshlet_triangle_count < max_triangles; t++) {
+                if (triangle_used[t]) continue;
+
+                uint32_t tv0 = mesh.indices[t * 3 + 0];
+                uint32_t tv1 = mesh.indices[t * 3 + 1];
+                uint32_t tv2 = mesh.indices[t * 3 + 2];
+
+                // Count new vertices needed
+                uint32_t new_verts = 0;
+                if (vertex_to_local.find(tv0) == vertex_to_local.end()) new_verts++;
+                if (vertex_to_local.find(tv1) == vertex_to_local.end()) new_verts++;
+                if (vertex_to_local.find(tv2) == vertex_to_local.end()) new_verts++;
+
+                // Add if there's room
+                if (meshlet_vertices.size() + new_verts <= max_vertices) {
+                    add_triangle(t);
                 }
             }
         }
