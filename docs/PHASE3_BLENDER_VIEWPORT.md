@@ -134,11 +134,24 @@ This can be called from Python and passed to Cycles as mesh data.
 
 ## Implementation Phases
 
-### Phase 3.1: Scene Graph & Multi-Object Support
-- [ ] VGeoScene class with object management
-- [ ] Per-object transforms (model matrices)
-- [ ] Batch rendering of multiple objects
-- [ ] Object picking/selection support
+### Phase 3.1: Scene Graph & Multi-Object Support ✅ COMPLETE
+- [x] VGeoScene class with object management
+- [x] Per-object transforms (model matrices)
+- [x] Asset caching with reference counting (for instancing)
+- [x] World-space bounds computation
+- [x] Frustum culling per object
+- [x] Object picking/selection support (ray-AABB intersection)
+- [x] Matrix utilities (identity, translation, rotation, scale, multiply, transform)
+- [x] Viewer integration with model rotation (arrow keys)
+
+**Files created:**
+- `src/scene/scene.h` - Scene graph API
+- `src/scene/scene.cpp` - Full implementation (~550 lines)
+- `src/scene/CMakeLists.txt` - Build config
+
+**Viewer controls added:**
+- Arrow keys: Rotate model (Left/Right = Y axis, Up/Down = X axis)
+- R key: Reset model rotation
 
 ### Phase 3.2: Blender Render Engine
 - [ ] RenderEngine subclass skeleton
@@ -230,19 +243,38 @@ NewRepo/
 
 ---
 
-## Open Questions
+## Design Decisions
 
-1. **Blender version target?** 3.6 LTS? 4.x? (GPU API differs)
-2. **Material support scope?** Viewport only? Cycles passthrough?
-3. **Instancing?** Same .vgeo with different transforms?
-4. **Edit mode?** Can you edit VGEO meshes or are they read-only?
+1. **Blender version target:** 4.x
+2. **Material support:** Full textures and materials (viewport + Cycles)
+3. **Instancing:** Yes - same .vgeo with different transforms (memory efficient)
+4. **Edit mode:** Read-only (VGEO meshes are not editable, re-import to update)
 
 ---
 
-## Next Steps
+## Current Status (January 2026)
 
-1. Review and refine this spec
-2. Prototype RenderEngine in Python (minimal)
-3. Test Vulkan ↔ Blender window interop
-4. Build scene graph in C++
-5. Create Python bindings
+**Branch:** `feature/blender-viewport`
+
+**Completed:**
+- Phase 3.1 Scene Graph - DONE
+- Viewer now supports model rotation via arrow keys
+- Foundation ready for multi-object rendering
+
+**Next Steps:**
+1. ~~Build scene graph in C++~~ ✅ DONE
+2. Test multi-object rendering (add second object to scene)
+3. Prototype RenderEngine in Python (minimal)
+4. Test Vulkan ↔ Blender window interop
+5. Create Python bindings (pybind11)
+
+**To resume development:**
+```bash
+cd NewRepo
+git checkout feature/blender-viewport
+cmake --build build --config Release
+
+# Test the viewer with model rotation
+build\src\viewer\Release\vgeo_viewer.exe path\to\model.vgeo
+# Use arrow keys to rotate, R to reset
+```
