@@ -5,6 +5,7 @@ add_library(vgeo_runtime STATIC
     cluster_manager.cpp
     culling.cpp
     renderer.cpp
+    offscreen_renderer.cpp
 )
 
 target_link_libraries(vgeo_runtime PUBLIC

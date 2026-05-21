@@ -8,6 +8,8 @@
 #include "scene.h"
 #include "vgeo_loader.h"
 #include "camera.h"
+#include "offscreen_renderer.h"
+#include "cluster_manager.h"
 
 #include <memory>
 #include <vector>
@@ -197,6 +199,120 @@ private:
     Scene m_scene;
 };
 
+// Python wrapper for offscreen renderer
+class PyRenderer {
+public:
+    PyRenderer() = default;
+
+    ~PyRenderer() {
+        // Ensure Vulkan resources are cleaned up before Python exit
+        m_renderer.destroy();
+    }
+
+    bool init(uint32_t width, uint32_t height) {
+        return m_renderer.init(width, height);
+    }
+
+    bool resize(uint32_t width, uint32_t height) {
+        return m_renderer.resize(width, height);
+    }
+
+    void destroy() {
+        m_renderer.destroy();
+    }
+
+    void upload_asset(PyScene& scene, int object_id) {
+        const SceneObject* obj = scene.scene().get_object(static_cast<ObjectId>(object_id));
+        if (!obj) return;
+
+        const VGeoAsset* asset = scene.scene().get_asset(obj->asset_id);
+        if (asset) {
+            m_renderer.upload_asset(*asset);
+        }
+    }
+
+    void render(PyCamera& camera, const float* model_matrix = nullptr) {
+        camera.update();
+        ClusterManager clusters;  // Empty for now
+        m_renderer.render(camera.camera, clusters, model_matrix);
+    }
+
+    void render_with_transform(PyCamera& camera, py::array_t<float> transform) {
+        camera.update();
+        ClusterManager clusters;
+
+        const float* model_matrix = nullptr;
+        if (transform.size() == 16) {
+            model_matrix = transform.data();
+        }
+
+        m_renderer.render(camera.camera, clusters, model_matrix);
+    }
+
+    // Get pixels as numpy array (RGBA, uint8)
+    py::array_t<uint8_t> get_pixels() {
+        uint32_t w = m_renderer.width();
+        uint32_t h = m_renderer.height();
+
+        // Create numpy array
+        py::array_t<uint8_t> result({h, w, 4u});
+        auto buf = result.mutable_unchecked<3>();
+
+        // Read pixels
+        std::vector<uint8_t> pixels(w * h * 4);
+        if (m_renderer.read_pixels(pixels.data())) {
+            // Copy to numpy array (flip Y for OpenGL convention)
+            for (uint32_t y = 0; y < h; y++) {
+                for (uint32_t x = 0; x < w; x++) {
+                    uint32_t src_y = h - 1 - y;  // Flip
+                    size_t src_idx = (src_y * w + x) * 4;
+                    buf(y, x, 0) = pixels[src_idx + 0];
+                    buf(y, x, 1) = pixels[src_idx + 1];
+                    buf(y, x, 2) = pixels[src_idx + 2];
+                    buf(y, x, 3) = pixels[src_idx + 3];
+                }
+            }
+        }
+
+        return result;
+    }
+
+    // Get pixels as flat float array for Blender (RGBA, float 0-1)
+    py::array_t<float> get_pixels_float() {
+        uint32_t w = m_renderer.width();
+        uint32_t h = m_renderer.height();
+
+        std::vector<uint8_t> pixels(w * h * 4);
+        m_renderer.read_pixels(pixels.data());
+
+        // Convert to float array (flipped)
+        py::array_t<float> result(w * h * 4);
+        auto buf = result.mutable_unchecked<1>();
+
+        for (uint32_t y = 0; y < h; y++) {
+            for (uint32_t x = 0; x < w; x++) {
+                uint32_t src_y = h - 1 - y;  // Flip for OpenGL
+                size_t src_idx = (src_y * w + x) * 4;
+                size_t dst_idx = (y * w + x) * 4;
+
+                buf(dst_idx + 0) = pixels[src_idx + 0] / 255.0f;
+                buf(dst_idx + 1) = pixels[src_idx + 1] / 255.0f;
+                buf(dst_idx + 2) = pixels[src_idx + 2] / 255.0f;
+                buf(dst_idx + 3) = pixels[src_idx + 3] / 255.0f;
+            }
+        }
+
+        return result;
+    }
+
+    uint32_t width() const { return m_renderer.width(); }
+    uint32_t height() const { return m_renderer.height(); }
+    bool is_initialized() const { return m_renderer.is_initialized(); }
+
+private:
+    OffscreenRenderer m_renderer;
+};
+
 // Query visible geometry for Cycles export
 py::dict query_visible_geometry(PyScene& scene, PyCamera& camera, float error_threshold) {
     camera.update();
@@ -332,6 +448,32 @@ PYBIND11_MODULE(vgeo_native, m) {
           py::arg("camera"),
           py::arg("error_threshold") = 1.0f,
           "Query visible geometry at given camera position for Cycles export");
+
+    // Offscreen Renderer
+    py::class_<vgeo::PyRenderer>(m, "Renderer")
+        .def(py::init<>())
+        .def("init", &vgeo::PyRenderer::init,
+             py::arg("width"), py::arg("height"),
+             "Initialize the offscreen Vulkan renderer")
+        .def("resize", &vgeo::PyRenderer::resize,
+             py::arg("width"), py::arg("height"),
+             "Resize the render target")
+        .def("destroy", &vgeo::PyRenderer::destroy,
+             "Cleanup Vulkan resources")
+        .def("upload_asset", &vgeo::PyRenderer::upload_asset,
+             py::arg("scene"), py::arg("object_id"),
+             "Upload geometry from a scene object to GPU")
+        .def("render", &vgeo::PyRenderer::render_with_transform,
+             py::arg("camera"),
+             py::arg("transform") = py::array_t<float>(),
+             "Render the scene")
+        .def("get_pixels", &vgeo::PyRenderer::get_pixels,
+             "Get rendered pixels as RGBA uint8 numpy array")
+        .def("get_pixels_float", &vgeo::PyRenderer::get_pixels_float,
+             "Get rendered pixels as RGBA float numpy array (for Blender)")
+        .def_property_readonly("width", &vgeo::PyRenderer::width)
+        .def_property_readonly("height", &vgeo::PyRenderer::height)
+        .def_property_readonly("is_initialized", &vgeo::PyRenderer::is_initialized);
 
     // Version info
     m.attr("__version__") = "0.1.0";

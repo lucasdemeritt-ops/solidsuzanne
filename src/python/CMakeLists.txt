@@ -19,11 +19,14 @@ pybind11_add_module(vgeo_python MODULE
 )
 
 target_link_libraries(vgeo_python PRIVATE
+    vgeo_runtime
     vgeo_scene
     vgeo_core
+    Vulkan::Vulkan
 )
 
 target_include_directories(vgeo_python PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/runtime
     ${CMAKE_SOURCE_DIR}/src/scene
     ${CMAKE_SOURCE_DIR}/src/core
 )

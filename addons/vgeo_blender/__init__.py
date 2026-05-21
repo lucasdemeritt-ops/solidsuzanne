@@ -26,7 +26,8 @@ def setup_module_path():
     # Possible locations for the native module
     search_paths = [
         os.path.join(addon_dir, "native"),  # Shipped with addon
-        os.path.join(addon_dir, "..", "..", "build", "src", "python", "Release"),  # Dev build
+        os.path.join(addon_dir, "..", "..", "build", "src", "python", "Debug"),  # Dev build (Debug)
+        os.path.join(addon_dir, "..", "..", "build", "src", "python", "Release"),  # Dev build (Release)
     ]
 
     for path in search_paths:

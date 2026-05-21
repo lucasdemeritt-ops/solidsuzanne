@@ -978,11 +978,11 @@ bool Renderer::create_pipeline() {
     dynamic_state.dynamicStateCount = static_cast<uint32_t>(dynamic_states.size());
     dynamic_state.pDynamicStates = dynamic_states.data();
 
-    // Push constants for MVP matrix
+    // Push constants for MVP and Model matrices
     VkPushConstantRange push_constant{};
     push_constant.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
     push_constant.offset = 0;
-    push_constant.size = sizeof(float) * 16;  // mat4
+    push_constant.size = sizeof(float) * 32;  // 2x mat4 (MVP + Model)
 
     VkPipelineLayoutCreateInfo layout_info{};
     layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
@@ -1208,9 +1208,17 @@ void Renderer::render_triangle(const Camera& camera) {
     scissor.extent = m_swapchain_extent;
     vkCmdSetScissor(cmd, 0, 1, &scissor);
 
-    // Push MVP matrix
+    // Push MVP and Model matrices (identity model for test triangle)
+    struct {
+        float mvp[16];
+        float model[16];
+    } push_data;
+    std::memcpy(push_data.mvp, camera.view_projection, sizeof(push_data.mvp));
+    // Identity model matrix
+    float identity[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+    std::memcpy(push_data.model, identity, sizeof(push_data.model));
     vkCmdPushConstants(cmd, m_render_layout, VK_SHADER_STAGE_VERTEX_BIT, 0,
-        sizeof(float) * 16, camera.view_projection);
+        sizeof(push_data), &push_data);
 
     // Bind vertex buffer and draw
     VkBuffer vertex_buffers[] = {m_triangle_vertex_buffer};
@@ -1326,8 +1334,16 @@ void Renderer::render(const Camera& camera, const ClusterManager& clusters) {
     scissor.extent = m_swapchain_extent;
     vkCmdSetScissor(cmd, 0, 1, &scissor);
 
+    // Push MVP and Model matrices (identity model)
+    struct {
+        float mvp[16];
+        float model[16];
+    } push_data;
+    std::memcpy(push_data.mvp, camera.view_projection, sizeof(push_data.mvp));
+    float identity[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+    std::memcpy(push_data.model, identity, sizeof(push_data.model));
     vkCmdPushConstants(cmd, m_render_layout, VK_SHADER_STAGE_VERTEX_BIT, 0,
-        sizeof(float) * 16, camera.view_projection);
+        sizeof(push_data), &push_data);
 
     // Draw visible clusters
     const auto& visible = clusters.visible_clusters();
@@ -1393,21 +1409,38 @@ void Renderer::render(const Camera& camera, const ClusterManager& clusters, cons
         return;
     }
 
+    // Push constants: MVP matrix + Model matrix
+    struct PushConstants {
+        float mvp[16];
+        float model[16];
+    } push_data;
+
+    // Identity matrix for when no model transform
+    static const float identity[16] = {
+        1, 0, 0, 0,
+        0, 1, 0, 0,
+        0, 0, 1, 0,
+        0, 0, 0, 1
+    };
+
+    const float* model = model_matrix ? model_matrix : identity;
+
     // Compute MVP = Projection * View * Model
-    float mvp[16];
     if (model_matrix) {
-        // Multiply view_projection * model
         for (int col = 0; col < 4; col++) {
             for (int row = 0; row < 4; row++) {
-                mvp[col * 4 + row] = 0.0f;
+                push_data.mvp[col * 4 + row] = 0.0f;
                 for (int k = 0; k < 4; k++) {
-                    mvp[col * 4 + row] += camera.view_projection[k * 4 + row] * model_matrix[col * 4 + k];
+                    push_data.mvp[col * 4 + row] += camera.view_projection[k * 4 + row] * model_matrix[col * 4 + k];
                 }
             }
         }
     } else {
-        std::memcpy(mvp, camera.view_projection, 16 * sizeof(float));
+        std::memcpy(push_data.mvp, camera.view_projection, 16 * sizeof(float));
     }
+
+    // Copy model matrix for normal transformation
+    std::memcpy(push_data.model, model, 16 * sizeof(float));
 
     // Wait for previous frame
     vkWaitForFences(m_device, 1, &m_in_flight_fences[m_current_frame], VK_TRUE, UINT64_MAX);
@@ -1461,9 +1494,9 @@ void Renderer::render(const Camera& camera, const ClusterManager& clusters, cons
     scissor.extent = m_swapchain_extent;
     vkCmdSetScissor(cmd, 0, 1, &scissor);
 
-    // Use computed MVP with model matrix
+    // Push MVP and Model matrices for rendering
     vkCmdPushConstants(cmd, m_render_layout, VK_SHADER_STAGE_VERTEX_BIT, 0,
-        sizeof(float) * 16, mvp);
+        sizeof(push_data), &push_data);
 
     // Draw visible clusters
     const auto& visible = clusters.visible_clusters();

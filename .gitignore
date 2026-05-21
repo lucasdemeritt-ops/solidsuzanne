@@ -36,6 +36,9 @@ venv/
 Thumbs.db
 desktop.ini
 
+# Test renders
+*.ppm
+
 # Project specific
 *.vgeo
 *.vscene
