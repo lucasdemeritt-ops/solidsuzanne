@@ -221,6 +221,10 @@ public:
         m_renderer.destroy();
     }
 
+    void set_debug_mode(bool cluster_colors) {
+        m_renderer.set_debug_mode(cluster_colors);
+    }
+
     void upload_asset(PyScene& scene, int object_id) {
         const SceneObject* obj = scene.scene().get_object(static_cast<ObjectId>(object_id));
         if (!obj) return;
@@ -467,6 +471,9 @@ PYBIND11_MODULE(vgeo_native, m) {
              py::arg("camera"),
              py::arg("transform") = py::array_t<float>(),
              "Render the scene")
+        .def("set_debug_mode", &vgeo::PyRenderer::set_debug_mode,
+             py::arg("cluster_colors"),
+             "Toggle meshlet color debug visualization")
         .def("get_pixels", &vgeo::PyRenderer::get_pixels,
              "Get rendered pixels as RGBA uint8 numpy array")
         .def("get_pixels_float", &vgeo::PyRenderer::get_pixels_float,

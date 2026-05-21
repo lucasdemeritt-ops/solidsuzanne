@@ -594,13 +594,13 @@ bool OffscreenRenderer::create_pipeline() {
 
     VkPipelineShaderStageCreateInfo stages[] = {vert_stage, frag_stage};
 
-    // Vertex input
+    // Vertex input: pos(3f) + normal(3f) + meshlet_id(1u) = 28 bytes
     VkVertexInputBindingDescription binding{};
     binding.binding = 0;
-    binding.stride = 6 * sizeof(float);  // pos + normal
+    binding.stride = 6 * sizeof(float) + sizeof(uint32_t);
     binding.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
 
-    std::array<VkVertexInputAttributeDescription, 2> attrs{};
+    std::array<VkVertexInputAttributeDescription, 3> attrs{};
     attrs[0].binding = 0;
     attrs[0].location = 0;
     attrs[0].format = VK_FORMAT_R32G32B32_SFLOAT;
@@ -610,6 +610,11 @@ bool OffscreenRenderer::create_pipeline() {
     attrs[1].location = 1;
     attrs[1].format = VK_FORMAT_R32G32B32_SFLOAT;
     attrs[1].offset = 3 * sizeof(float);
+
+    attrs[2].binding = 0;
+    attrs[2].location = 2;
+    attrs[2].format = VK_FORMAT_R32_UINT;
+    attrs[2].offset = 6 * sizeof(float);
 
     VkPipelineVertexInputStateCreateInfo vertex_input{};
     vertex_input.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
@@ -645,8 +650,8 @@ bool OffscreenRenderer::create_pipeline() {
     rasterizer.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
     rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
     rasterizer.lineWidth = 1.0f;
-    rasterizer.cullMode = VK_CULL_MODE_BACK_BIT;
-    rasterizer.frontFace = VK_FRONT_FACE_CLOCKWISE;
+    rasterizer.cullMode = VK_CULL_MODE_NONE;
+    rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
 
     VkPipelineMultisampleStateCreateInfo multisampling{};
     multisampling.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
@@ -678,12 +683,11 @@ bool OffscreenRenderer::create_pipeline() {
     dynamic_state.dynamicStateCount = static_cast<uint32_t>(dynamic_states.size());
     dynamic_state.pDynamicStates = dynamic_states.data();
 
-    // Push constants for MVP
-    // Push constants for MVP and Model matrices
+    // Push constants: 2x mat4 + uint debug_mode
     VkPushConstantRange push_constant{};
-    push_constant.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    push_constant.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
     push_constant.offset = 0;
-    push_constant.size = sizeof(float) * 32;  // 2x mat4
+    push_constant.size = sizeof(float) * 32 + sizeof(uint32_t);  // 132 bytes
 
     VkPipelineLayoutCreateInfo layout_info{};
     layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
@@ -752,14 +756,27 @@ VkShaderModule OffscreenRenderer::create_shader_module(const uint32_t* code, siz
 }
 
 void OffscreenRenderer::upload_asset(const VGeoAsset& asset) {
-    // Same as main renderer - create vertex and index buffers
     size_t vertex_count = asset.positions.size() / 3;
-    std::vector<float> interleaved(vertex_count * 6);
+
+    // Build vertex -> meshlet mapping for debug color mode
+    std::vector<uint32_t> vertex_meshlet_ids(vertex_count, 0);
+    for (uint32_t m = 0; m < asset.meshlets.size(); m++) {
+        const auto& meshlet = asset.meshlets[m];
+        uint32_t idx_end = meshlet.index_offset + meshlet.triangle_count * 3;
+        for (uint32_t i = meshlet.index_offset; i < idx_end && i < asset.indices.size(); i++) {
+            uint32_t v = asset.indices[i];
+            if (v < vertex_count) vertex_meshlet_ids[v] = m;
+        }
+    }
+
+    // Interleaved: pos(3f) + normal(3f) + meshlet_id(1u) = 28 bytes per vertex
+    struct Vertex { float pos[3]; float normal[3]; uint32_t meshlet_id; };
+    std::vector<Vertex> verts(vertex_count);
 
     for (size_t i = 0; i < vertex_count; i++) {
-        interleaved[i * 6 + 0] = asset.positions[i * 3 + 0];
-        interleaved[i * 6 + 1] = asset.positions[i * 3 + 1];
-        interleaved[i * 6 + 2] = asset.positions[i * 3 + 2];
+        verts[i].pos[0] = asset.positions[i * 3 + 0];
+        verts[i].pos[1] = asset.positions[i * 3 + 1];
+        verts[i].pos[2] = asset.positions[i * 3 + 2];
 
         if (i < asset.normals.size()) {
             float nx = static_cast<float>(asset.normals[i].x) / 32767.0f;
@@ -771,18 +788,20 @@ void OffscreenRenderer::upload_asset(const VGeoAsset& asset) {
                 ny = (1.0f - std::abs(tx)) * (ny >= 0 ? 1.0f : -1.0f);
             }
             float len = std::sqrt(nx*nx + ny*ny + nz*nz);
-            interleaved[i * 6 + 3] = nx / len;
-            interleaved[i * 6 + 4] = ny / len;
-            interleaved[i * 6 + 5] = nz / len;
+            verts[i].normal[0] = nx / len;
+            verts[i].normal[1] = ny / len;
+            verts[i].normal[2] = nz / len;
         } else {
-            interleaved[i * 6 + 3] = 0.0f;
-            interleaved[i * 6 + 4] = 1.0f;
-            interleaved[i * 6 + 5] = 0.0f;
+            verts[i].normal[0] = 0.0f;
+            verts[i].normal[1] = 1.0f;
+            verts[i].normal[2] = 0.0f;
         }
+
+        verts[i].meshlet_id = vertex_meshlet_ids[i];
     }
 
     // Create vertex buffer
-    VkDeviceSize vertex_size = interleaved.size() * sizeof(float);
+    VkDeviceSize vertex_size = verts.size() * sizeof(Vertex);
 
     VkBufferCreateInfo buffer_info{};
     buffer_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
@@ -805,7 +824,7 @@ void OffscreenRenderer::upload_asset(const VGeoAsset& asset) {
 
     void* data;
     vkMapMemory(m_device, m_vertex_memory, 0, vertex_size, 0, &data);
-    memcpy(data, interleaved.data(), vertex_size);
+    memcpy(data, verts.data(), vertex_size);
     vkUnmapMemory(m_device, m_vertex_memory);
 
     m_vertex_count = static_cast<uint32_t>(vertex_count);
@@ -880,10 +899,10 @@ void OffscreenRenderer::render(const Camera& camera, const ClusterManager& clust
     scissor.extent = {m_width, m_height};
     vkCmdSetScissor(m_command_buffer, 0, 1, &scissor);
 
-    // Push constants: MVP + Model matrices
     struct PushConstants {
         float mvp[16];
         float model[16];
+        uint32_t debug_mode;
     } push_data;
 
     // Identity matrix for when no model transform
@@ -910,10 +929,16 @@ void OffscreenRenderer::render(const Camera& camera, const ClusterManager& clust
         std::memcpy(push_data.mvp, camera.view_projection, sizeof(push_data.mvp));
     }
 
-    // Copy model matrix for normal transformation
     std::memcpy(push_data.model, model, sizeof(push_data.model));
+    push_data.debug_mode = m_debug_mode ? 1u : 0u;
 
-    vkCmdPushConstants(m_command_buffer, m_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(push_data), &push_data);
+    std::cout << "VGEO: MVP[0,0]=" << push_data.mvp[0] << " MVP[5]=" << push_data.mvp[5]
+              << " MVP[10]=" << push_data.mvp[10] << " MVP[14]=" << push_data.mvp[14]
+              << " debug=" << push_data.debug_mode << "\n";
+
+    vkCmdPushConstants(m_command_buffer, m_pipeline_layout,
+        VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+        0, sizeof(push_data), &push_data);
 
     if (m_has_asset && m_vertex_buffer) {
         VkBuffer buffers[] = {m_vertex_buffer};
@@ -921,11 +946,17 @@ void OffscreenRenderer::render(const Camera& camera, const ClusterManager& clust
         vkCmdBindVertexBuffers(m_command_buffer, 0, 1, buffers, offsets);
 
         if (m_index_buffer) {
+            std::cout << "VGEO: Drawing " << m_index_count << " indices ("
+                      << (m_index_count/3) << " tris), " << m_vertex_count << " verts\n";
             vkCmdBindIndexBuffer(m_command_buffer, m_index_buffer, 0, VK_INDEX_TYPE_UINT32);
             vkCmdDrawIndexed(m_command_buffer, m_index_count, 1, 0, 0, 0);
         } else {
+            std::cout << "VGEO: Drawing " << m_vertex_count << " verts (no index buffer)\n";
             vkCmdDraw(m_command_buffer, m_vertex_count, 1, 0, 0);
         }
+    } else {
+        std::cout << "VGEO: No asset to draw (has_asset=" << m_has_asset
+                  << ", vertex_buffer=" << (m_vertex_buffer != VK_NULL_HANDLE) << ")\n";
     }
 
     vkCmdEndRenderPass(m_command_buffer);

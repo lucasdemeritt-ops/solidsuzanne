@@ -92,6 +92,16 @@ class VGEO_PT_scene_stats(Panel):
     def draw(self, context):
         layout = self.layout
 
+        # Convert button — always visible regardless of native module
+        obj = context.active_object
+        col = layout.column(align=True)
+        col.label(text="Convert", icon='EXPORT')
+        row = col.row()
+        row.enabled = obj is not None and obj.type == 'MESH'
+        row.operator("vgeo.convert", text="Active Mesh → VGEO", icon='FILE_TICK')
+
+        layout.separator()
+
         if not NATIVE_AVAILABLE:
             layout.label(text="Native module not loaded!", icon='ERROR')
             return
@@ -110,6 +120,11 @@ class VGEO_PT_scene_stats(Panel):
 
         col.label(text=f"Total Meshlets: {total_meshlets:,}")
         col.label(text=f"Total Clusters: {total_clusters:,}")
+
+        layout.separator()
+        box2 = layout.box()
+        box2.label(text="Debug", icon='SHADING_WIRE')
+        box2.prop(context.scene, "vgeo_debug_meshlets", text="Meshlet Colors")
 
 
 # Panel list

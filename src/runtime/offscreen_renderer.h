@@ -63,6 +63,9 @@ public:
     // Render a frame
     void render(const Camera& camera, const ClusterManager& clusters, const float* model_matrix = nullptr);
 
+    // Toggle meshlet color debug view
+    void set_debug_mode(bool cluster_colors) { m_debug_mode = cluster_colors; }
+
     // Get shared image info for OpenGL import
     SharedImageInfo get_shared_image_info() const;
 
@@ -147,6 +150,7 @@ private:
     // State
     bool m_initialized = false;
     bool m_has_asset = false;
+    bool m_debug_mode = false;
 
     // Extension function pointers
     PFN_vkGetMemoryWin32HandleKHR vkGetMemoryWin32HandleKHR = nullptr;

@@ -1,13 +1,14 @@
 """
 VGEO Operators
-Import/export operators for .vgeo files
+Import/export and conversion operators for .vgeo files
 """
 
 import bpy
 from bpy.types import Operator
 from bpy.props import StringProperty, BoolProperty
-from bpy_extras.io_utils import ImportHelper
+from bpy_extras.io_utils import ImportHelper, ExportHelper
 import os
+import subprocess
 
 # Try to import native module
 try:
@@ -17,74 +18,172 @@ except ImportError:
     NATIVE_AVAILABLE = False
 
 
+def find_vgeo_build():
+    """Locate vgeo_build.exe relative to the addon directory"""
+    addon_dir = os.path.dirname(os.path.realpath(__file__))
+    candidates = [
+        os.path.join(addon_dir, "vgeo_build.exe"),
+        os.path.join(addon_dir, "..", "..", "build", "tools", "vgeo_build", "Release", "vgeo_build.exe"),
+        os.path.join(addon_dir, "..", "..", "build", "tools", "vgeo_build", "Debug", "vgeo_build.exe"),
+    ]
+    for c in candidates:
+        path = os.path.realpath(c)
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def import_vgeo_file(operator, filepath):
+    """Shared logic: load a .vgeo, create a proxy mesh, set custom properties."""
+    if not NATIVE_AVAILABLE:
+        operator.report({'ERROR'}, "VGEO native module not available")
+        return {'CANCELLED'}
+
+    scene = vgeo_native.Scene()
+    obj_id = scene.add_object_from_file(filepath, None, "temp")
+
+    if obj_id < 0:
+        operator.report({'ERROR'}, f"Failed to load {filepath}")
+        return {'CANCELLED'}
+
+    bounds = scene.get_object_bounds(obj_id)
+    stats = scene.get_stats()
+
+    min_b, max_b = bounds
+    size = [max_b[i] - min_b[i] for i in range(3)]
+    center = [(max_b[i] + min_b[i]) / 2 for i in range(3)]
+
+    bpy.ops.mesh.primitive_cube_add()
+    obj = bpy.context.active_object
+    obj.scale = [max(s / 2, 0.01) for s in size]
+    obj.location = center
+    obj.name = os.path.basename(filepath).replace('.vgeo', '')
+    obj["vgeo_path"] = filepath
+    obj["vgeo_meshlets"] = stats.get('total_meshlets', 0)
+    obj["vgeo_clusters"] = stats.get('total_clusters', 0)
+
+    operator.report({'INFO'}, f"Loaded {obj.name} — {stats.get('total_meshlets', 0):,} meshlets")
+    return {'FINISHED'}
+
+
 class VGEO_OT_import(Operator, ImportHelper):
-    """Import a VGEO file as a mesh object"""
+    """Import a .vgeo file into the scene"""
     bl_idname = "vgeo.import"
     bl_label = "Import VGEO"
     bl_options = {'REGISTER', 'UNDO'}
 
     filename_ext = ".vgeo"
-    filter_glob: StringProperty(
-        default="*.vgeo",
-        options={'HIDDEN'},
-    )
-
-    create_proxy: BoolProperty(
-        name="Create Proxy Mesh",
-        description="Create a simplified proxy mesh for viewport display (when not using VGEO engine)",
-        default=True,
-    )
+    filter_glob: StringProperty(default="*.vgeo", options={'HIDDEN'})
 
     def execute(self, context):
-        if not NATIVE_AVAILABLE:
-            self.report({'ERROR'}, "VGEO native module not available")
+        return import_vgeo_file(self, self.filepath)
+
+
+class VGEO_OT_convert(Operator, ExportHelper):
+    """Convert the active mesh to VGEO format and load it"""
+    bl_idname = "vgeo.convert"
+    bl_label = "Convert to VGEO"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    filename_ext = ".vgeo"
+    filter_glob: StringProperty(default="*.vgeo", options={'HIDDEN'})
+
+    @classmethod
+    def poll(cls, context):
+        return context.active_object and context.active_object.type == 'MESH'
+
+    def execute(self, context):
+        vgeo_build = find_vgeo_build()
+        if not vgeo_build:
+            self.report({'ERROR'}, "vgeo_build.exe not found")
             return {'CANCELLED'}
 
-        # Load the asset to get bounds
-        scene = vgeo_native.Scene()
-        obj_id = scene.add_object_from_file(self.filepath, None, "temp")
+        source_obj = context.active_object
+        tmp_obj = self.filepath.replace('.vgeo', '_tmp.obj')
 
-        if obj_id < 0:
-            self.report({'ERROR'}, f"Failed to load {self.filepath}")
+        # Isolate selection for export
+        prev_active = context.view_layer.objects.active
+        prev_selected = list(context.selected_objects)
+        bpy.ops.object.select_all(action='DESELECT')
+        source_obj.select_set(True)
+        context.view_layer.objects.active = source_obj
+
+        # Export OBJ — try Blender 4.x API first, fall back to legacy
+        exported = False
+        try:
+            bpy.ops.wm.obj_export(
+                filepath=tmp_obj,
+                export_selected_objects=True,
+                export_normals=True,
+                export_uv=False,
+                export_materials=False,
+            )
+            exported = True
+        except AttributeError:
+            pass
+
+        if not exported:
+            try:
+                bpy.ops.export_scene.obj(
+                    filepath=tmp_obj,
+                    use_selection=True,
+                    use_normals=True,
+                    use_uvs=False,
+                    use_materials=False,
+                )
+                exported = True
+            except Exception as e:
+                self.report({'ERROR'}, f"OBJ export failed: {e}")
+                return {'CANCELLED'}
+
+        # Restore selection
+        bpy.ops.object.select_all(action='DESELECT')
+        for o in prev_selected:
+            o.select_set(True)
+        context.view_layer.objects.active = prev_active
+
+        if not os.path.exists(tmp_obj):
+            self.report({'ERROR'}, "OBJ export produced no file")
             return {'CANCELLED'}
 
-        bounds = scene.get_object_bounds(obj_id)
-        stats = scene.get_stats()
+        # Run vgeo_build
+        print(f"VGEO: Converting {tmp_obj} -> {self.filepath}")
+        try:
+            result = subprocess.run(
+                [vgeo_build, tmp_obj, self.filepath],
+                capture_output=True, text=True, timeout=120
+            )
+        except subprocess.TimeoutExpired:
+            self.report({'ERROR'}, "vgeo_build timed out")
+            return {'CANCELLED'}
 
-        # Create an empty or cube as proxy
-        if self.create_proxy:
-            # Create a simple cube at the bounds
-            bpy.ops.mesh.primitive_cube_add()
-            obj = context.active_object
+        # Clean up temp OBJ
+        for ext in ['.obj', '.mtl']:
+            tmp = tmp_obj.replace('.obj', ext)
+            if os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except Exception:
+                    pass
 
-            # Scale to match bounds
-            min_b, max_b = bounds
-            size = [max_b[i] - min_b[i] for i in range(3)]
-            center = [(max_b[i] + min_b[i]) / 2 for i in range(3)]
+        if result.returncode != 0:
+            msg = result.stderr.strip()[:300] if result.stderr else "unknown error"
+            self.report({'ERROR'}, f"Conversion failed: {msg}")
+            print(f"VGEO: vgeo_build output:\n{result.stdout}\n{result.stderr}")
+            return {'CANCELLED'}
 
-            obj.scale = [s / 2 for s in size]  # Cube is 2x2x2
-            obj.location = center
-        else:
-            # Create an empty
-            bpy.ops.object.empty_add(type='CUBE')
-            obj = context.active_object
+        if not os.path.exists(self.filepath):
+            self.report({'ERROR'}, "vgeo_build produced no output file")
+            return {'CANCELLED'}
 
-            min_b, max_b = bounds
-            size = max(max_b[i] - min_b[i] for i in range(3))
-            obj.empty_display_size = size / 2
+        print(f"VGEO: Conversion complete\n{result.stdout}")
 
-        # Store VGEO path in custom property
-        obj.name = os.path.basename(self.filepath).replace('.vgeo', '')
-        obj["vgeo_path"] = self.filepath
-        obj["vgeo_meshlets"] = stats.get('total_meshlets', 0)
-        obj["vgeo_clusters"] = stats.get('total_clusters', 0)
-
-        self.report({'INFO'}, f"Imported VGEO: {obj.name} ({stats.get('total_meshlets', 0)} meshlets)")
-        return {'FINISHED'}
+        # Auto-import the result
+        return import_vgeo_file(self, self.filepath)
 
 
 class VGEO_OT_reload(Operator):
-    """Reload VGEO file for selected object"""
+    """Reload the VGEO file for the selected object"""
     bl_idname = "vgeo.reload"
     bl_label = "Reload VGEO"
     bl_options = {'REGISTER', 'UNDO'}
@@ -102,7 +201,6 @@ class VGEO_OT_reload(Operator):
             self.report({'ERROR'}, "VGEO file not found")
             return {'CANCELLED'}
 
-        # The engine will reload on next view_update
         self.report({'INFO'}, f"Marked for reload: {vgeo_path}")
         return {'FINISHED'}
 
@@ -110,6 +208,7 @@ class VGEO_OT_reload(Operator):
 # Operator list
 classes = [
     VGEO_OT_import,
+    VGEO_OT_convert,
     VGEO_OT_reload,
 ]
 
@@ -118,15 +217,21 @@ def menu_func_import(self, context):
     self.layout.operator(VGEO_OT_import.bl_idname, text="VGEO (.vgeo)")
 
 
+def menu_func_convert(self, context):
+    self.layout.operator(VGEO_OT_convert.bl_idname, text="Convert Mesh to VGEO")
+
+
 def register():
     for cls in classes:
         bpy.utils.register_class(cls)
 
     bpy.types.TOPBAR_MT_file_import.append(menu_func_import)
+    bpy.types.TOPBAR_MT_file_export.append(menu_func_convert)
     print("VGEO Operators: Registered")
 
 
 def unregister():
+    bpy.types.TOPBAR_MT_file_export.remove(menu_func_convert)
     bpy.types.TOPBAR_MT_file_import.remove(menu_func_import)
 
     for cls in reversed(classes):

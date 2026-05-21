@@ -26,17 +26,29 @@ class VGEORenderEngine(RenderEngine):
     bl_use_eevee_viewport = False
     bl_use_gpu_context = True
 
+    # Z-up (Blender) to Y-up (renderer) rotation — row-major, applied as ZUPYUP @ matrix
+    _ZUPYUP = np.array([
+        [1,  0, 0, 0],
+        [0,  0, 1, 0],
+        [0, -1, 0, 0],
+        [0,  0, 0, 1],
+    ], dtype=np.float32)
+
     def __init__(self):
         super().__init__()
         self.scene = None
         self.camera = None
         self.renderer = None
         self._object_map = {}  # Blender object -> VGEO object ID
+        self._initial_matrices = {}  # obj_name -> world matrix at import (row-major numpy)
+        self._current_matrices = {}  # obj_name -> current world matrix (row-major numpy)
         self._texture = None
         self._image = None  # Blender Image for pixel transfer
         self._last_width = 0
         self._last_height = 0
         self._needs_upload = False
+
+        self._debug_meshlets = False
 
         if NATIVE_AVAILABLE:
             self.scene = vgeo_native.Scene()
@@ -108,11 +120,29 @@ class VGEORenderEngine(RenderEngine):
         # Update camera from Blender's view
         self._update_camera(context)
 
-        # Get model transform (identity for now - transforms are in scene)
-        identity = np.eye(4, dtype=np.float32).flatten()
+        # OBJ exporter already converts Z-up→Y-up, so geometry is in Y-up space.
+        # Base model is identity. For proxy movement, conjugate the Z-up delta
+        # into Y-up: ZUPYUP @ delta_zup @ ZUPYUP.T
+        model_flat = np.eye(4, dtype=np.float32).flatten()
+        if self._object_map and self._current_matrices and self._initial_matrices:
+            first_name = next(iter(self._object_map))
+            current = self._current_matrices.get(first_name)
+            initial = self._initial_matrices.get(first_name)
+            if current is not None and initial is not None:
+                try:
+                    delta = current @ np.linalg.inv(initial)
+                    model_flat = (self._ZUPYUP @ delta @ self._ZUPYUP.T).T.flatten()
+                except np.linalg.LinAlgError:
+                    pass
+
+        # Sync debug mode
+        debug = context.scene.vgeo_debug_meshlets
+        if debug != self._debug_meshlets:
+            self._debug_meshlets = debug
+            self.renderer.set_debug_mode(debug)
 
         # Render the frame
-        self.renderer.render(self.camera, identity)
+        self.renderer.render(self.camera, model_flat)
 
         # Get pixels and display
         pixels = self.renderer.get_pixels_float()
@@ -120,40 +150,41 @@ class VGEORenderEngine(RenderEngine):
 
     def _sync_scene(self, depsgraph):
         """Synchronize Blender scene with VGEO scene"""
-        # Track which objects we've seen
         seen_objects = set()
 
         for obj in depsgraph.objects:
             if obj.type != 'MESH':
                 continue
 
-            # Check if this object has a vgeo_path custom property
             vgeo_path = obj.get("vgeo_path", None)
             if not vgeo_path:
                 continue
 
             seen_objects.add(obj.name)
 
-            # Get transform as flat 4x4 matrix (column-major for Vulkan)
-            transform = np.array(obj.matrix_world, dtype=np.float32).T.flatten()
+            # Row-major for our delta computation; column-major flat for scene/Vulkan
+            obj_mat = np.array(obj.matrix_world, dtype=np.float32)
+            transform = obj_mat.T.flatten()
+
+            self._current_matrices[obj.name] = obj_mat
 
             if obj.name in self._object_map:
-                # Update existing object's transform
                 vgeo_id = self._object_map[obj.name]
                 self.scene.set_transform(vgeo_id, transform)
             else:
-                # Add new object
                 vgeo_id = self.scene.add_object_from_file(vgeo_path, transform, obj.name)
                 if vgeo_id >= 0:
                     self._object_map[obj.name] = vgeo_id
+                    self._initial_matrices[obj.name] = obj_mat.copy()
                     self._needs_upload = True
                     print(f"VGEO: Added object '{obj.name}' (ID: {vgeo_id})")
 
-        # Remove objects that no longer exist
         for obj_name in list(self._object_map.keys()):
             if obj_name not in seen_objects:
                 vgeo_id = self._object_map.pop(obj_name)
                 self.scene.remove_object(vgeo_id)
+                self._initial_matrices.pop(obj_name, None)
+                self._current_matrices.pop(obj_name, None)
                 self._needs_upload = True
                 print(f"VGEO: Removed object '{obj_name}'")
 
@@ -174,23 +205,19 @@ class VGEORenderEngine(RenderEngine):
         region = context.region
         rv3d = context.region_data
 
-        # Get view matrix and extract camera position
+        # camera-to-world in Blender Z-up space
         view_matrix = rv3d.view_matrix.inverted()
         cam_pos = view_matrix.translation
-
-        # Camera looks down -Z in view space
         target = cam_pos - view_matrix.col[2].xyz * 10.0
 
-        self.camera.set_position(cam_pos.x, cam_pos.y, cam_pos.z)
-        self.camera.set_target(target.x, target.y, target.z)
+        # Convert Z-up (Blender) to Y-up (renderer): (x, y, z) -> (x, z, -y)
+        self.camera.set_position(cam_pos.x, cam_pos.z, -cam_pos.y)
+        self.camera.set_target(target.x, target.z, -target.y)
         self.camera.aspect = region.width / max(region.height, 1)
 
-        # Get FOV from view - perspective vs ortho
         if rv3d.is_perspective:
-            # Perspective view
-            self.camera.fov = 50.0  # Default Blender viewport FOV
+            self.camera.fov = 50.0
         else:
-            # Ortho view - use a small FOV approximation
             self.camera.fov = 5.0
 
         self.camera.update()
@@ -220,9 +247,8 @@ class VGEORenderEngine(RenderEngine):
             # pixels is already a flat RGBA float array from get_pixels_float()
             self._image.pixels.foreach_set(pixels)
 
-            # Get GPU texture from image
-            if self._texture is None:
-                self._texture = gpu.texture.from_image(self._image)
+            # Always recreate — cached texture won't reflect updated pixels
+            self._texture = gpu.texture.from_image(self._image)
 
             # Draw the texture covering the entire viewport
             gpu.state.blend_set('NONE')
@@ -374,7 +400,13 @@ def get_panels():
 def register():
     bpy.utils.register_class(VGEORenderEngine)
 
-    # Add VGEO to compatible engines for relevant panels
+    bpy.types.Scene.vgeo_debug_meshlets = bpy.props.BoolProperty(
+        name="Debug Meshlets",
+        description="Color each meshlet with a unique color",
+        default=False,
+        update=lambda self, ctx: ctx.area.tag_redraw() if ctx.area else None
+    )
+
     for panel in get_panels():
         panel.COMPAT_ENGINES.add('VGEO')
 
@@ -382,10 +414,10 @@ def register():
 
 
 def unregister():
-    # Remove VGEO from panel compatibility
     for panel in get_panels():
         if 'VGEO' in panel.COMPAT_ENGINES:
             panel.COMPAT_ENGINES.remove('VGEO')
 
+    del bpy.types.Scene.vgeo_debug_meshlets
     bpy.utils.unregister_class(VGEORenderEngine)
     print("VGEO Engine: Unregistered")
