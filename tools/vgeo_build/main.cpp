@@ -4,6 +4,7 @@
 #include "mesh_import.h"
 #include "meshlet_gen.h"
 #include "hierarchy.h"
+#include "simplify.h"
 #include "vgeo_writer.h"
 
 #include <iostream>
@@ -22,6 +23,7 @@ void print_usage() {
     std::cout << "  --max-tris N       Max triangles per meshlet (default: 126)\n";
     std::cout << "  --cluster-size N   Meshlets per cluster (default: 8)\n";
     std::cout << "  --branching N      Branching factor for LOD hierarchy (default: 4)\n";
+    std::cout << "  --simplify R       Decimate mesh to ratio R of triangles (0<R<1) via QEM\n";
     std::cout << "  --no-spatial       Disable spatial grouping (use sequential)\n";
     std::cout << "  --verbose          Print detailed stats\n";
 }
@@ -36,6 +38,7 @@ struct Options {
     uint32_t max_triangles = 126;
     uint32_t cluster_size = 8;
     uint32_t branching_factor = 4;
+    float simplify_ratio = 0.0f;  // 0 = disabled
     bool use_spatial_grouping = true;
     bool verbose = false;
 };
@@ -65,6 +68,8 @@ bool parse_args(int argc, char* argv[], Options& opts) {
             opts.cluster_size = std::stoi(argv[++i]);
         } else if (arg == "--branching" && i + 1 < argc) {
             opts.branching_factor = std::stoi(argv[++i]);
+        } else if (arg == "--simplify" && i + 1 < argc) {
+            opts.simplify_ratio = std::stof(argv[++i]);
         } else if (arg == "--no-spatial") {
             opts.use_spatial_grouping = false;
         } else {
@@ -88,6 +93,11 @@ bool parse_args(int argc, char* argv[], Options& opts) {
     }
     if (opts.branching_factor < 2 || opts.branching_factor > 16) {
         std::cerr << "Error: branching must be between 2 and 16\n";
+        return false;
+    }
+    if (opts.simplify_ratio != 0.0f &&
+        (opts.simplify_ratio <= 0.0f || opts.simplify_ratio >= 1.0f)) {
+        std::cerr << "Error: simplify ratio must be between 0 and 1 (exclusive)\n";
         return false;
     }
 
@@ -141,6 +151,24 @@ int main(int argc, char* argv[]) {
     if (mesh.vertex_count() == 0) {
         std::cerr << "Error: Mesh has no vertices\n";
         return 1;
+    }
+
+    // Optional: simplify mesh via quadric error metric before meshletization
+    if (opts.simplify_ratio > 0.0f) {
+        std::cout << "\nSimplifying mesh (ratio " << opts.simplify_ratio << ")...\n";
+        SimplifyParams sp;
+        sp.target_ratio = opts.simplify_ratio;
+
+        RawMesh simplified;
+        SimplifyResult sr;
+        if (!simplify_mesh(mesh, sp, simplified, sr)) {
+            std::cerr << "Error: Simplification failed\n";
+            return 1;
+        }
+        std::cout << "  Triangles: " << sr.input_triangles << " -> " << sr.output_triangles << "\n";
+        std::cout << "  Vertices:  " << sr.input_vertices << " -> " << sr.output_vertices << "\n";
+        std::cout << "  Geometric error: " << sr.error << "\n";
+        mesh = std::move(simplified);
     }
 
     // Step 2: Generate meshlets

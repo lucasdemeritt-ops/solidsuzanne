@@ -4,12 +4,14 @@
 #include "mesh_import.h"
 #include "meshlet_gen.h"
 #include "hierarchy.h"
+#include "simplify.h"
 #include "vgeo_writer.h"
 #include "vgeo_loader.h"
 
 #include <iostream>
 #include <cstdio>
 #include <cmath>
+#include <vector>
 
 using namespace vgeo;
 
@@ -231,6 +233,258 @@ TEST(bounding_sphere) {
     ASSERT(bs.radius < 1.5f);
 }
 
+// Decode an octahedral snorm16 normal back to a unit vector.
+// Mirrors encode_octahedral() in vgeo_writer.cpp.
+static void decode_octahedral(int16_t ix, int16_t iy, float& nx, float& ny, float& nz) {
+    float ox = std::max(-1.0f, ix / 32767.0f);
+    float oy = std::max(-1.0f, iy / 32767.0f);
+    nx = ox;
+    ny = oy;
+    nz = 1.0f - std::abs(ox) - std::abs(oy);
+    if (nz < 0.0f) {
+        float tx = (1.0f - std::abs(oy)) * (nx >= 0.0f ? 1.0f : -1.0f);
+        float ty = (1.0f - std::abs(ox)) * (ny >= 0.0f ? 1.0f : -1.0f);
+        nx = tx;
+        ny = ty;
+    }
+    float len = std::sqrt(nx * nx + ny * ny + nz * nz);
+    if (len > 1e-8f) { nx /= len; ny /= len; nz /= len; }
+}
+
+// Build an N x N grid of quads in the XZ plane (procedural, no asset needed).
+static RawMesh make_grid(uint32_t cells) {
+    RawMesh m;
+    uint32_t side = cells + 1;
+    for (uint32_t z = 0; z < side; z++) {
+        for (uint32_t x = 0; x < side; x++) {
+            float fx = static_cast<float>(x) / cells - 0.5f;
+            float fz = static_cast<float>(z) / cells - 0.5f;
+            m.positions.push_back(fx);
+            m.positions.push_back(0.0f);
+            m.positions.push_back(fz);
+        }
+    }
+    for (uint32_t z = 0; z < cells; z++) {
+        for (uint32_t x = 0; x < cells; x++) {
+            uint32_t a = z * side + x;
+            uint32_t b = a + 1;
+            uint32_t c = a + side;
+            uint32_t d = c + 1;
+            m.indices.push_back(a); m.indices.push_back(c); m.indices.push_back(b);
+            m.indices.push_back(b); m.indices.push_back(c); m.indices.push_back(d);
+        }
+    }
+    return m;
+}
+
+// Test: glTF 2.0 loader with embedded base64 buffer
+TEST(gltf_load) {
+    RawMesh mesh;
+    ASSERT(load_mesh("assets/cube.gltf", mesh));
+    ASSERT_EQ(mesh.vertex_count(), 8u);     // shared corners (no split normals)
+    ASSERT_EQ(mesh.triangle_count(), 12u);
+    ASSERT(!mesh.normals.empty());          // auto-computed when absent
+}
+
+// Test: octahedral normals survive the write -> load roundtrip.
+// On a unit icosphere the smooth normal ~= the radial direction, so each
+// decoded normal should align with its (normalized) position.
+TEST(octahedral_roundtrip) {
+    const char* test_file = "test_oct.vgeo";
+
+    RawMesh mesh;
+    ASSERT(load_mesh("assets/icosphere.obj", mesh));
+
+    MeshletParams mp;
+    MeshletData meshlets;
+    ASSERT(generate_meshlets(mesh, mp, meshlets));
+
+    HierarchyParams hp;
+    HierarchyData hierarchy;
+    ASSERT(build_hierarchy(meshlets, mesh, hp, hierarchy));
+
+    WriteParams wp;
+    ASSERT(write_vgeo(test_file, mesh, meshlets, hierarchy, wp));
+
+    auto asset = load_vgeo(test_file);
+    ASSERT(asset != nullptr);
+    ASSERT(asset->header.flags & Flags::HAS_NORMALS);
+    ASSERT_EQ(asset->normals.size(), asset->positions.size() / 3);
+
+    for (size_t v = 0; v < asset->normals.size(); v++) {
+        float nx, ny, nz;
+        decode_octahedral(asset->normals[v].x, asset->normals[v].y, nx, ny, nz);
+
+        // Decoded normal must be unit length.
+        float len = std::sqrt(nx * nx + ny * ny + nz * nz);
+        ASSERT(std::abs(len - 1.0f) < 1e-3f);
+
+        // And aligned with the outward radial direction.
+        float px = asset->positions[v * 3 + 0];
+        float py = asset->positions[v * 3 + 1];
+        float pz = asset->positions[v * 3 + 2];
+        float plen = std::sqrt(px * px + py * py + pz * pz);
+        if (plen > 1e-6f) {
+            float d = (nx * px + ny * py + nz * pz) / plen;
+            ASSERT(d > 0.9f);
+        }
+    }
+
+    std::remove(test_file);
+}
+
+// Test: multi-level hierarchy with deep nesting on a larger mesh
+TEST(hierarchy_multilevel) {
+    RawMesh mesh = make_grid(16);  // 512 triangles, 289 vertices
+    ASSERT_EQ(mesh.triangle_count(), 512u);
+
+    MeshletParams mp;
+    mp.max_vertices = 16;
+    mp.max_triangles = 8;
+    MeshletData meshlets;
+    ASSERT(generate_meshlets(mesh, mp, meshlets));
+    ASSERT(meshlets.meshlets.size() > 8);
+
+    HierarchyParams hp;
+    hp.meshlets_per_cluster = 2;
+    hp.branching_factor = 2;
+    HierarchyData hierarchy;
+    ASSERT(build_hierarchy(meshlets, mesh, hp, hierarchy));
+
+    // Should produce a genuinely multi-level DAG.
+    ASSERT(hierarchy.lod_levels >= 3);
+    ASSERT(hierarchy.total_internal_clusters >= 1);
+    ASSERT(!hierarchy.root_clusters.empty());
+
+    // Structural integrity: every non-root cluster is listed in exactly its
+    // parent's contiguous child range; every leaf carries meshlets.
+    uint32_t n = static_cast<uint32_t>(hierarchy.clusters.size());
+    for (uint32_t i = 0; i < n; i++) {
+        const ClusterNode& c = hierarchy.clusters[i];
+        if (c.parent_id != INVALID_ID) {
+            ASSERT(c.parent_id < n);
+            const ClusterNode& p = hierarchy.clusters[c.parent_id];
+            ASSERT(i >= p.child_start);
+            ASSERT(i < p.child_start + p.child_count);
+        }
+        if (c.child_count == 0) {
+            ASSERT(c.meshlet_count > 0);  // leaf clusters reference geometry
+        } else {
+            ASSERT(c.child_start + c.child_count <= n);
+        }
+    }
+}
+
+// Test: QEM simplification reduces triangles on a smooth mesh
+TEST(simplify_reduces) {
+    RawMesh mesh;
+    ASSERT(load_mesh("assets/icosphere.obj", mesh));
+    ASSERT_EQ(mesh.triangle_count(), 80u);
+
+    SimplifyParams sp;
+    sp.target_ratio = 0.5f;
+    RawMesh out;
+    SimplifyResult res;
+    ASSERT(simplify_mesh(mesh, sp, out, res));
+
+    // Strictly fewer triangles, but still a real mesh.
+    ASSERT(res.output_triangles < res.input_triangles);
+    ASSERT(res.output_triangles >= 1u);
+    ASSERT(res.output_triangles <= 56u);          // ~30%+ reduction achieved
+    ASSERT_EQ(out.triangle_count(), res.output_triangles);
+    ASSERT(out.vertex_count() < mesh.vertex_count());
+    ASSERT(res.error >= 0.0f);
+    ASSERT(std::isfinite(res.error));
+
+    // Output normals are present and unit length.
+    ASSERT_EQ(out.normals.size(), out.positions.size());
+    for (size_t v = 0; v < out.vertex_count(); v++) {
+        float nx = out.normals[v * 3 + 0];
+        float ny = out.normals[v * 3 + 1];
+        float nz = out.normals[v * 3 + 2];
+        float len = std::sqrt(nx * nx + ny * ny + nz * nz);
+        ASSERT(std::abs(len - 1.0f) < 1e-2f);
+    }
+}
+
+// Test: absolute target triangle count is respected (within a small margin)
+TEST(simplify_target_count) {
+    RawMesh mesh;
+    ASSERT(load_mesh("assets/icosphere.obj", mesh));
+
+    SimplifyParams sp;
+    sp.target_triangle_count = 20;
+    RawMesh out;
+    SimplifyResult res;
+    ASSERT(simplify_mesh(mesh, sp, out, res));
+
+    // Greedy collapse stops at the first count <= target, so we never go far
+    // below the target; flip rejection may leave us slightly above it.
+    ASSERT(res.output_triangles <= 28u);
+    ASSERT(res.output_triangles >= 16u);
+}
+
+// Test: more aggressive simplification yields larger geometric error
+TEST(simplify_error_monotonic) {
+    RawMesh mesh;
+    ASSERT(load_mesh("assets/icosphere.obj", mesh));
+
+    SimplifyParams none;
+    none.target_ratio = 1.0f;  // keep everything -> no collapses
+    RawMesh out_none; SimplifyResult res_none;
+    ASSERT(simplify_mesh(mesh, none, out_none, res_none));
+    ASSERT(res_none.error == 0.0f);
+    ASSERT_EQ(res_none.output_triangles, mesh.triangle_count());
+
+    SimplifyParams mild; mild.target_ratio = 0.75f;
+    RawMesh out_mild; SimplifyResult res_mild;
+    ASSERT(simplify_mesh(mesh, mild, out_mild, res_mild));
+
+    SimplifyParams hard; hard.target_ratio = 0.25f;
+    RawMesh out_hard; SimplifyResult res_hard;
+    ASSERT(simplify_mesh(mesh, hard, out_hard, res_hard));
+
+    ASSERT(res_hard.output_triangles < res_mild.output_triangles);
+    ASSERT(res_hard.error >= res_mild.error);
+}
+
+// Test: simplifying a watertight cube stays valid (no crash / no garbage)
+TEST(simplify_cube_valid) {
+    RawMesh mesh;
+    ASSERT(load_mesh("assets/cube.gltf", mesh));  // 8 shared verts, watertight
+
+    SimplifyParams sp;
+    sp.target_triangle_count = 4;
+    RawMesh out;
+    SimplifyResult res;
+    ASSERT(simplify_mesh(mesh, sp, out, res));
+
+    ASSERT(res.output_triangles >= 1u);
+    ASSERT(res.output_triangles <= mesh.triangle_count());
+    ASSERT(std::isfinite(res.error));
+
+    // No index may reference a vertex outside the compacted buffer.
+    for (uint32_t idx : out.indices) {
+        ASSERT(idx < out.vertex_count());
+    }
+    // No degenerate triangles remain.
+    for (size_t t = 0; t < out.indices.size(); t += 3) {
+        uint32_t a = out.indices[t + 0];
+        uint32_t b = out.indices[t + 1];
+        uint32_t c = out.indices[t + 2];
+        ASSERT(a != b && b != c && a != c);
+    }
+}
+
+// Test: empty / triangleless input is rejected cleanly
+TEST(simplify_rejects_empty) {
+    RawMesh empty;
+    SimplifyParams sp;
+    RawMesh out;
+    SimplifyResult res;
+    ASSERT(!simplify_mesh(empty, sp, out, res));
+}
+
 int main() {
     std::cout << "=== VGEO Pipeline Tests ===\n\n";
 
@@ -241,6 +495,14 @@ int main() {
     RUN_TEST(vgeo_roundtrip);
     RUN_TEST(icosphere_pipeline);
     RUN_TEST(bounding_sphere);
+    RUN_TEST(gltf_load);
+    RUN_TEST(octahedral_roundtrip);
+    RUN_TEST(hierarchy_multilevel);
+    RUN_TEST(simplify_reduces);
+    RUN_TEST(simplify_target_count);
+    RUN_TEST(simplify_error_monotonic);
+    RUN_TEST(simplify_cube_valid);
+    RUN_TEST(simplify_rejects_empty);
 
     std::cout << "\n=== Results ===\n";
     std::cout << "Tests run: " << tests_run << "\n";
