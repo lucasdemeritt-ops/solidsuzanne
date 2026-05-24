@@ -9,22 +9,6 @@
 
 namespace vgeo {
 
-// Helper to get chunk type name for error messages
-static const char* chunk_type_name(uint32_t type) {
-    switch (type) {
-        case ChunkType::VERT: return "VERT";
-        case ChunkType::NORM: return "NORM";
-        case ChunkType::UVCO: return "UVCO";
-        case ChunkType::INDX: return "INDX";
-        case ChunkType::MSLT: return "MSLT";
-        case ChunkType::CLST: return "CLST";
-        case ChunkType::BVOL: return "BVOL";
-        case ChunkType::CBND: return "CBND";
-        case ChunkType::CONE: return "CONE";
-        default: return "UNKNOWN";
-    }
-}
-
 std::unique_ptr<VGeoAsset> load_vgeo(const std::string& path) {
     std::ifstream file(path, std::ios::binary);
     if (!file.is_open()) {
@@ -65,51 +49,6 @@ std::unique_ptr<VGeoAsset> load_vgeo(const std::string& path) {
     // Create asset
     auto asset = std::make_unique<VGeoAsset>();
     asset->header = header;
-
-    // Helper to read a chunk
-    auto read_chunk = [&](uint32_t type, void* data, size_t expected_size) -> bool {
-        auto it = chunk_map.find(type);
-        if (it == chunk_map.end()) {
-            return false;
-        }
-
-        const ChunkEntry* entry = it->second;
-
-        if (entry->offset + entry->size > file_size) {
-            return false;
-        }
-
-        if (entry->size != expected_size) {
-            return false;
-        }
-
-        file.seekg(entry->offset);
-        file.read(reinterpret_cast<char*>(data), entry->size);
-
-        return file.good();
-    };
-
-    // Helper to read a chunk into a vector
-    auto read_chunk_vec = [&](uint32_t type, auto& vec, size_t element_size) -> bool {
-        auto it = chunk_map.find(type);
-        if (it == chunk_map.end()) {
-            return false;
-        }
-
-        const ChunkEntry* entry = it->second;
-
-        if (entry->offset + entry->size > file_size) {
-            return false;
-        }
-
-        size_t count = entry->size / element_size;
-        vec.resize(count);
-
-        file.seekg(entry->offset);
-        file.read(reinterpret_cast<char*>(vec.data()), entry->size);
-
-        return file.good();
-    };
 
     // Load VERT chunk - positions (float x 3 per vertex)
     {

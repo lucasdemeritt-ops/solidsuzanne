@@ -26,6 +26,7 @@ jobs:
           -DCMAKE_BUILD_TYPE=Release
           -DVGEO_BUILD_VIEWER=OFF
           -DVGEO_BUILD_PYTHON=OFF
+          -DCMAKE_CXX_FLAGS="-Wall -Wextra"
 
       - name: Build
         run: cmake --build build --parallel

@@ -33,8 +33,8 @@ struct HierarchyData {
 // Spatial partitioning helper for grouping nearby meshlets/clusters
 struct SpatialGroup {
     std::vector<uint32_t> indices;  // Indices of items in this group
-    BoundingSphere bounds;          // Combined bounding sphere
-    float error;                    // Combined error metric
+    BoundingSphere bounds{};        // Combined bounding sphere
+    float error = 0.0f;             // Combined error metric
 };
 
 // Build cluster hierarchy from meshlets using full multi-level DAG

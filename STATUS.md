@@ -75,11 +75,15 @@ color debug view in the Blender viewport) but are not part of automated testing:
 
 ## Testing
 
-`tests/unit/test_pipeline.cpp` covers the full CPU pipeline (15 tests):
+`tests/unit/test_pipeline.cpp` covers the full CPU pipeline (20 tests):
 OBJ + glTF loading, meshlet generation, multi-level hierarchy integrity,
-`.vgeo` roundtrip, octahedral-normal roundtrip accuracy, bounding spheres,
-and QEM simplification (reduction, target count, error monotonicity,
-watertight validity, empty-input rejection).
+`.vgeo` roundtrip and index-flag consistency, octahedral-normal roundtrip
+accuracy, bounding spheres, QEM simplification (reduction, target count,
+error monotonicity, watertight validity, empty-input rejection), and the
+scene graph (matrix utilities, asset caching/instancing, object lifecycle,
+transformed world bounds).
+
+The CI build compiles with `-Wall -Wextra`; the CPU pipeline is warning-clean.
 
 ```bash
 cmake -B build -DVGEO_BUILD_VIEWER=OFF -DVGEO_BUILD_PYTHON=OFF

@@ -395,6 +395,10 @@ void Scene::collect_draw_commands(
     float error_threshold,
     std::vector<DrawCommand>& out_commands
 ) {
+    // TODO: error_threshold will gate LOD-cut selection once internal clusters
+    // carry simplified geometry; for now all leaf clusters are emitted.
+    (void)error_threshold;
+
     out_commands.clear();
 
     for (const auto& obj : m_objects) {

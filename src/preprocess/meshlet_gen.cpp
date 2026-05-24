@@ -55,7 +55,7 @@ static BoundingSphere compute_bounding_sphere(
 
 // Helper: compute normal cone from triangle normals
 static NormalCone compute_normal_cone(
-    const std::vector<float>& normals,
+    const std::vector<float>& /*normals*/,  // cone is derived from face geometry
     const std::vector<float>& positions,
     const std::vector<uint32_t>& indices,
     uint32_t index_start,

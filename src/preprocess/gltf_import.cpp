@@ -300,9 +300,6 @@ private:
 // Base64 Decoder
 // ============================================================================
 
-static const char* BASE64_CHARS =
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
 static int base64_decode_char(char c) {
     if (c >= 'A' && c <= 'Z') return c - 'A';
     if (c >= 'a' && c <= 'z') return c - 'a' + 26;
@@ -895,7 +892,6 @@ static bool build_mesh(const GltfData& gltf, RawMesh& out_mesh) {
     out_mesh.indices.clear();
 
     bool has_any_normals = false;
-    bool has_any_uvs = false;
 
     // Process all meshes and their primitives
     for (const GltfMesh& mesh : gltf.meshes) {
@@ -913,7 +909,6 @@ static bool build_mesh(const GltfData& gltf, RawMesh& out_mesh) {
             if (vertex_count == 0) continue;
 
             // Read normals (optional)
-            size_t normals_start = out_mesh.normals.size();
             if (prim.normal >= 0) {
                 read_float_data(gltf, prim.normal, out_mesh.normals, 3);
                 has_any_normals = true;
@@ -927,10 +922,8 @@ static bool build_mesh(const GltfData& gltf, RawMesh& out_mesh) {
             }
 
             // Read UVs (optional)
-            size_t uvs_start = out_mesh.uvs.size();
             if (prim.texcoord_0 >= 0) {
                 read_float_data(gltf, prim.texcoord_0, out_mesh.uvs, 2);
-                has_any_uvs = true;
             }
 
             // Pad UVs if needed

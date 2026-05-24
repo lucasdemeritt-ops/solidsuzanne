@@ -54,7 +54,8 @@ static OctNormal encode_octahedral(float nx, float ny, float nz) {
 
 // Convert float to half-float (IEEE 754 binary16)
 static uint16_t float_to_half(float value) {
-    uint32_t f = *reinterpret_cast<uint32_t*>(&value);
+    uint32_t f;
+    std::memcpy(&f, &value, sizeof(f));
     uint32_t sign = (f >> 16) & 0x8000;
     int32_t exp = ((f >> 23) & 0xFF) - 127 + 15;
     uint32_t mantissa = f & 0x7FFFFF;
@@ -126,11 +127,9 @@ bool write_vgeo(
         flags |= Flags::HAS_UVS;
     }
 
-    // Determine if we can use 16-bit indices
-    bool use_16bit_indices = mesh.vertex_count() <= 65535;
-    if (use_16bit_indices) {
-        flags |= Flags::INDEX_16BIT;
-    }
+    // The INDX chunk is always written as 32-bit indices (see below), so the
+    // INDEX_16BIT flag is intentionally not set. Setting it without writing
+    // 16-bit data would mislead any consumer that binds the buffer as UINT16.
 
     // Count chunks
     uint32_t chunk_count = 0;
