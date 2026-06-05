@@ -4,20 +4,68 @@
 #include "renderer.h"
 #include "vgeo_loader.h"
 #include "cluster_manager.h"
-#include "../viewer/camera.h"
+#include "camera.h"
 
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
 
 #include <iostream>
+#include <fstream>
 #include <cstring>
 #include <set>
 #include <algorithm>
 #include <array>
+#include <filesystem>
 
 namespace vgeo {
 
-// Embedded SPIR-V shaders (pre-compiled)
+// Helper function to find shader directory
+static std::string find_shader_dir() {
+    // Try common locations relative to executable
+    std::vector<std::string> search_paths = {
+        "shaders",
+        "../shaders",
+        "../../shaders",
+        "../../../shaders",
+#ifdef VGEO_SHADER_DIR
+        VGEO_SHADER_DIR,
+#endif
+    };
+
+    for (const auto& path : search_paths) {
+        if (std::filesystem::exists(path) && std::filesystem::is_directory(path)) {
+            return path;
+        }
+    }
+
+    return "shaders";  // Default
+}
+
+// Load shader from file
+static std::vector<uint32_t> load_shader_file(const std::string& filename) {
+    std::string shader_dir = find_shader_dir();
+    std::string full_path = shader_dir + "/" + filename;
+
+    std::cout << "    Loading shader: " << full_path << "\n" << std::flush;
+
+    std::ifstream file(full_path, std::ios::ate | std::ios::binary);
+
+    if (!file.is_open()) {
+        std::cerr << "Failed to open shader file: " << full_path << "\n";
+        return {};
+    }
+
+    size_t file_size = static_cast<size_t>(file.tellg());
+    std::vector<uint32_t> buffer(file_size / sizeof(uint32_t));
+
+    file.seekg(0);
+    file.read(reinterpret_cast<char*>(buffer.data()), file_size);
+    file.close();
+
+    return buffer;
+}
+
+// Fallback embedded SPIR-V shaders (minimal, for testing only)
 // These are minimal shaders for testing - will be replaced with file loading
 
 // Vertex shader for basic rendering
@@ -181,16 +229,27 @@ bool Renderer::init(void* window_handle, uint32_t width, uint32_t height) {
     m_width = width;
     m_height = height;
 
+    std::cout << "  Creating instance...\n" << std::flush;
     if (!create_instance()) return false;
+    std::cout << "  Creating surface...\n" << std::flush;
     if (!create_surface(window_handle)) return false;
+    std::cout << "  Selecting physical device...\n" << std::flush;
     if (!select_physical_device()) return false;
+    std::cout << "  Creating logical device...\n" << std::flush;
     if (!create_device()) return false;
+    std::cout << "  Creating swapchain...\n" << std::flush;
     if (!create_swapchain()) return false;
+    std::cout << "  Creating render pass...\n" << std::flush;
     if (!create_render_pass()) return false;
+    std::cout << "  Creating framebuffers...\n" << std::flush;
     if (!create_framebuffers()) return false;
+    std::cout << "  Creating command pool...\n" << std::flush;
     if (!create_command_pool()) return false;
+    std::cout << "  Creating sync objects...\n" << std::flush;
     if (!create_sync_objects()) return false;
+    std::cout << "  Creating pipeline...\n" << std::flush;
     if (!create_pipeline()) return false;
+    std::cout << "  Creating triangle buffers...\n" << std::flush;
     if (!create_triangle_buffers()) return false;
 
     std::cout << "Vulkan renderer initialized successfully\n";
@@ -779,13 +838,37 @@ VkShaderModule Renderer::create_shader_module(const uint32_t* code, size_t size)
 }
 
 bool Renderer::create_pipeline() {
-    // Create shader modules
-    VkShaderModule vert_shader = create_shader_module(basic_vert_spv, sizeof(basic_vert_spv));
-    VkShaderModule frag_shader = create_shader_module(basic_frag_spv, sizeof(basic_frag_spv));
+    // Try to load shaders from files first
+    std::cout << "    Loading shaders from files...\n" << std::flush;
+
+    std::vector<uint32_t> vert_code = load_shader_file("basic.vert.spv");
+    std::vector<uint32_t> frag_code = load_shader_file("basic.frag.spv");
+
+    VkShaderModule vert_shader = VK_NULL_HANDLE;
+    VkShaderModule frag_shader = VK_NULL_HANDLE;
+
+    if (!vert_code.empty() && !frag_code.empty()) {
+        std::cout << "    Creating vertex shader module from file...\n" << std::flush;
+        vert_shader = create_shader_module(vert_code.data(), vert_code.size() * sizeof(uint32_t));
+        std::cout << "    Creating fragment shader module from file...\n" << std::flush;
+        frag_shader = create_shader_module(frag_code.data(), frag_code.size() * sizeof(uint32_t));
+    }
+
+    // Fallback to embedded shaders if file loading failed
+    if (vert_shader == VK_NULL_HANDLE) {
+        std::cout << "    Falling back to embedded vertex shader...\n" << std::flush;
+        vert_shader = create_shader_module(basic_vert_spv, sizeof(basic_vert_spv));
+    }
+    if (frag_shader == VK_NULL_HANDLE) {
+        std::cout << "    Falling back to embedded fragment shader...\n" << std::flush;
+        frag_shader = create_shader_module(basic_frag_spv, sizeof(basic_frag_spv));
+    }
 
     if (vert_shader == VK_NULL_HANDLE || frag_shader == VK_NULL_HANDLE) {
+        std::cerr << "    Shader module creation failed!\n" << std::flush;
         return false;
     }
+    std::cout << "    Shader modules created successfully\n" << std::flush;
 
     VkPipelineShaderStageCreateInfo vert_stage_info{};
     vert_stage_info.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
@@ -856,7 +939,7 @@ bool Renderer::create_pipeline() {
     rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
     rasterizer.lineWidth = 1.0f;
     rasterizer.cullMode = VK_CULL_MODE_BACK_BIT;
-    rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rasterizer.frontFace = VK_FRONT_FACE_CLOCKWISE;
     rasterizer.depthBiasEnable = VK_FALSE;
 
     VkPipelineMultisampleStateCreateInfo multisampling{};
@@ -895,24 +978,27 @@ bool Renderer::create_pipeline() {
     dynamic_state.dynamicStateCount = static_cast<uint32_t>(dynamic_states.size());
     dynamic_state.pDynamicStates = dynamic_states.data();
 
-    // Push constants for MVP matrix
+    // Push constants for MVP and Model matrices
     VkPushConstantRange push_constant{};
     push_constant.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
     push_constant.offset = 0;
-    push_constant.size = sizeof(float) * 16;  // mat4
+    push_constant.size = sizeof(float) * 32;  // 2x mat4 (MVP + Model)
 
     VkPipelineLayoutCreateInfo layout_info{};
     layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
     layout_info.pushConstantRangeCount = 1;
     layout_info.pPushConstantRanges = &push_constant;
 
+    std::cout << "    Creating pipeline layout...\n" << std::flush;
     if (vkCreatePipelineLayout(m_device, &layout_info, nullptr, &m_render_layout) != VK_SUCCESS) {
         std::cerr << "Failed to create pipeline layout\n";
         vkDestroyShaderModule(m_device, vert_shader, nullptr);
         vkDestroyShaderModule(m_device, frag_shader, nullptr);
         return false;
     }
+    std::cout << "    Pipeline layout created\n" << std::flush;
 
+    std::cout << "    Setting up graphics pipeline...\n" << std::flush;
     VkGraphicsPipelineCreateInfo pipeline_info{};
     pipeline_info.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
     pipeline_info.stageCount = 2;
@@ -929,16 +1015,22 @@ bool Renderer::create_pipeline() {
     pipeline_info.renderPass = m_render_pass;
     pipeline_info.subpass = 0;
 
-    if (vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipeline_info, nullptr, &m_render_pipeline) != VK_SUCCESS) {
-        std::cerr << "Failed to create graphics pipeline\n";
+    std::cout << "    Calling vkCreateGraphicsPipelines...\n" << std::flush;
+    VkResult result = vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipeline_info, nullptr, &m_render_pipeline);
+    std::cout << "    vkCreateGraphicsPipelines returned: " << result << "\n" << std::flush;
+
+    if (result != VK_SUCCESS) {
+        std::cerr << "Failed to create graphics pipeline (error: " << result << ")\n";
         vkDestroyShaderModule(m_device, vert_shader, nullptr);
         vkDestroyShaderModule(m_device, frag_shader, nullptr);
         return false;
     }
 
+    std::cout << "    Cleaning up shader modules...\n" << std::flush;
     vkDestroyShaderModule(m_device, vert_shader, nullptr);
     vkDestroyShaderModule(m_device, frag_shader, nullptr);
 
+    std::cout << "    Pipeline created successfully!\n" << std::flush;
     return true;
 }
 
@@ -1116,9 +1208,17 @@ void Renderer::render_triangle(const Camera& camera) {
     scissor.extent = m_swapchain_extent;
     vkCmdSetScissor(cmd, 0, 1, &scissor);
 
-    // Push MVP matrix
+    // Push MVP and Model matrices (identity model for test triangle)
+    struct {
+        float mvp[16];
+        float model[16];
+    } push_data;
+    std::memcpy(push_data.mvp, camera.view_projection, sizeof(push_data.mvp));
+    // Identity model matrix
+    float identity[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+    std::memcpy(push_data.model, identity, sizeof(push_data.model));
     vkCmdPushConstants(cmd, m_render_layout, VK_SHADER_STAGE_VERTEX_BIT, 0,
-        sizeof(float) * 16, camera.view_projection);
+        sizeof(push_data), &push_data);
 
     // Bind vertex buffer and draw
     VkBuffer vertex_buffers[] = {m_triangle_vertex_buffer};
@@ -1234,11 +1334,173 @@ void Renderer::render(const Camera& camera, const ClusterManager& clusters) {
     scissor.extent = m_swapchain_extent;
     vkCmdSetScissor(cmd, 0, 1, &scissor);
 
+    // Push MVP and Model matrices (identity model)
+    struct {
+        float mvp[16];
+        float model[16];
+    } push_data;
+    std::memcpy(push_data.mvp, camera.view_projection, sizeof(push_data.mvp));
+    float identity[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+    std::memcpy(push_data.model, identity, sizeof(push_data.model));
     vkCmdPushConstants(cmd, m_render_layout, VK_SHADER_STAGE_VERTEX_BIT, 0,
-        sizeof(float) * 16, camera.view_projection);
+        sizeof(push_data), &push_data);
 
     // Draw visible clusters
     const auto& visible = clusters.visible_clusters();
+
+    if (!visible.empty() && m_vertex_buffer != VK_NULL_HANDLE) {
+        VkBuffer vertex_buffers[] = {m_vertex_buffer};
+        VkDeviceSize offsets[] = {0};
+        vkCmdBindVertexBuffers(cmd, 0, 1, vertex_buffers, offsets);
+
+        if (m_index_buffer != VK_NULL_HANDLE) {
+            vkCmdBindIndexBuffer(cmd, m_index_buffer, 0, VK_INDEX_TYPE_UINT32);
+            vkCmdDrawIndexed(cmd, m_index_count, 1, 0, 0, 0);
+        } else {
+            vkCmdDraw(cmd, m_vertex_count, 1, 0, 0);
+        }
+    }
+
+    vkCmdEndRenderPass(cmd);
+    vkEndCommandBuffer(cmd);
+
+    VkSubmitInfo submit_info{};
+    submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+
+    VkSemaphore wait_semaphores[] = {m_image_available_semaphores[m_current_frame]};
+    VkPipelineStageFlags wait_stages[] = {VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT};
+    submit_info.waitSemaphoreCount = 1;
+    submit_info.pWaitSemaphores = wait_semaphores;
+    submit_info.pWaitDstStageMask = wait_stages;
+    submit_info.commandBufferCount = 1;
+    submit_info.pCommandBuffers = &cmd;
+
+    VkSemaphore signal_semaphores[] = {m_render_finished_semaphores[m_current_frame]};
+    submit_info.signalSemaphoreCount = 1;
+    submit_info.pSignalSemaphores = signal_semaphores;
+
+    vkQueueSubmit(m_graphics_queue, 1, &submit_info, m_in_flight_fences[m_current_frame]);
+
+    VkPresentInfoKHR present_info{};
+    present_info.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+    present_info.waitSemaphoreCount = 1;
+    present_info.pWaitSemaphores = signal_semaphores;
+
+    VkSwapchainKHR swapchains[] = {m_swapchain};
+    present_info.swapchainCount = 1;
+    present_info.pSwapchains = swapchains;
+    present_info.pImageIndices = &image_index;
+
+    result = vkQueuePresentKHR(m_present_queue, &present_info);
+
+    if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR || m_framebuffer_resized) {
+        m_framebuffer_resized = false;
+        recreate_swapchain();
+    }
+
+    m_current_frame = (m_current_frame + 1) % MAX_FRAMES_IN_FLIGHT;
+}
+
+void Renderer::render(const Camera& camera, const ClusterManager& clusters, const float* model_matrix) {
+    // Same as render() but with a model transform applied
+
+    if (!m_has_asset) {
+        render_triangle(camera);
+        return;
+    }
+
+    // Push constants: MVP matrix + Model matrix
+    struct PushConstants {
+        float mvp[16];
+        float model[16];
+    } push_data;
+
+    // Identity matrix for when no model transform
+    static const float identity[16] = {
+        1, 0, 0, 0,
+        0, 1, 0, 0,
+        0, 0, 1, 0,
+        0, 0, 0, 1
+    };
+
+    const float* model = model_matrix ? model_matrix : identity;
+
+    // Compute MVP = Projection * View * Model
+    if (model_matrix) {
+        for (int col = 0; col < 4; col++) {
+            for (int row = 0; row < 4; row++) {
+                push_data.mvp[col * 4 + row] = 0.0f;
+                for (int k = 0; k < 4; k++) {
+                    push_data.mvp[col * 4 + row] += camera.view_projection[k * 4 + row] * model_matrix[col * 4 + k];
+                }
+            }
+        }
+    } else {
+        std::memcpy(push_data.mvp, camera.view_projection, 16 * sizeof(float));
+    }
+
+    // Copy model matrix for normal transformation
+    std::memcpy(push_data.model, model, 16 * sizeof(float));
+
+    // Wait for previous frame
+    vkWaitForFences(m_device, 1, &m_in_flight_fences[m_current_frame], VK_TRUE, UINT64_MAX);
+
+    uint32_t image_index;
+    VkResult result = vkAcquireNextImageKHR(m_device, m_swapchain, UINT64_MAX,
+        m_image_available_semaphores[m_current_frame], VK_NULL_HANDLE, &image_index);
+
+    if (result == VK_ERROR_OUT_OF_DATE_KHR) {
+        recreate_swapchain();
+        return;
+    }
+
+    vkResetFences(m_device, 1, &m_in_flight_fences[m_current_frame]);
+
+    VkCommandBuffer cmd = m_command_buffers[m_current_frame];
+    vkResetCommandBuffer(cmd, 0);
+
+    VkCommandBufferBeginInfo begin_info{};
+    begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    vkBeginCommandBuffer(cmd, &begin_info);
+
+    VkRenderPassBeginInfo render_pass_info{};
+    render_pass_info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+    render_pass_info.renderPass = m_render_pass;
+    render_pass_info.framebuffer = m_framebuffers[image_index];
+    render_pass_info.renderArea.offset = {0, 0};
+    render_pass_info.renderArea.extent = m_swapchain_extent;
+
+    std::array<VkClearValue, 2> clear_values{};
+    clear_values[0].color = {{0.1f, 0.1f, 0.15f, 1.0f}};
+    clear_values[1].depthStencil = {1.0f, 0};
+    render_pass_info.clearValueCount = static_cast<uint32_t>(clear_values.size());
+    render_pass_info.pClearValues = clear_values.data();
+
+    vkCmdBeginRenderPass(cmd, &render_pass_info, VK_SUBPASS_CONTENTS_INLINE);
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_render_pipeline);
+
+    VkViewport viewport{};
+    viewport.x = 0.0f;
+    viewport.y = 0.0f;
+    viewport.width = static_cast<float>(m_swapchain_extent.width);
+    viewport.height = static_cast<float>(m_swapchain_extent.height);
+    viewport.minDepth = 0.0f;
+    viewport.maxDepth = 1.0f;
+    vkCmdSetViewport(cmd, 0, 1, &viewport);
+
+    VkRect2D scissor{};
+    scissor.offset = {0, 0};
+    scissor.extent = m_swapchain_extent;
+    vkCmdSetScissor(cmd, 0, 1, &scissor);
+
+    // Push MVP and Model matrices for rendering
+    vkCmdPushConstants(cmd, m_render_layout, VK_SHADER_STAGE_VERTEX_BIT, 0,
+        sizeof(push_data), &push_data);
+
+    // Draw visible clusters
+    const auto& visible = clusters.visible_clusters();
+
     if (!visible.empty() && m_vertex_buffer != VK_NULL_HANDLE) {
         VkBuffer vertex_buffers[] = {m_vertex_buffer};
         VkDeviceSize offsets[] = {0};

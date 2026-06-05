@@ -24,6 +24,9 @@ public:
     // Render frame
     void render(const Camera& camera, const ClusterManager& clusters);
 
+    // Render frame with model transform
+    void render(const Camera& camera, const ClusterManager& clusters, const float* model_matrix);
+
     // Render hardcoded triangle (for testing)
     void render_triangle(const Camera& camera);
 

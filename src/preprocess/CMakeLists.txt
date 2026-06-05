@@ -3,6 +3,7 @@
 
 add_library(vgeo_preprocess STATIC
     mesh_import.cpp
+    gltf_import.cpp
     meshlet_gen.cpp
     hierarchy.cpp
     vgeo_writer.cpp

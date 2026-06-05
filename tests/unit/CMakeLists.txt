@@ -4,7 +4,6 @@
 add_executable(test_pipeline test_pipeline.cpp)
 target_link_libraries(test_pipeline PRIVATE
     vgeo_preprocess
-    vgeo_runtime
     vgeo_core
 )
 add_test(NAME pipeline COMMAND test_pipeline

@@ -1,43 +1,37 @@
 #version 450
 
-// Inputs from vertex shader
 layout(location = 0) in vec3 fragNormal;
-layout(location = 1) in vec2 fragUV;
-layout(location = 2) in vec3 fragWorldPos;
+layout(location = 1) in flat uint fragMeshletId;
 
-// Output color
+layout(push_constant) uniform PushConstants {
+    mat4 mvp;
+    mat4 model;
+    uint debug_mode;
+} pc;
+
 layout(location = 0) out vec4 outColor;
 
-// Simple directional light
 const vec3 lightDir = normalize(vec3(1.0, 1.0, 1.0));
-const vec3 lightColor = vec3(1.0, 0.98, 0.95);
-const vec3 ambientColor = vec3(0.1, 0.12, 0.15);
 
-// Base material color
-const vec3 baseColor = vec3(0.8, 0.8, 0.8);
+vec3 meshlet_color(uint id) {
+    // Knuth multiplicative hash -> distinct hue per meshlet
+    uint h = id * 2654435761u;
+    float r = float((h >> 16) & 0xFFu) / 255.0;
+    float g = float((h >>  8) & 0xFFu) / 255.0;
+    float b = float( h        & 0xFFu) / 255.0;
+    return mix(vec3(0.15), vec3(r, g, b), 0.9);
+}
 
 void main() {
     vec3 N = normalize(fragNormal);
-
-    // Simple Lambert diffuse
     float NdotL = max(dot(N, lightDir), 0.0);
+    if (!gl_FrontFacing) NdotL = max(dot(-N, lightDir), 0.0);
 
-    // Two-sided lighting
-    if (!gl_FrontFacing) {
-        N = -N;
-        NdotL = max(dot(N, lightDir), 0.0);
+    if (pc.debug_mode == 1u) {
+        vec3 base = meshlet_color(fragMeshletId);
+        outColor = vec4(base * (0.4 + 0.6 * NdotL), 1.0);
+    } else {
+        vec3 color = vec3(0.3) + vec3(0.7) * NdotL;
+        outColor = vec4(color, 1.0);
     }
-
-    vec3 diffuse = baseColor * lightColor * NdotL;
-    vec3 ambient = baseColor * ambientColor;
-
-    vec3 color = ambient + diffuse;
-
-    // Simple tone mapping
-    color = color / (color + vec3(1.0));
-
-    // Gamma correction
-    color = pow(color, vec3(1.0/2.2));
-
-    outColor = vec4(color, 1.0);
 }

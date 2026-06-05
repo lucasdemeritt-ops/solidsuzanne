@@ -18,7 +18,8 @@ namespace ChunkType {
     constexpr uint32_t INDX = 0x58444E49; // "INDX"
     constexpr uint32_t MSLT = 0x544C534D; // "MSLT"
     constexpr uint32_t CLST = 0x54534C43; // "CLST"
-    constexpr uint32_t BVOL = 0x4C4F5642; // "BVOL"
+    constexpr uint32_t BVOL = 0x4C4F5642; // "BVOL" - meshlet bounding spheres
+    constexpr uint32_t CBND = 0x444E4243; // "CBND" - cluster bounding spheres
     constexpr uint32_t CONE = 0x454E4F43; // "CONE"
 }
 

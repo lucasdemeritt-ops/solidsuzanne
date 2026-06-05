@@ -16,12 +16,14 @@ using namespace vgeo;
 void print_usage() {
     std::cout << "Usage: vgeo_build <input.obj|gltf> <output.vgeo> [options]\n";
     std::cout << "\nOptions:\n";
-    std::cout << "  --compress       Enable LZ4 compression\n";
-    std::cout << "  --quantize       Quantize vertex positions\n";
-    std::cout << "  --max-verts N    Max vertices per meshlet (default: 64)\n";
-    std::cout << "  --max-tris N     Max triangles per meshlet (default: 126)\n";
-    std::cout << "  --cluster-size N Meshlets per cluster (default: 8)\n";
-    std::cout << "  --verbose        Print detailed stats\n";
+    std::cout << "  --compress         Enable LZ4 compression\n";
+    std::cout << "  --quantize         Quantize vertex positions\n";
+    std::cout << "  --max-verts N      Max vertices per meshlet (default: 64)\n";
+    std::cout << "  --max-tris N       Max triangles per meshlet (default: 126)\n";
+    std::cout << "  --cluster-size N   Meshlets per cluster (default: 8)\n";
+    std::cout << "  --branching N      Branching factor for LOD hierarchy (default: 4)\n";
+    std::cout << "  --no-spatial       Disable spatial grouping (use sequential)\n";
+    std::cout << "  --verbose          Print detailed stats\n";
 }
 
 // Parse command line arguments
@@ -33,6 +35,8 @@ struct Options {
     uint32_t max_vertices = 64;
     uint32_t max_triangles = 126;
     uint32_t cluster_size = 8;
+    uint32_t branching_factor = 4;
+    bool use_spatial_grouping = true;
     bool verbose = false;
 };
 
@@ -59,6 +63,10 @@ bool parse_args(int argc, char* argv[], Options& opts) {
             opts.max_triangles = std::stoi(argv[++i]);
         } else if (arg == "--cluster-size" && i + 1 < argc) {
             opts.cluster_size = std::stoi(argv[++i]);
+        } else if (arg == "--branching" && i + 1 < argc) {
+            opts.branching_factor = std::stoi(argv[++i]);
+        } else if (arg == "--no-spatial") {
+            opts.use_spatial_grouping = false;
         } else {
             std::cerr << "Unknown option: " << arg << "\n";
             return false;
@@ -76,6 +84,10 @@ bool parse_args(int argc, char* argv[], Options& opts) {
     }
     if (opts.cluster_size < 1 || opts.cluster_size > 64) {
         std::cerr << "Error: cluster-size must be between 1 and 64\n";
+        return false;
+    }
+    if (opts.branching_factor < 2 || opts.branching_factor > 16) {
+        std::cerr << "Error: branching must be between 2 and 16\n";
         return false;
     }
 
@@ -179,6 +191,8 @@ int main(int argc, char* argv[]) {
 
     HierarchyParams hierarchy_params;
     hierarchy_params.meshlets_per_cluster = opts.cluster_size;
+    hierarchy_params.branching_factor = opts.branching_factor;
+    hierarchy_params.use_spatial_grouping = opts.use_spatial_grouping;
 
     HierarchyData hierarchy;
     if (!build_hierarchy(meshlets, mesh, hierarchy_params, hierarchy)) {
@@ -190,6 +204,23 @@ int main(int argc, char* argv[]) {
 
     std::cout << "  Clusters:  " << hierarchy.clusters.size() << "\n";
     std::cout << "  LOD levels: " << hierarchy.lod_levels << "\n";
+    std::cout << "  Leaf clusters: " << hierarchy.total_leaf_clusters << "\n";
+    std::cout << "  Internal clusters: " << hierarchy.total_internal_clusters << "\n";
+    std::cout << "  Root clusters: " << hierarchy.root_clusters.size() << "\n";
+
+    if (opts.verbose) {
+        // Print cluster count per LOD level
+        std::vector<uint32_t> clusters_per_level(hierarchy.lod_levels, 0);
+        for (const auto& c : hierarchy.clusters) {
+            if (c.lod_level < hierarchy.lod_levels) {
+                clusters_per_level[c.lod_level]++;
+            }
+        }
+        std::cout << "  Clusters per level:\n";
+        for (uint32_t l = 0; l < hierarchy.lod_levels; l++) {
+            std::cout << "    Level " << l << ": " << clusters_per_level[l] << " clusters\n";
+        }
+    }
 
     // Step 4: Write .vgeo file
     std::cout << "\nWriting .vgeo file...\n";

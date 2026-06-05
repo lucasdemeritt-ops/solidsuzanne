@@ -140,7 +140,8 @@ bool write_vgeo(
     chunk_count++;  // INDX
     chunk_count++;  // MSLT
     chunk_count++;  // CLST
-    chunk_count++;  // BVOL
+    chunk_count++;  // BVOL (meshlet bounds)
+    if (!hierarchy.cluster_bounds.empty()) chunk_count++;  // CBND (cluster bounds)
     chunk_count++;  // CONE
 
     // Calculate sizes
@@ -193,32 +194,29 @@ bool write_vgeo(
         chunk_idx++;
     }
 
-    // INDX chunk - local indices within meshlets
+    // INDX chunk - global vertex indices (expanded from meshlet local indices)
     {
         chunk_types[chunk_idx] = ChunkType::INDX;
         auto& data = chunk_data[chunk_idx];
 
-        if (use_16bit_indices) {
-            // For local indices within meshlets, we use the meshlet's local_indices (uint8)
-            // But we need to convert them based on the vertex_indices mapping
-            // Actually, local_indices are 0-63 range (local to meshlet), so uint8 is fine
-            // But the spec says INDX uses 16 or 32 bit based on flags
-            // For simplicity, we'll store the local indices as-is (uint8 packed into u16/u32)
+        // Expand local indices to global indices using vertex_indices mapping
+        // For each meshlet, local_indices[i] indexes into vertex_indices[meshlet.vertex_offset + local_index]
+        std::vector<uint32_t> global_indices;
+        global_indices.reserve(index_count);
 
-            // The local_indices are already uint8, representing local vertex indices within each meshlet
-            // We'll expand them to uint32 for consistency
-            data.resize(index_count * sizeof(uint32_t));
-            uint32_t* indices_out = reinterpret_cast<uint32_t*>(data.data());
-            for (uint32_t i = 0; i < index_count; i++) {
-                indices_out[i] = meshlets.local_indices[i];
-            }
-        } else {
-            data.resize(index_count * sizeof(uint32_t));
-            uint32_t* indices_out = reinterpret_cast<uint32_t*>(data.data());
-            for (uint32_t i = 0; i < index_count; i++) {
-                indices_out[i] = meshlets.local_indices[i];
+        for (const auto& meshlet : meshlets.meshlets) {
+            for (uint32_t t = 0; t < meshlet.triangle_count; t++) {
+                for (uint32_t v = 0; v < 3; v++) {
+                    uint32_t local_idx_offset = meshlet.index_offset + t * 3 + v;
+                    uint8_t local_idx = meshlets.local_indices[local_idx_offset];
+                    uint32_t global_idx = meshlets.vertex_indices[meshlet.vertex_offset + local_idx];
+                    global_indices.push_back(global_idx);
+                }
             }
         }
+
+        data.resize(global_indices.size() * sizeof(uint32_t));
+        memcpy(data.data(), global_indices.data(), data.size());
         chunk_idx++;
     }
 
@@ -242,13 +240,23 @@ bool write_vgeo(
         chunk_idx++;
     }
 
-    // BVOL chunk - bounding spheres
+    // BVOL chunk - meshlet bounding spheres
     {
         chunk_types[chunk_idx] = ChunkType::BVOL;
         auto& data = chunk_data[chunk_idx];
         uint32_t bounds_count = static_cast<uint32_t>(meshlets.bounds.size());
         data.resize(bounds_count * sizeof(BoundingSphere));
         memcpy(data.data(), meshlets.bounds.data(), data.size());
+        chunk_idx++;
+    }
+
+    // CBND chunk - cluster bounding spheres (for LOD hierarchy traversal)
+    if (!hierarchy.cluster_bounds.empty()) {
+        chunk_types[chunk_idx] = ChunkType::CBND;
+        auto& data = chunk_data[chunk_idx];
+        uint32_t bounds_count = static_cast<uint32_t>(hierarchy.cluster_bounds.size());
+        data.resize(bounds_count * sizeof(BoundingSphere));
+        memcpy(data.data(), hierarchy.cluster_bounds.data(), data.size());
         chunk_idx++;
     }
 

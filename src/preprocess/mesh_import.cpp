@@ -1,7 +1,8 @@
 // VGEO Mesh Import
-// Load OBJ files and extract geometry data
+// Load OBJ, glTF and GLB files and extract geometry data
 
 #include "mesh_import.h"
+#include "gltf_import.h"
 
 #include <fstream>
 #include <sstream>
@@ -312,8 +313,11 @@ bool load_mesh(const std::string& path, RawMesh& out_mesh) {
         return load_obj(path, out_mesh);
     }
 
-    // TODO: Add glTF support
-    // For now, only OBJ is supported
+    if (has_extension(path, ".gltf") || has_extension(path, ".glb")) {
+        return load_gltf(path, out_mesh);
+    }
+
+    // Unsupported format
     return false;
 }
 

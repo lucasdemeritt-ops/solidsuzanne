@@ -19,6 +19,7 @@ static const char* chunk_type_name(uint32_t type) {
         case ChunkType::MSLT: return "MSLT";
         case ChunkType::CLST: return "CLST";
         case ChunkType::BVOL: return "BVOL";
+        case ChunkType::CBND: return "CBND";
         case ChunkType::CONE: return "CONE";
         default: return "UNKNOWN";
     }
@@ -247,6 +248,23 @@ std::unique_ptr<VGeoAsset> load_vgeo(const std::string& path) {
 
             file.seekg(entry->offset);
             file.read(reinterpret_cast<char*>(asset->clusters.data()), entry->size);
+
+            if (!file.good()) {
+                return nullptr;
+            }
+        }
+    }
+
+    // Load CBND chunk (cluster bounding spheres)
+    {
+        auto it = chunk_map.find(ChunkType::CBND);
+        if (it != chunk_map.end()) {
+            const ChunkEntry* entry = it->second;
+            size_t count = entry->size / sizeof(BoundingSphere);
+            asset->cluster_bounds.resize(count);
+
+            file.seekg(entry->offset);
+            file.read(reinterpret_cast<char*>(asset->cluster_bounds.data()), entry->size);
 
             if (!file.good()) {
                 return nullptr;
