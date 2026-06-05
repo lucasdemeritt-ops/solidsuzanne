@@ -932,10 +932,6 @@ void OffscreenRenderer::render(const Camera& camera, const ClusterManager& clust
     std::memcpy(push_data.model, model, sizeof(push_data.model));
     push_data.debug_mode = m_debug_mode ? 1u : 0u;
 
-    std::cout << "VGEO: MVP[0,0]=" << push_data.mvp[0] << " MVP[5]=" << push_data.mvp[5]
-              << " MVP[10]=" << push_data.mvp[10] << " MVP[14]=" << push_data.mvp[14]
-              << " debug=" << push_data.debug_mode << "\n";
-
     vkCmdPushConstants(m_command_buffer, m_pipeline_layout,
         VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
         0, sizeof(push_data), &push_data);
@@ -946,17 +942,11 @@ void OffscreenRenderer::render(const Camera& camera, const ClusterManager& clust
         vkCmdBindVertexBuffers(m_command_buffer, 0, 1, buffers, offsets);
 
         if (m_index_buffer) {
-            std::cout << "VGEO: Drawing " << m_index_count << " indices ("
-                      << (m_index_count/3) << " tris), " << m_vertex_count << " verts\n";
             vkCmdBindIndexBuffer(m_command_buffer, m_index_buffer, 0, VK_INDEX_TYPE_UINT32);
             vkCmdDrawIndexed(m_command_buffer, m_index_count, 1, 0, 0, 0);
         } else {
-            std::cout << "VGEO: Drawing " << m_vertex_count << " verts (no index buffer)\n";
             vkCmdDraw(m_command_buffer, m_vertex_count, 1, 0, 0);
         }
-    } else {
-        std::cout << "VGEO: No asset to draw (has_asset=" << m_has_asset
-                  << ", vertex_buffer=" << (m_vertex_buffer != VK_NULL_HANDLE) << ")\n";
     }
 
     vkCmdEndRenderPass(m_command_buffer);

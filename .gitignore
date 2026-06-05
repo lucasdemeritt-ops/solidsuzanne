@@ -26,6 +26,7 @@ __pycache__/
 *.egg-info/
 .venv/
 venv/
+*.pyd
 
 # Blender
 *.blend1
