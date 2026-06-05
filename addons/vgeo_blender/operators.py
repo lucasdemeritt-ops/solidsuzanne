@@ -73,7 +73,7 @@ class VGEO_OT_import(Operator, ImportHelper):
     bl_options = {'REGISTER', 'UNDO'}
 
     filename_ext = ".vgeo"
-    filter_glob: StringProperty(default="*.vgeo", options={'HIDDEN'})
+    filter_glob: StringProperty(default="*.vgeo;*.glb;*.gltf", options={'HIDDEN'})
 
     def execute(self, context):
         return import_vgeo_file(self, self.filepath)

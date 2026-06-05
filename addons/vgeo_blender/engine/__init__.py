@@ -42,6 +42,7 @@ class VGEORenderEngine(RenderEngine):
         self._object_map = {}  # Blender object -> VGEO object ID
         self._initial_matrices = {}  # obj_name -> world matrix at import (row-major numpy)
         self._current_matrices = {}  # obj_name -> current world matrix (row-major numpy)
+        self._upload_done = set()  # obj names whose geometry is on the GPU
         self._texture = None
         self._image = None  # Blender Image for pixel transfer
         self._last_width = 0
@@ -112,39 +113,37 @@ class VGEORenderEngine(RenderEngine):
             self._last_height = height
             self._texture = None  # Recreate texture
 
-        # Upload assets if needed
-        if self._needs_upload:
-            self._upload_assets()
-            self._needs_upload = False
-
-        # Update camera from Blender's view
-        self._update_camera(context)
-
-        # OBJ exporter already converts Z-up→Y-up, so geometry is in Y-up space.
-        # Base model is identity. For proxy movement, conjugate the Z-up delta
-        # into Y-up: ZUPYUP @ delta_zup @ ZUPYUP.T
-        model_flat = np.eye(4, dtype=np.float32).flatten()
-        if self._object_map and self._current_matrices and self._initial_matrices:
-            first_name = next(iter(self._object_map))
-            current = self._current_matrices.get(first_name)
-            initial = self._initial_matrices.get(first_name)
-            if current is not None and initial is not None:
-                try:
-                    delta = current @ np.linalg.inv(initial)
-                    model_flat = (self._ZUPYUP @ delta @ self._ZUPYUP.T).T.flatten()
-                except np.linalg.LinAlgError:
-                    pass
-
         # Sync debug mode
         debug = context.scene.vgeo_debug_meshlets
         if debug != self._debug_meshlets:
             self._debug_meshlets = debug
             self.renderer.set_debug_mode(debug)
 
-        # Render the frame
-        self.renderer.render(self.camera, model_flat)
+        # Update camera from Blender's view
+        self._update_camera(context)
 
-        # Get pixels and display
+        # Render each object with its own transform.
+        # Upload + draw per object so all objects appear (renderer holds one buffer at a time).
+        for obj_name, vgeo_id in self._object_map.items():
+            if self._needs_upload or obj_name not in self._upload_done:
+                self.renderer.upload_asset(self.scene, vgeo_id)
+                self._upload_done.add(obj_name)
+
+            current = self._current_matrices.get(obj_name)
+            initial = self._initial_matrices.get(obj_name)
+            model_flat = np.eye(4, dtype=np.float32).flatten()
+            if current is not None and initial is not None:
+                try:
+                    delta = current @ np.linalg.inv(initial)
+                    model_flat = (self._ZUPYUP @ delta @ self._ZUPYUP.T).T.flatten()
+                except np.linalg.LinAlgError:
+                    pass
+            self.renderer.render(self.camera, model_flat)
+
+        self._needs_upload = False
+
+        # Get pixels and display (last render call wins — multi-object compositing
+        # requires a proper render pass per object, which is a future improvement)
         pixels = self.renderer.get_pixels_float()
         self._blit_to_viewport(context, pixels, width, height)
 
@@ -185,6 +184,7 @@ class VGEORenderEngine(RenderEngine):
                 self.scene.remove_object(vgeo_id)
                 self._initial_matrices.pop(obj_name, None)
                 self._current_matrices.pop(obj_name, None)
+                self._upload_done.discard(obj_name)
                 self._needs_upload = True
                 print(f"VGEO: Removed object '{obj_name}'")
 
@@ -216,7 +216,9 @@ class VGEORenderEngine(RenderEngine):
         self.camera.aspect = region.width / max(region.height, 1)
 
         if rv3d.is_perspective:
-            self.camera.fov = 50.0
+            # rv3d.view_lens is the focal length in mm; convert to vertical FOV
+            lens = rv3d.view_lens if rv3d.view_lens > 0 else 50.0
+            self.camera.fov = 2.0 * np.degrees(np.arctan(18.0 / lens))
         else:
             self.camera.fov = 5.0
 
