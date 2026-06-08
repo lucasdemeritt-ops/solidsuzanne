@@ -4,6 +4,7 @@ out/
 cmake-build-*/
 *.o
 *.obj
+!tests/assets/**/*.obj
 *.exe
 *.dll
 *.so
