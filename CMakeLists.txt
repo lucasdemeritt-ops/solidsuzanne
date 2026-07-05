@@ -21,6 +21,8 @@ else()
     message(WARNING "Install Vulkan SDK from https://vulkan.lunarg.com/ to enable rendering.")
     set(VGEO_HAS_VULKAN OFF)
     set(VGEO_BUILD_VIEWER OFF)
+    # Python bindings wrap the Vulkan runtime, so they cannot build without it
+    set(VGEO_BUILD_PYTHON OFF)
 endif()
 
 # GLFW for windowing (only if building viewer)

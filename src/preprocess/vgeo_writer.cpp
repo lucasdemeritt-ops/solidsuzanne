@@ -54,7 +54,8 @@ static OctNormal encode_octahedral(float nx, float ny, float nz) {
 
 // Convert float to half-float (IEEE 754 binary16)
 static uint16_t float_to_half(float value) {
-    uint32_t f = *reinterpret_cast<uint32_t*>(&value);
+    uint32_t f;
+    std::memcpy(&f, &value, sizeof(f));
     uint32_t sign = (f >> 16) & 0x8000;
     int32_t exp = ((f >> 23) & 0xFF) - 127 + 15;
     uint32_t mantissa = f & 0x7FFFFF;
