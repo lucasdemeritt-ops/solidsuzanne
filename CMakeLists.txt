@@ -27,8 +27,9 @@ else()
     set(VGEO_BUILD_PYTHON OFF)
 endif()
 
-# GLFW for windowing (only if building viewer)
-if(VGEO_HAS_VULKAN AND VGEO_BUILD_VIEWER)
+# GLFW for windowing. vgeo_runtime links glfw (not just the viewer), so it
+# must be available whenever Vulkan targets are built.
+if(VGEO_HAS_VULKAN)
     include(FetchContent)
     FetchContent_Declare(
         glfw

@@ -9,21 +9,8 @@
 
 namespace vgeo {
 
-// Helper to get chunk type name for error messages
-static const char* chunk_type_name(uint32_t type) {
-    switch (type) {
-        case ChunkType::VERT: return "VERT";
-        case ChunkType::NORM: return "NORM";
-        case ChunkType::UVCO: return "UVCO";
-        case ChunkType::INDX: return "INDX";
-        case ChunkType::MSLT: return "MSLT";
-        case ChunkType::CLST: return "CLST";
-        case ChunkType::BVOL: return "BVOL";
-        case ChunkType::CBND: return "CBND";
-        case ChunkType::CONE: return "CONE";
-        default: return "UNKNOWN";
-    }
-}
+// Sanity cap: a hostile chunk_count would otherwise drive a huge allocation
+static constexpr uint32_t MAX_CHUNK_COUNT = 1024;
 
 std::unique_ptr<VGeoAsset> load_vgeo(const std::string& path) {
     std::ifstream file(path, std::ios::binary);
@@ -48,13 +35,21 @@ std::unique_ptr<VGeoAsset> load_vgeo(const std::string& path) {
         return nullptr;
     }
 
+    if (header.chunk_count > MAX_CHUNK_COUNT) {
+        return nullptr;
+    }
+
     // Read chunk directory
-    if (file_size < sizeof(FileHeader) + header.chunk_count * sizeof(ChunkEntry)) {
+    if (file_size < sizeof(FileHeader) +
+            static_cast<uint64_t>(header.chunk_count) * sizeof(ChunkEntry)) {
         return nullptr;
     }
 
     std::vector<ChunkEntry> chunks(header.chunk_count);
     file.read(reinterpret_cast<char*>(chunks.data()), header.chunk_count * sizeof(ChunkEntry));
+    if (!file.good()) {
+        return nullptr;
+    }
 
     // Build chunk map for easy lookup
     std::unordered_map<uint32_t, const ChunkEntry*> chunk_map;
@@ -66,209 +61,90 @@ std::unique_ptr<VGeoAsset> load_vgeo(const std::string& path) {
     auto asset = std::make_unique<VGeoAsset>();
     asset->header = header;
 
-    // Helper to read a chunk
-    auto read_chunk = [&](uint32_t type, void* data, size_t expected_size) -> bool {
+    // Read a chunk's payload into a vector of its element type.
+    // Bounds are checked in 64-bit so offset+size cannot wrap, and only
+    // whole elements are read so a truncated chunk size cannot overflow
+    // the vector's allocation.
+    auto read_chunk_vec = [&](uint32_t type, auto& vec, bool required) -> bool {
         auto it = chunk_map.find(type);
         if (it == chunk_map.end()) {
-            return false;
+            return !required;
         }
 
         const ChunkEntry* entry = it->second;
-
-        if (entry->offset + entry->size > file_size) {
+        if (static_cast<uint64_t>(entry->offset) + entry->size > file_size) {
             return false;
         }
 
-        if (entry->size != expected_size) {
-            return false;
-        }
-
-        file.seekg(entry->offset);
-        file.read(reinterpret_cast<char*>(data), entry->size);
-
-        return file.good();
-    };
-
-    // Helper to read a chunk into a vector
-    auto read_chunk_vec = [&](uint32_t type, auto& vec, size_t element_size) -> bool {
-        auto it = chunk_map.find(type);
-        if (it == chunk_map.end()) {
-            return false;
-        }
-
-        const ChunkEntry* entry = it->second;
-
-        if (entry->offset + entry->size > file_size) {
-            return false;
-        }
-
-        size_t count = entry->size / element_size;
+        using VecT = std::remove_reference_t<decltype(vec)>;
+        using ElemT = typename VecT::value_type;
+        size_t count = entry->size / sizeof(ElemT);
         vec.resize(count);
+        if (count == 0) {
+            return true;
+        }
 
         file.seekg(entry->offset);
-        file.read(reinterpret_cast<char*>(vec.data()), entry->size);
-
+        file.read(reinterpret_cast<char*>(vec.data()), count * sizeof(ElemT));
         return file.good();
     };
 
-    // Load VERT chunk - positions (float x 3 per vertex)
-    {
-        auto it = chunk_map.find(ChunkType::VERT);
-        if (it == chunk_map.end()) {
-            return nullptr;  // VERT is required
-        }
+    // Required chunks must also actually be present
+    if (chunk_map.find(ChunkType::VERT) == chunk_map.end()) return nullptr;
+    if (chunk_map.find(ChunkType::INDX) == chunk_map.end()) return nullptr;
+    if (chunk_map.find(ChunkType::MSLT) == chunk_map.end()) return nullptr;
 
-        const ChunkEntry* entry = it->second;
-        size_t float_count = entry->size / sizeof(float);
-        asset->positions.resize(float_count);
+    if (!read_chunk_vec(ChunkType::VERT, asset->positions, true)) return nullptr;
+    if (!read_chunk_vec(ChunkType::INDX, asset->indices, true)) return nullptr;
+    if (!read_chunk_vec(ChunkType::MSLT, asset->meshlets, true)) return nullptr;
 
-        file.seekg(entry->offset);
-        file.read(reinterpret_cast<char*>(asset->positions.data()), entry->size);
-
-        if (!file.good()) {
-            return nullptr;
-        }
-    }
-
-    // Load NORM chunk if present
     if (header.flags & Flags::HAS_NORMALS) {
-        auto it = chunk_map.find(ChunkType::NORM);
-        if (it != chunk_map.end()) {
-            const ChunkEntry* entry = it->second;
-            size_t count = entry->size / sizeof(OctNormal);
-            asset->normals.resize(count);
-
-            file.seekg(entry->offset);
-            file.read(reinterpret_cast<char*>(asset->normals.data()), entry->size);
-
-            if (!file.good()) {
-                return nullptr;
-            }
-        }
+        if (!read_chunk_vec(ChunkType::NORM, asset->normals, false)) return nullptr;
     }
-
-    // Load UVCO chunk if present
     if (header.flags & Flags::HAS_UVS) {
-        auto it = chunk_map.find(ChunkType::UVCO);
-        if (it != chunk_map.end()) {
-            const ChunkEntry* entry = it->second;
-            size_t count = entry->size / sizeof(uint16_t);
-            asset->uvs.resize(count);
+        if (!read_chunk_vec(ChunkType::UVCO, asset->uvs, false)) return nullptr;
+    }
+    if (!read_chunk_vec(ChunkType::BVOL, asset->meshlet_bounds, false)) return nullptr;
+    if (!read_chunk_vec(ChunkType::CONE, asset->meshlet_cones, false)) return nullptr;
+    if (!read_chunk_vec(ChunkType::CLST, asset->clusters, false)) return nullptr;
+    if (!read_chunk_vec(ChunkType::CBND, asset->cluster_bounds, false)) return nullptr;
 
-            file.seekg(entry->offset);
-            file.read(reinterpret_cast<char*>(asset->uvs.data()), entry->size);
+    // ========================================================================
+    // Cross-validate loaded data so a corrupt or hostile file cannot drive
+    // the renderer out of bounds.
+    // ========================================================================
 
-            if (!file.good()) {
-                return nullptr;
-            }
-        }
+    // Header counts must match the chunk payloads
+    if (asset->positions.size() != static_cast<uint64_t>(header.vertex_count) * 3) {
+        return nullptr;
+    }
+    if (asset->meshlets.size() != header.meshlet_count) {
+        return nullptr;
+    }
+    if (!asset->clusters.empty() && asset->clusters.size() != header.cluster_count) {
+        return nullptr;
     }
 
-    // Load INDX chunk
-    {
-        auto it = chunk_map.find(ChunkType::INDX);
-        if (it == chunk_map.end()) {
-            return nullptr;  // INDX is required
-        }
-
-        const ChunkEntry* entry = it->second;
-
-        // Indices are stored as uint32_t in the current implementation
-        size_t count = entry->size / sizeof(uint32_t);
-        asset->indices.resize(count);
-
-        file.seekg(entry->offset);
-        file.read(reinterpret_cast<char*>(asset->indices.data()), entry->size);
-
-        if (!file.good()) {
+    // Every index must reference a valid vertex
+    for (uint32_t idx : asset->indices) {
+        if (idx >= header.vertex_count) {
             return nullptr;
         }
     }
 
-    // Load MSLT chunk
-    {
-        auto it = chunk_map.find(ChunkType::MSLT);
-        if (it == chunk_map.end()) {
-            return nullptr;  // MSLT is required
-        }
-
-        const ChunkEntry* entry = it->second;
-        size_t count = entry->size / sizeof(MeshletDescriptor);
-        asset->meshlets.resize(count);
-
-        file.seekg(entry->offset);
-        file.read(reinterpret_cast<char*>(asset->meshlets.data()), entry->size);
-
-        if (!file.good()) {
+    // Cluster graph references must stay in range
+    const uint64_t cluster_count = asset->clusters.size();
+    const uint64_t meshlet_count = asset->meshlets.size();
+    for (const ClusterNode& node : asset->clusters) {
+        if (node.child_count != 0 &&
+            static_cast<uint64_t>(node.child_start) + node.child_count > cluster_count) {
             return nullptr;
         }
-    }
-
-    // Load BVOL chunk
-    {
-        auto it = chunk_map.find(ChunkType::BVOL);
-        if (it != chunk_map.end()) {
-            const ChunkEntry* entry = it->second;
-            size_t count = entry->size / sizeof(BoundingSphere);
-            asset->meshlet_bounds.resize(count);
-
-            file.seekg(entry->offset);
-            file.read(reinterpret_cast<char*>(asset->meshlet_bounds.data()), entry->size);
-
-            if (!file.good()) {
-                return nullptr;
-            }
+        if (static_cast<uint64_t>(node.meshlet_start) + node.meshlet_count > meshlet_count) {
+            return nullptr;
         }
-    }
-
-    // Load CONE chunk
-    {
-        auto it = chunk_map.find(ChunkType::CONE);
-        if (it != chunk_map.end()) {
-            const ChunkEntry* entry = it->second;
-            size_t count = entry->size / sizeof(NormalCone);
-            asset->meshlet_cones.resize(count);
-
-            file.seekg(entry->offset);
-            file.read(reinterpret_cast<char*>(asset->meshlet_cones.data()), entry->size);
-
-            if (!file.good()) {
-                return nullptr;
-            }
-        }
-    }
-
-    // Load CLST chunk
-    {
-        auto it = chunk_map.find(ChunkType::CLST);
-        if (it != chunk_map.end()) {
-            const ChunkEntry* entry = it->second;
-            size_t count = entry->size / sizeof(ClusterNode);
-            asset->clusters.resize(count);
-
-            file.seekg(entry->offset);
-            file.read(reinterpret_cast<char*>(asset->clusters.data()), entry->size);
-
-            if (!file.good()) {
-                return nullptr;
-            }
-        }
-    }
-
-    // Load CBND chunk (cluster bounding spheres)
-    {
-        auto it = chunk_map.find(ChunkType::CBND);
-        if (it != chunk_map.end()) {
-            const ChunkEntry* entry = it->second;
-            size_t count = entry->size / sizeof(BoundingSphere);
-            asset->cluster_bounds.resize(count);
-
-            file.seekg(entry->offset);
-            file.read(reinterpret_cast<char*>(asset->cluster_bounds.data()), entry->size);
-
-            if (!file.good()) {
-                return nullptr;
-            }
+        if (node.parent_id != INVALID_ID && node.parent_id >= cluster_count) {
+            return nullptr;
         }
     }
 
@@ -306,8 +182,14 @@ bool validate_vgeo(const std::string& path, std::string& out_error) {
         return false;
     }
 
+    if (header.chunk_count > MAX_CHUNK_COUNT) {
+        out_error = "Unreasonable chunk count";
+        return false;
+    }
+
     // Validate chunk directory fits
-    size_t directory_end = sizeof(FileHeader) + header.chunk_count * sizeof(ChunkEntry);
+    uint64_t directory_end = sizeof(FileHeader) +
+        static_cast<uint64_t>(header.chunk_count) * sizeof(ChunkEntry);
     if (file_size < directory_end) {
         out_error = "File too small for chunk directory";
         return false;
@@ -331,8 +213,8 @@ bool validate_vgeo(const std::string& path, std::string& out_error) {
             return false;
         }
 
-        // Check chunk data fits within file
-        if (chunk.offset + chunk.size > file_size) {
+        // Check chunk data fits within file (64-bit so offset+size can't wrap)
+        if (static_cast<uint64_t>(chunk.offset) + chunk.size > file_size) {
             out_error = "Chunk " + std::to_string(i) + " extends beyond file end";
             return false;
         }

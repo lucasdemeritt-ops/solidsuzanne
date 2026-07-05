@@ -8,6 +8,9 @@
 #include <sstream>
 #include <unordered_map>
 #include <cmath>
+#include <cstdlib>
+#include <cerrno>
+#include <limits>
 #include <algorithm>
 
 namespace vgeo {
@@ -33,6 +36,21 @@ struct VertexKeyHash {
     }
 };
 
+// Parse a decimal integer without throwing (std::stoi throws on malformed
+// or out-of-range input, which would crash the importer on a bad OBJ file)
+static bool parse_int(const std::string& s, int& out) {
+    if (s.empty()) return false;
+    errno = 0;
+    char* end = nullptr;
+    long v = std::strtol(s.c_str(), &end, 10);
+    if (end == s.c_str() || *end != '\0' || errno == ERANGE ||
+        v < std::numeric_limits<int>::min() || v > std::numeric_limits<int>::max()) {
+        return false;
+    }
+    out = static_cast<int>(v);
+    return true;
+}
+
 // Parse an OBJ face vertex index (can be v, v/vt, v/vt/vn, or v//vn)
 static bool parse_face_vertex(const std::string& token, int& pos_idx, int& uv_idx, int& norm_idx) {
     pos_idx = 0;
@@ -42,27 +60,30 @@ static bool parse_face_vertex(const std::string& token, int& pos_idx, int& uv_id
     size_t first_slash = token.find('/');
     if (first_slash == std::string::npos) {
         // Just position index
-        pos_idx = std::stoi(token);
-        return true;
+        return parse_int(token, pos_idx);
     }
 
-    pos_idx = std::stoi(token.substr(0, first_slash));
+    if (!parse_int(token.substr(0, first_slash), pos_idx)) {
+        return false;
+    }
 
     size_t second_slash = token.find('/', first_slash + 1);
     if (second_slash == std::string::npos) {
         // v/vt format
         if (first_slash + 1 < token.length()) {
-            uv_idx = std::stoi(token.substr(first_slash + 1));
+            if (!parse_int(token.substr(first_slash + 1), uv_idx)) return false;
         }
         return true;
     }
 
     // v/vt/vn or v//vn format
     if (second_slash > first_slash + 1) {
-        uv_idx = std::stoi(token.substr(first_slash + 1, second_slash - first_slash - 1));
+        if (!parse_int(token.substr(first_slash + 1, second_slash - first_slash - 1), uv_idx)) {
+            return false;
+        }
     }
     if (second_slash + 1 < token.length()) {
-        norm_idx = std::stoi(token.substr(second_slash + 1));
+        if (!parse_int(token.substr(second_slash + 1), norm_idx)) return false;
     }
 
     return true;
@@ -135,25 +156,25 @@ static bool load_obj(const std::string& path, RawMesh& out_mesh) {
         iss >> prefix;
 
         if (prefix == "v") {
-            // Vertex position
-            float x, y, z;
-            iss >> x >> y >> z;
+            // Vertex position (skip malformed lines rather than pushing garbage)
+            float x = 0.0f, y = 0.0f, z = 0.0f;
+            if (!(iss >> x >> y >> z)) continue;
             temp_positions.push_back(x);
             temp_positions.push_back(y);
             temp_positions.push_back(z);
         }
         else if (prefix == "vn") {
             // Vertex normal
-            float x, y, z;
-            iss >> x >> y >> z;
+            float x = 0.0f, y = 0.0f, z = 0.0f;
+            if (!(iss >> x >> y >> z)) continue;
             temp_normals.push_back(x);
             temp_normals.push_back(y);
             temp_normals.push_back(z);
         }
         else if (prefix == "vt") {
             // Texture coordinate
-            float u, v;
-            iss >> u >> v;
+            float u = 0.0f, v = 0.0f;
+            if (!(iss >> u >> v)) continue;
             temp_uvs.push_back(u);
             temp_uvs.push_back(v);
         }

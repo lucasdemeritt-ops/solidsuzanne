@@ -28,6 +28,7 @@ const char* chunk_type_str(uint32_t type) {
         case ChunkType::MSLT: return "MSLT";
         case ChunkType::CLST: return "CLST";
         case ChunkType::BVOL: return "BVOL";
+        case ChunkType::CBND: return "CBND";
         case ChunkType::CONE: return "CONE";
         default: return "????";
     }
@@ -156,7 +157,7 @@ bool validate_file(const std::string& path, bool show_stats, bool dump_chunks) {
             std::cerr << "Error: Chunk " << i << " (" << chunk_type_str(chunk.type)
                       << ") offset beyond file end\n";
             valid = false;
-        } else if (chunk.offset + chunk.size > file_size) {
+        } else if (static_cast<uint64_t>(chunk.offset) + chunk.size > file_size) {
             std::cerr << "Error: Chunk " << i << " (" << chunk_type_str(chunk.type)
                       << ") extends beyond file end\n";
             valid = false;
@@ -213,6 +214,10 @@ bool validate_file(const std::string& path, bool show_stats, bool dump_chunks) {
 
         // Try to load and validate hierarchy
         auto asset = load_vgeo(path);
+        if (!asset) {
+            std::cerr << "Error: Chunk directory looks valid but deep load failed\n";
+            valid = false;
+        }
         if (asset) {
             std::cout << "\n=== Hierarchy ===\n";
             std::cout << "Clusters loaded:    " << asset->clusters.size() << "\n";
@@ -258,17 +263,36 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    std::string path = argv[1];
+    std::string path;
     bool show_stats = false;
     bool dump_chunks = false;
 
-    for (int i = 2; i < argc; i++) {
+    // Accept options and the path in any order; reject unknown options
+    for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
         if (arg == "--stats") {
             show_stats = true;
         } else if (arg == "--dump") {
             dump_chunks = true;
+        } else if (arg == "--help" || arg == "-h") {
+            print_usage();
+            return 0;
+        } else if (!arg.empty() && arg[0] == '-') {
+            std::cerr << "Unknown option: " << arg << "\n";
+            print_usage();
+            return 1;
+        } else if (path.empty()) {
+            path = arg;
+        } else {
+            std::cerr << "Multiple input files given\n";
+            print_usage();
+            return 1;
         }
+    }
+
+    if (path.empty()) {
+        print_usage();
+        return 1;
     }
 
     std::cout << "vgeo_validate v0.1\n";

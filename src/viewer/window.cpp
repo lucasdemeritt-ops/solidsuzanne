@@ -39,9 +39,15 @@ bool Window::create(const WindowConfig& config) {
     }
 
     m_handle = window;
-    m_width = config.width;
-    m_height = config.height;
     m_should_close = false;
+
+    // Use the actual framebuffer size, not the requested window size: on
+    // HiDPI displays the framebuffer is larger than the window's screen
+    // coordinates, and the swapchain must match the framebuffer
+    int fb_width = 0, fb_height = 0;
+    glfwGetFramebufferSize(window, &fb_width, &fb_height);
+    m_width = static_cast<uint32_t>(fb_width);
+    m_height = static_cast<uint32_t>(fb_height);
 
     // Store this pointer for callbacks
     glfwSetWindowUserPointer(window, this);
@@ -64,8 +70,11 @@ bool Window::create(const WindowConfig& config) {
     glfwSetKeyCallback(window, [](GLFWwindow* win, int key, int /*scancode*/, int action, int /*mods*/) {
         Window* w = static_cast<Window*>(glfwGetWindowUserPointer(win));
         if (w && w->m_key_callback) {
-            bool pressed = (action == GLFW_PRESS || action == GLFW_REPEAT);
-            w->m_key_callback(key, pressed);
+            // Only initial presses: GLFW_REPEAT would re-fire toggles
+            // (cluster colors, wireframe) at the OS key-repeat rate
+            if (action == GLFW_PRESS || action == GLFW_RELEASE) {
+                w->m_key_callback(key, action == GLFW_PRESS);
+            }
         }
     });
 
@@ -102,6 +111,13 @@ void* Window::native_handle() const {
 bool Window::should_close() const {
     if (!m_handle) return true;
     return m_should_close || glfwWindowShouldClose(static_cast<GLFWwindow*>(m_handle));
+}
+
+void Window::request_close() {
+    m_should_close = true;
+    if (m_handle) {
+        glfwSetWindowShouldClose(static_cast<GLFWwindow*>(m_handle), GLFW_TRUE);
+    }
 }
 
 void Window::poll_events() {

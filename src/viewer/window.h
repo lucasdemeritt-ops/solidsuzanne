@@ -19,6 +19,7 @@ public:
 
     void* native_handle() const;
     bool should_close() const;
+    void request_close();
     void poll_events();
 
     uint32_t width() const;

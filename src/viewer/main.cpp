@@ -188,7 +188,7 @@ int main(int argc, char* argv[]) {
 
         switch (key) {
             case GLFW_KEY_ESCAPE:
-                // Request close - handled by window
+                window.request_close();
                 break;
             case GLFW_KEY_C:
                 show_clusters = !show_clusters;
@@ -230,6 +230,10 @@ int main(int argc, char* argv[]) {
     int frame_count = 0;
     float fps_timer = 0.0f;
 
+    // Resize tracking
+    uint32_t last_width = window.width();
+    uint32_t last_height = window.height();
+
     // Main loop
     std::cout << "Entering main loop...\n";
     while (!window.should_close()) {
@@ -256,8 +260,18 @@ int main(int argc, char* argv[]) {
         // Poll input
         window.poll_events();
 
-        // Handle resize
-        if (window.width() != camera.aspect * window.height()) {
+        // Skip frames while minimized: a 0x0 framebuffer would produce a
+        // division by zero below and an invalid zero-extent swapchain
+        if (window.width() == 0 || window.height() == 0) {
+            continue;
+        }
+
+        // Handle resize. Compare integers — reconstructing the width from
+        // the float aspect ratio misdetects a resize every frame for many
+        // window sizes, causing endless swapchain recreation.
+        if (window.width() != last_width || window.height() != last_height) {
+            last_width = window.width();
+            last_height = window.height();
             camera.aspect = static_cast<float>(window.width()) / static_cast<float>(window.height());
             camera.update();
             renderer.resize(window.width(), window.height());

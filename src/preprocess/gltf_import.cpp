@@ -9,6 +9,7 @@
 #include <string>
 #include <unordered_map>
 #include <cstring>
+#include <cstdlib>
 #include <cmath>
 #include <algorithm>
 #include <memory>
@@ -109,8 +110,12 @@ public:
     }
 
 private:
+    // Recursion cap so hostile input like "[[[[..." cannot overflow the stack
+    static constexpr int MAX_DEPTH = 256;
+
     const std::string* json_ = nullptr;
     size_t pos_ = 0;
+    int depth_ = 0;
 
     char peek() const {
         return pos_ < json_->size() ? (*json_)[pos_] : '\0';
@@ -135,14 +140,22 @@ private:
         skip_whitespace();
         char c = peek();
 
-        if (c == '{') return parse_object();
-        if (c == '[') return parse_array();
-        if (c == '"') return parse_string();
-        if (c == 't' || c == 'f') return parse_bool();
-        if (c == 'n') return parse_null();
-        if (c == '-' || (c >= '0' && c <= '9')) return parse_number();
+        if (depth_ >= MAX_DEPTH) {
+            return std::make_shared<JsonValue>();
+        }
 
-        return std::make_shared<JsonValue>();
+        depth_++;
+        std::shared_ptr<JsonValue> result;
+        if (c == '{') result = parse_object();
+        else if (c == '[') result = parse_array();
+        else if (c == '"') result = parse_string();
+        else if (c == 't' || c == 'f') result = parse_bool();
+        else if (c == 'n') result = parse_null();
+        else if (c == '-' || (c >= '0' && c <= '9')) result = parse_number();
+        else result = std::make_shared<JsonValue>();
+        depth_--;
+
+        return result;
     }
 
     std::shared_ptr<JsonValue> parse_object() {
@@ -264,8 +277,12 @@ private:
             while (peek() >= '0' && peek() <= '9') get();
         }
 
+        // strtod never throws (std::stod throws on malformed/overflowing
+        // input like "-" or "1e999", killing the importer)
         std::string num_str = json_->substr(start, pos_ - start);
-        value->number_value = std::stod(num_str);
+        char* end = nullptr;
+        double parsed = std::strtod(num_str.c_str(), &end);
+        value->number_value = (end != num_str.c_str()) ? parsed : 0.0;
         return value;
     }
 
@@ -299,9 +316,6 @@ private:
 // ============================================================================
 // Base64 Decoder
 // ============================================================================
-
-static const char* BASE64_CHARS =
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 static int base64_decode_char(char c) {
     if (c >= 'A' && c <= 'Z') return c - 'A';
@@ -487,12 +501,30 @@ static const uint8_t* get_accessor_data(
     size_t num_components = get_type_components(accessor.type);
     size_t element_size = component_size * num_components;
 
+    // Unknown component/element types would produce a zero stride below
+    if (element_size == 0) {
+        return nullptr;
+    }
+
     out_count = accessor.count;
     out_stride = view.byte_stride > 0 ? view.byte_stride : element_size;
-
-    size_t offset = view.byte_offset + accessor.byte_offset;
-    if (offset >= buffer.data.size()) {
+    if (out_stride < element_size) {
         return nullptr;
+    }
+
+    // Validate the full accessor range, not just its first byte: a corrupt
+    // or hostile file with a large count would otherwise be read far past
+    // the end of the buffer. All math in 64-bit to avoid wrapping.
+    uint64_t offset = static_cast<uint64_t>(view.byte_offset) + accessor.byte_offset;
+    if (offset > buffer.data.size()) {
+        return nullptr;
+    }
+    if (out_count > 0) {
+        uint64_t last_end = offset +
+            static_cast<uint64_t>(out_count - 1) * out_stride + element_size;
+        if (last_end > buffer.data.size()) {
+            return nullptr;
+        }
     }
 
     return buffer.data.data() + offset;
@@ -895,7 +927,6 @@ static bool build_mesh(const GltfData& gltf, RawMesh& out_mesh) {
     out_mesh.indices.clear();
 
     bool has_any_normals = false;
-    bool has_any_uvs = false;
 
     // Process all meshes and their primitives
     for (const GltfMesh& mesh : gltf.meshes) {
@@ -913,7 +944,6 @@ static bool build_mesh(const GltfData& gltf, RawMesh& out_mesh) {
             if (vertex_count == 0) continue;
 
             // Read normals (optional)
-            size_t normals_start = out_mesh.normals.size();
             if (prim.normal >= 0) {
                 read_float_data(gltf, prim.normal, out_mesh.normals, 3);
                 has_any_normals = true;
@@ -927,10 +957,8 @@ static bool build_mesh(const GltfData& gltf, RawMesh& out_mesh) {
             }
 
             // Read UVs (optional)
-            size_t uvs_start = out_mesh.uvs.size();
             if (prim.texcoord_0 >= 0) {
                 read_float_data(gltf, prim.texcoord_0, out_mesh.uvs, 2);
-                has_any_uvs = true;
             }
 
             // Pad UVs if needed
@@ -953,6 +981,15 @@ static bool build_mesh(const GltfData& gltf, RawMesh& out_mesh) {
 
     if (out_mesh.positions.empty()) {
         return false;
+    }
+
+    // Reject files whose index data points outside the vertex array; the
+    // meshlet builder and normal generation index positions[] unchecked
+    uint32_t total_vertices = static_cast<uint32_t>(out_mesh.positions.size() / 3);
+    for (uint32_t idx : out_mesh.indices) {
+        if (idx >= total_vertices) {
+            return false;
+        }
     }
 
     // Generate normals if none were provided

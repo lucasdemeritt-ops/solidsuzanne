@@ -10,14 +10,17 @@
 #include <string>
 #include <chrono>
 #include <iomanip>
+#include <cstdlib>
+#include <cerrno>
+#include <limits>
 
 using namespace vgeo;
 
 void print_usage() {
     std::cout << "Usage: vgeo_build <input.obj|gltf> <output.vgeo> [options]\n";
     std::cout << "\nOptions:\n";
-    std::cout << "  --compress         Enable LZ4 compression\n";
-    std::cout << "  --quantize         Quantize vertex positions\n";
+    std::cout << "  --compress         Enable LZ4 compression (not yet implemented)\n";
+    std::cout << "  --quantize         Quantize vertex positions (not yet implemented)\n";
     std::cout << "  --max-verts N      Max vertices per meshlet (default: 64)\n";
     std::cout << "  --max-tris N       Max triangles per meshlet (default: 126)\n";
     std::cout << "  --cluster-size N   Meshlets per cluster (default: 8)\n";
@@ -40,7 +43,31 @@ struct Options {
     bool verbose = false;
 };
 
+// Parse a option value as a bounded unsigned integer without throwing
+// (std::stoi aborts the process on non-numeric or overflowing input)
+static bool parse_uint_arg(const char* name, const char* text, uint32_t& out) {
+    errno = 0;
+    char* end = nullptr;
+    unsigned long v = std::strtoul(text, &end, 10);
+    if (end == text || *end != '\0' || errno == ERANGE || text[0] == '-' ||
+        v > std::numeric_limits<uint32_t>::max()) {
+        std::cerr << "Error: " << name << " expects a non-negative integer, got '"
+                  << text << "'\n";
+        return false;
+    }
+    out = static_cast<uint32_t>(v);
+    return true;
+}
+
 bool parse_args(int argc, char* argv[], Options& opts) {
+    // Handle help before positional parsing so "vgeo_build --help" works
+    for (int i = 1; i < argc; i++) {
+        std::string arg = argv[i];
+        if (arg == "--help" || arg == "-h") {
+            return false;
+        }
+    }
+
     if (argc < 3) {
         return false;
     }
@@ -57,14 +84,20 @@ bool parse_args(int argc, char* argv[], Options& opts) {
             opts.quantize = true;
         } else if (arg == "--verbose") {
             opts.verbose = true;
-        } else if (arg == "--max-verts" && i + 1 < argc) {
-            opts.max_vertices = std::stoi(argv[++i]);
-        } else if (arg == "--max-tris" && i + 1 < argc) {
-            opts.max_triangles = std::stoi(argv[++i]);
-        } else if (arg == "--cluster-size" && i + 1 < argc) {
-            opts.cluster_size = std::stoi(argv[++i]);
-        } else if (arg == "--branching" && i + 1 < argc) {
-            opts.branching_factor = std::stoi(argv[++i]);
+        } else if (arg == "--max-verts" || arg == "--max-tris" ||
+                   arg == "--cluster-size" || arg == "--branching") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: " << arg << " requires a value\n";
+                return false;
+            }
+            uint32_t* target =
+                (arg == "--max-verts")    ? &opts.max_vertices :
+                (arg == "--max-tris")     ? &opts.max_triangles :
+                (arg == "--cluster-size") ? &opts.cluster_size :
+                                            &opts.branching_factor;
+            if (!parse_uint_arg(arg.c_str(), argv[++i], *target)) {
+                return false;
+            }
         } else if (arg == "--no-spatial") {
             opts.use_spatial_grouping = false;
         } else {
@@ -113,6 +146,13 @@ int main(int argc, char* argv[]) {
     if (!parse_args(argc, argv, opts)) {
         print_usage();
         return 1;
+    }
+
+    if (opts.compress) {
+        std::cout << "Warning: --compress is not implemented yet; writing uncompressed data\n";
+    }
+    if (opts.quantize) {
+        std::cout << "Warning: --quantize is not implemented yet; writing float32 positions\n";
     }
 
     std::cout << "Input:  " << opts.input << "\n";
