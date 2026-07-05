@@ -98,16 +98,17 @@ inline void look_at(float* out, const float* eye, const float* target, const flo
 }
 
 // Perspective matrix (column-major, Vulkan NDC: y-down, z [0,1])
-inline void perspective_vulkan(float* out, float fov_y_rad, float aspect, float near, float far) {
+// (parameters named z_near/z_far because Windows headers #define near/far)
+inline void perspective_vulkan(float* out, float fov_y_rad, float aspect, float z_near, float z_far) {
     float tan_half_fov = std::tan(fov_y_rad / 2.0f);
 
     std::memset(out, 0, sizeof(float) * 16);
 
     out[0]  = 1.0f / (aspect * tan_half_fov);
     out[5]  = -1.0f / tan_half_fov;  // Negative for Vulkan y-down
-    out[10] = far / (near - far);
+    out[10] = z_far / (z_near - z_far);
     out[11] = -1.0f;
-    out[14] = (near * far) / (near - far);
+    out[14] = (z_near * z_far) / (z_near - z_far);
 }
 
 } // anonymous namespace
@@ -152,11 +153,12 @@ void Camera::update() {
     frustum_planes[3][2] = m[11] - m[9];
     frustum_planes[3][3] = m[15] - m[13];
 
-    // Near plane: row3 + row2 (for Vulkan z [0,1])
-    frustum_planes[4][0] = m[3]  + m[2];
-    frustum_planes[4][1] = m[7]  + m[6];
-    frustum_planes[4][2] = m[11] + m[10];
-    frustum_planes[4][3] = m[15] + m[14];
+    // Near plane: row2 alone (Vulkan clip space has z in [0,1], so the
+    // near-side constraint is z >= 0, not the GL-style z >= -w)
+    frustum_planes[4][0] = m[2];
+    frustum_planes[4][1] = m[6];
+    frustum_planes[4][2] = m[10];
+    frustum_planes[4][3] = m[14];
 
     // Far plane: row3 - row2
     frustum_planes[5][0] = m[3]  - m[2];

@@ -130,6 +130,43 @@ TEST(hierarchy_build) {
     ASSERT(has_root);
 }
 
+// Test: leaf clusters partition the meshlets (each meshlet in exactly one
+// leaf's contiguous range) and cluster_id back-references are consistent
+TEST(hierarchy_leaf_ranges) {
+    RawMesh mesh;
+    ASSERT(load_mesh("assets/icosphere.obj", mesh));
+
+    // Small limits to force many meshlets and multiple leaf clusters
+    MeshletParams mp;
+    mp.max_vertices = 16;
+    mp.max_triangles = 8;
+
+    MeshletData meshlets;
+    ASSERT(generate_meshlets(mesh, mp, meshlets));
+    ASSERT(meshlets.meshlets.size() > 2);
+
+    HierarchyParams hp;
+    hp.meshlets_per_cluster = 2;
+
+    HierarchyData hierarchy;
+    ASSERT(build_hierarchy(meshlets, mesh, hp, hierarchy));
+
+    std::vector<uint32_t> owner(meshlets.meshlets.size(), INVALID_ID);
+    for (uint32_t c = 0; c < hierarchy.clusters.size(); c++) {
+        const ClusterNode& node = hierarchy.clusters[c];
+        if (node.child_count != 0) continue;  // Internal node
+        for (uint32_t m = node.meshlet_start; m < node.meshlet_start + node.meshlet_count; m++) {
+            ASSERT(m < meshlets.meshlets.size());
+            ASSERT_EQ(owner[m], INVALID_ID);  // No meshlet claimed twice
+            owner[m] = c;
+        }
+    }
+    for (size_t m = 0; m < owner.size(); m++) {
+        ASSERT(owner[m] != INVALID_ID);                     // Every meshlet claimed
+        ASSERT_EQ(meshlets.meshlets[m].cluster_id, owner[m]);  // Back-reference matches
+    }
+}
+
 // Test: Write and read VGEO file
 TEST(vgeo_roundtrip) {
     const char* test_file = "test_output.vgeo";
@@ -238,6 +275,7 @@ int main() {
     RUN_TEST(meshlet_gen_small);
     RUN_TEST(meshlet_gen_multiple);
     RUN_TEST(hierarchy_build);
+    RUN_TEST(hierarchy_leaf_ranges);
     RUN_TEST(vgeo_roundtrip);
     RUN_TEST(icosphere_pipeline);
     RUN_TEST(bounding_sphere);

@@ -173,6 +173,10 @@ std::vector<SpatialGroup> group_spatially(
         return groups;
     }
 
+    // Guard against division by zero / degenerate grouping below
+    target_group_size = std::max(target_group_size, 1u);
+    branching_factor = std::max(branching_factor, 1u);
+
     // Special case: few items, just make one group
     if (indices.size() <= branching_factor) {
         SpatialGroup group;
@@ -307,6 +311,11 @@ uint32_t calculate_lod_levels(
         return 1;
     }
 
+    // meshlets_per_cluster == 0 would divide by zero below;
+    // branching_factor < 2 would make the reduction loop spin forever
+    meshlets_per_cluster = std::max(meshlets_per_cluster, 1u);
+    branching_factor = std::max(branching_factor, 2u);
+
     // Calculate leaf cluster count
     uint32_t leaf_count = (meshlet_count + meshlets_per_cluster - 1) / meshlets_per_cluster;
 
@@ -345,13 +354,19 @@ struct ClusterInfo {
 // ============================================================================
 
 bool build_hierarchy(
-    const MeshletData& meshlets,
+    MeshletData& meshlets,
     const RawMesh& mesh,
-    const HierarchyParams& params,
+    const HierarchyParams& params_in,
     HierarchyData& out_hierarchy
 ) {
     // mesh parameter reserved for future use (e.g., quadric error metric computation)
     (void)mesh;
+
+    // Sanitize parameters: 0 meshlets-per-cluster divides by zero and a
+    // branching factor below 2 never converges to a root
+    HierarchyParams params = params_in;
+    params.meshlets_per_cluster = std::max(params.meshlets_per_cluster, 1u);
+    params.branching_factor = std::max(params.branching_factor, 2u);
 
     out_hierarchy.clusters.clear();
     out_hierarchy.cluster_bounds.clear();
@@ -430,6 +445,42 @@ bool build_hierarchy(
         }
     }
 
+    // ========================================================================
+    // Reorder meshlets so each leaf group occupies a contiguous range.
+    // ClusterNode only stores meshlet_start/meshlet_count, but spatial
+    // grouping produces arbitrary index sets — without this permutation,
+    // clusters would reference meshlets belonging to other clusters.
+    // Descriptor offsets into the shared vertex/index streams are absolute,
+    // so permuting the descriptor/bounds/cones arrays is safe.
+    // ========================================================================
+    {
+        std::vector<MeshletDescriptor> new_descs;
+        std::vector<BoundingSphere> new_bounds;
+        std::vector<NormalCone> new_cones;
+        new_descs.reserve(meshlet_count);
+        new_bounds.reserve(meshlet_count);
+        new_cones.reserve(meshlet_count);
+
+        uint32_t next_start = 0;
+        for (auto& group : leaf_groups) {
+            for (uint32_t old_idx : group.indices) {
+                new_descs.push_back(meshlets.meshlets[old_idx]);
+                new_bounds.push_back(meshlets.bounds[old_idx]);
+                if (old_idx < meshlets.cones.size()) {
+                    new_cones.push_back(meshlets.cones[old_idx]);
+                }
+            }
+            // Rewrite the group to its new contiguous range
+            uint32_t group_size = static_cast<uint32_t>(group.indices.size());
+            std::iota(group.indices.begin(), group.indices.end(), next_start);
+            next_start += group_size;
+        }
+
+        meshlets.meshlets = std::move(new_descs);
+        meshlets.bounds = std::move(new_bounds);
+        meshlets.cones = std::move(new_cones);
+    }
+
     // Reserve space for temp clusters
     temp_clusters.reserve(leaf_groups.size() * 2);
 
@@ -443,12 +494,10 @@ bool build_hierarchy(
         info.node.child_start = 0;
         info.node.child_count = 0;  // Leaf nodes have no children
 
-        // Store meshlet range
+        // Store meshlet range (contiguous after the reorder above)
         if (!group.indices.empty()) {
-            std::vector<uint32_t> sorted_indices = group.indices;
-            std::sort(sorted_indices.begin(), sorted_indices.end());
-            info.node.meshlet_start = sorted_indices[0];
-            info.node.meshlet_count = static_cast<uint32_t>(sorted_indices.size());
+            info.node.meshlet_start = group.indices.front();
+            info.node.meshlet_count = static_cast<uint32_t>(group.indices.size());
         } else {
             info.node.meshlet_start = 0;
             info.node.meshlet_count = 0;
@@ -637,6 +686,16 @@ bool build_hierarchy(
     for (auto& info : reordered) {
         out_hierarchy.clusters.push_back(info.node);
         out_hierarchy.cluster_bounds.push_back(info.bounds);
+    }
+
+    // Back-reference: stamp each meshlet with its owning leaf cluster
+    for (uint32_t cluster_idx = 0; cluster_idx < out_hierarchy.clusters.size(); cluster_idx++) {
+        const ClusterNode& node = out_hierarchy.clusters[cluster_idx];
+        if (node.child_count != 0) continue;  // Only leaves own meshlets
+        for (uint32_t m = node.meshlet_start;
+             m < node.meshlet_start + node.meshlet_count && m < meshlet_count; m++) {
+            meshlets.meshlets[m].cluster_id = cluster_idx;
+        }
     }
 
     // ========================================================================

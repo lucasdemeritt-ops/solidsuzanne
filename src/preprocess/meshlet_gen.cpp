@@ -53,17 +53,15 @@ static BoundingSphere compute_bounding_sphere(
     return sphere;
 }
 
-// Helper: compute normal cone from triangle normals
+// Helper: compute normal cone from the face normals of the meshlet's triangles
 static NormalCone compute_normal_cone(
-    const std::vector<float>& normals,
     const std::vector<float>& positions,
     const std::vector<uint32_t>& indices,
-    uint32_t index_start,
-    uint32_t triangle_count
+    const std::vector<uint32_t>& triangle_ids
 ) {
     NormalCone cone = {};
 
-    if (triangle_count == 0) {
+    if (triangle_ids.empty()) {
         cone.axis[0] = 0;
         cone.axis[1] = 127;
         cone.axis[2] = 0;
@@ -73,10 +71,10 @@ static NormalCone compute_normal_cone(
 
     // Compute average normal (cone axis)
     float ax = 0.0f, ay = 0.0f, az = 0.0f;
-    for (uint32_t t = 0; t < triangle_count; t++) {
-        uint32_t i0 = indices[index_start + t * 3 + 0];
-        uint32_t i1 = indices[index_start + t * 3 + 1];
-        uint32_t i2 = indices[index_start + t * 3 + 2];
+    for (uint32_t t : triangle_ids) {
+        uint32_t i0 = indices[t * 3 + 0];
+        uint32_t i1 = indices[t * 3 + 1];
+        uint32_t i2 = indices[t * 3 + 2];
 
         // Compute face normal
         float p0x = positions[i0 * 3 + 0], p0y = positions[i0 * 3 + 1], p0z = positions[i0 * 3 + 2];
@@ -112,10 +110,10 @@ static NormalCone compute_normal_cone(
 
     // Find minimum dot product (maximum angle from axis)
     float min_dot = 1.0f;
-    for (uint32_t t = 0; t < triangle_count; t++) {
-        uint32_t i0 = indices[index_start + t * 3 + 0];
-        uint32_t i1 = indices[index_start + t * 3 + 1];
-        uint32_t i2 = indices[index_start + t * 3 + 2];
+    for (uint32_t t : triangle_ids) {
+        uint32_t i0 = indices[t * 3 + 0];
+        uint32_t i1 = indices[t * 3 + 1];
+        uint32_t i2 = indices[t * 3 + 2];
 
         float p0x = positions[i0 * 3 + 0], p0y = positions[i0 * 3 + 1], p0z = positions[i0 * 3 + 2];
         float p1x = positions[i1 * 3 + 0], p1y = positions[i1 * 3 + 1], p1z = positions[i1 * 3 + 2];
@@ -138,11 +136,13 @@ static NormalCone compute_normal_cone(
         }
     }
 
-    // Convert to snorm8
-    cone.axis[0] = static_cast<int8_t>(std::clamp(ax * 127.0f, -127.0f, 127.0f));
-    cone.axis[1] = static_cast<int8_t>(std::clamp(ay * 127.0f, -127.0f, 127.0f));
-    cone.axis[2] = static_cast<int8_t>(std::clamp(az * 127.0f, -127.0f, 127.0f));
-    cone.cos_angle = static_cast<int8_t>(std::clamp(min_dot * 127.0f, -127.0f, 127.0f));
+    // Convert to snorm8. Round the axis to nearest; round cos_angle toward
+    // negative infinity so the quantized cone is never narrower than the
+    // true cone (a too-narrow cone would let culling drop visible meshlets).
+    cone.axis[0] = static_cast<int8_t>(std::clamp(std::round(ax * 127.0f), -127.0f, 127.0f));
+    cone.axis[1] = static_cast<int8_t>(std::clamp(std::round(ay * 127.0f), -127.0f, 127.0f));
+    cone.axis[2] = static_cast<int8_t>(std::clamp(std::round(az * 127.0f), -127.0f, 127.0f));
+    cone.cos_angle = static_cast<int8_t>(std::clamp(std::floor(min_dot * 127.0f), -127.0f, 127.0f));
 
     return cone;
 }
@@ -164,7 +164,8 @@ bool generate_meshlets(
         return true;  // Empty mesh is valid
     }
 
-    const uint32_t max_vertices = params.max_vertices;
+    // Local indices are stored as uint8, so a meshlet can address at most 256 vertices
+    const uint32_t max_vertices = std::min(params.max_vertices, 256u);
     const uint32_t max_triangles = params.max_triangles;
     const uint32_t triangle_count = static_cast<uint32_t>(mesh.indices.size() / 3);
 
@@ -188,6 +189,7 @@ bool generate_meshlets(
         std::vector<uint32_t> meshlet_vertices;
         std::unordered_map<uint32_t, uint8_t> vertex_to_local;
         std::vector<uint8_t> meshlet_local_indices;
+        std::vector<uint32_t> meshlet_triangles;  // Global triangle ids in this meshlet
         uint32_t meshlet_triangle_count = 0;
 
         // Find an unused triangle to seed the meshlet
@@ -243,6 +245,7 @@ bool generate_meshlets(
             meshlet_local_indices.push_back(l2);
 
             triangle_used[t] = true;
+            meshlet_triangles.push_back(t);
             meshlet_triangle_count++;
             triangles_remaining--;
 
@@ -343,14 +346,8 @@ bool generate_meshlets(
         BoundingSphere sphere = compute_bounding_sphere(mesh.positions, meshlet_vertices);
         out_data.bounds.push_back(sphere);
 
-        // Compute normal cone
-        NormalCone cone = compute_normal_cone(
-            mesh.normals,
-            mesh.positions,
-            mesh.indices,
-            seed_triangle * 3,  // Approximate - use actual meshlet triangles
-            meshlet_triangle_count
-        );
+        // Compute normal cone from the triangles actually in this meshlet
+        NormalCone cone = compute_normal_cone(mesh.positions, mesh.indices, meshlet_triangles);
         out_data.cones.push_back(cone);
 
         current_vertex_offset += desc.vertex_count;

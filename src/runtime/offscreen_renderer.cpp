@@ -9,9 +9,14 @@
 #include <iostream>
 #include <fstream>
 #include <cstring>
+#include <cmath>
 #include <algorithm>
 #include <array>
 #include <filesystem>
+
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 
 namespace vgeo {
 
@@ -167,11 +172,13 @@ void OffscreenRenderer::cleanup_render_target() {
     if (m_color_memory) vkFreeMemory(m_device, m_color_memory, nullptr);
 #ifdef _WIN32
     if (m_color_handle) CloseHandle(m_color_handle);
+#else
+    if (m_color_handle >= 0) close(m_color_handle);
 #endif
     m_color_view = VK_NULL_HANDLE;
     m_color_image = VK_NULL_HANDLE;
     m_color_memory = VK_NULL_HANDLE;
-    m_color_handle = nullptr;
+    m_color_handle = INVALID_SHARED_MEMORY_HANDLE;
 
     if (m_depth_view) vkDestroyImageView(m_device, m_depth_view, nullptr);
     if (m_depth_image) vkDestroyImage(m_device, m_depth_image, nullptr);
@@ -293,6 +300,9 @@ bool OffscreenRenderer::create_device() {
 #ifdef _WIN32
     vkGetMemoryWin32HandleKHR = (PFN_vkGetMemoryWin32HandleKHR)
         vkGetDeviceProcAddr(m_device, "vkGetMemoryWin32HandleKHR");
+#else
+    vkGetMemoryFdKHR_fn = (PFN_vkGetMemoryFdKHR)
+        vkGetDeviceProcAddr(m_device, "vkGetMemoryFdKHR");
 #endif
 
     return true;
@@ -331,17 +341,17 @@ bool OffscreenRenderer::create_render_target() {
     VkMemoryRequirements mem_reqs;
     vkGetImageMemoryRequirements(m_device, m_color_image, &mem_reqs);
 
-#ifdef _WIN32
     VkExportMemoryAllocateInfo export_info{};
     export_info.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO;
+#ifdef _WIN32
     export_info.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+#else
+    export_info.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
 #endif
 
     VkMemoryAllocateInfo alloc_info{};
     alloc_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-#ifdef _WIN32
     alloc_info.pNext = &export_info;
-#endif
     alloc_info.allocationSize = mem_reqs.size;
     alloc_info.memoryTypeIndex = find_memory_type(mem_reqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 
@@ -361,6 +371,15 @@ bool OffscreenRenderer::create_render_target() {
         handle_info.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
 
         vkGetMemoryWin32HandleKHR(m_device, &handle_info, &m_color_handle);
+    }
+#else
+    if (vkGetMemoryFdKHR_fn) {
+        VkMemoryGetFdInfoKHR handle_info{};
+        handle_info.sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR;
+        handle_info.memory = m_color_memory;
+        handle_info.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+
+        vkGetMemoryFdKHR_fn(m_device, &handle_info, &m_color_handle);
     }
 #endif
 
@@ -966,12 +985,14 @@ SharedImageInfo OffscreenRenderer::get_shared_image_info() const {
     info.handle = m_color_handle;
     info.width = m_width;
     info.height = m_height;
-    info.valid = (m_color_handle != nullptr);
+    info.valid = (m_color_handle != INVALID_SHARED_MEMORY_HANDLE);
 
     // Get allocation size
-    VkMemoryRequirements mem_reqs;
-    vkGetImageMemoryRequirements(m_device, m_color_image, &mem_reqs);
-    info.allocation_size = mem_reqs.size;
+    if (m_device != VK_NULL_HANDLE && m_color_image != VK_NULL_HANDLE) {
+        VkMemoryRequirements mem_reqs;
+        vkGetImageMemoryRequirements(m_device, m_color_image, &mem_reqs);
+        info.allocation_size = mem_reqs.size;
+    }
 
     return info;
 }

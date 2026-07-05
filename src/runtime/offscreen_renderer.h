@@ -25,8 +25,10 @@ struct Camera;
 // Handle for shared memory (platform-specific)
 #ifdef _WIN32
 using SharedMemoryHandle = HANDLE;
+constexpr SharedMemoryHandle INVALID_SHARED_MEMORY_HANDLE = nullptr;
 #else
 using SharedMemoryHandle = int;  // File descriptor on Linux
+constexpr SharedMemoryHandle INVALID_SHARED_MEMORY_HANDLE = -1;
 #endif
 
 // Information about a shared image for OpenGL import
@@ -106,7 +108,7 @@ private:
     VkImage m_color_image = VK_NULL_HANDLE;
     VkDeviceMemory m_color_memory = VK_NULL_HANDLE;
     VkImageView m_color_view = VK_NULL_HANDLE;
-    SharedMemoryHandle m_color_handle = nullptr;  // For OpenGL sharing
+    SharedMemoryHandle m_color_handle = INVALID_SHARED_MEMORY_HANDLE;  // For OpenGL sharing
 
     VkImage m_depth_image = VK_NULL_HANDLE;
     VkDeviceMemory m_depth_memory = VK_NULL_HANDLE;
@@ -153,7 +155,11 @@ private:
     bool m_debug_mode = false;
 
     // Extension function pointers
+#ifdef _WIN32
     PFN_vkGetMemoryWin32HandleKHR vkGetMemoryWin32HandleKHR = nullptr;
+#else
+    PFN_vkGetMemoryFdKHR vkGetMemoryFdKHR_fn = nullptr;
+#endif
 };
 
 } // namespace vgeo

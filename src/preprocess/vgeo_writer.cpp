@@ -112,25 +112,17 @@ bool write_vgeo(
         return false;
     }
 
-    // Determine flags
+    // Determine flags. COMPRESSED / QUANTIZED_POS / INDEX_16BIT are never set:
+    // compression and quantization are not implemented yet, and indices are
+    // always written as uint32 below. Setting them would make the header lie
+    // about the chunk contents to any spec-conforming reader.
+    (void)params;
     uint32_t flags = 0;
-    if (params.compress) {
-        flags |= Flags::COMPRESSED;
-    }
-    if (params.quantize_positions) {
-        flags |= Flags::QUANTIZED_POS;
-    }
     if (!mesh.normals.empty()) {
         flags |= Flags::HAS_NORMALS;
     }
     if (!mesh.uvs.empty()) {
         flags |= Flags::HAS_UVS;
-    }
-
-    // Determine if we can use 16-bit indices
-    bool use_16bit_indices = mesh.vertex_count() <= 65535;
-    if (use_16bit_indices) {
-        flags |= Flags::INDEX_16BIT;
     }
 
     // Count chunks
@@ -237,7 +229,7 @@ bool write_vgeo(
         auto& data = chunk_data[chunk_idx];
         uint32_t cluster_count = static_cast<uint32_t>(hierarchy.clusters.size());
         data.resize(cluster_count * sizeof(ClusterNode));
-        memcpy(data.data(), hierarchy.clusters.data(), data.size());
+        if (!data.empty()) memcpy(data.data(), hierarchy.clusters.data(), data.size());
         chunk_idx++;
     }
 
@@ -247,7 +239,7 @@ bool write_vgeo(
         auto& data = chunk_data[chunk_idx];
         uint32_t bounds_count = static_cast<uint32_t>(meshlets.bounds.size());
         data.resize(bounds_count * sizeof(BoundingSphere));
-        memcpy(data.data(), meshlets.bounds.data(), data.size());
+        if (!data.empty()) memcpy(data.data(), meshlets.bounds.data(), data.size());
         chunk_idx++;
     }
 
@@ -267,7 +259,7 @@ bool write_vgeo(
         auto& data = chunk_data[chunk_idx];
         uint32_t cone_count = static_cast<uint32_t>(meshlets.cones.size());
         data.resize(cone_count * sizeof(NormalCone));
-        memcpy(data.data(), meshlets.cones.data(), data.size());
+        if (!data.empty()) memcpy(data.data(), meshlets.cones.data(), data.size());
         chunk_idx++;
     }
 
@@ -317,7 +309,9 @@ bool write_vgeo(
 
     // Write chunks with padding
     for (uint32_t i = 0; i < chunk_count; i++) {
-        file.write(reinterpret_cast<const char*>(chunk_data[i].data()), chunk_data[i].size());
+        if (!chunk_data[i].empty()) {
+            file.write(reinterpret_cast<const char*>(chunk_data[i].data()), chunk_data[i].size());
+        }
         current_offset += static_cast<uint32_t>(chunk_data[i].size());
 
         // Pad to next chunk alignment
@@ -330,7 +324,8 @@ bool write_vgeo(
         }
     }
 
-    return true;
+    file.flush();
+    return file.good();
 }
 
 } // namespace vgeo

@@ -37,9 +37,11 @@ struct SpatialGroup {
     float error = 0.0f;             // Combined error metric
 };
 
-// Build cluster hierarchy from meshlets using full multi-level DAG
+// Build cluster hierarchy from meshlets using full multi-level DAG.
+// Reorders meshlets (descriptors, bounds, cones) so that each leaf cluster
+// references a contiguous meshlet range, and assigns each meshlet's cluster_id.
 bool build_hierarchy(
-    const MeshletData& meshlets,
+    MeshletData& meshlets,
     const RawMesh& mesh,
     const HierarchyParams& params,
     HierarchyData& out_hierarchy
