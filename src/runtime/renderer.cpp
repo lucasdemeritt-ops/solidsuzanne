@@ -262,46 +262,58 @@ void Renderer::destroy() {
         vkDeviceWaitIdle(m_device);
     }
 
-    // Cleanup triangle buffers
+    // Cleanup triangle buffers (handles are nulled so destroy() is
+    // idempotent — a second call must not double-free)
     if (m_triangle_vertex_buffer != VK_NULL_HANDLE) {
         vkDestroyBuffer(m_device, m_triangle_vertex_buffer, nullptr);
         vkFreeMemory(m_device, m_triangle_vertex_memory, nullptr);
+        m_triangle_vertex_buffer = VK_NULL_HANDLE;
+        m_triangle_vertex_memory = VK_NULL_HANDLE;
     }
 
     // Cleanup geometry buffers
     if (m_vertex_buffer != VK_NULL_HANDLE) {
         vkDestroyBuffer(m_device, m_vertex_buffer, nullptr);
         vkFreeMemory(m_device, m_vertex_memory, nullptr);
+        m_vertex_buffer = VK_NULL_HANDLE;
+        m_vertex_memory = VK_NULL_HANDLE;
     }
     if (m_index_buffer != VK_NULL_HANDLE) {
         vkDestroyBuffer(m_device, m_index_buffer, nullptr);
         vkFreeMemory(m_device, m_index_memory, nullptr);
+        m_index_buffer = VK_NULL_HANDLE;
+        m_index_memory = VK_NULL_HANDLE;
     }
 
     // Cleanup pipeline
     if (m_render_pipeline != VK_NULL_HANDLE) {
         vkDestroyPipeline(m_device, m_render_pipeline, nullptr);
+        m_render_pipeline = VK_NULL_HANDLE;
     }
     if (m_render_layout != VK_NULL_HANDLE) {
         vkDestroyPipelineLayout(m_device, m_render_layout, nullptr);
+        m_render_layout = VK_NULL_HANDLE;
     }
 
-    // Cleanup sync objects
-    for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
-        if (i < m_render_finished_semaphores.size()) {
-            vkDestroySemaphore(m_device, m_render_finished_semaphores[i], nullptr);
-        }
-        if (i < m_image_available_semaphores.size()) {
-            vkDestroySemaphore(m_device, m_image_available_semaphores[i], nullptr);
-        }
-        if (i < m_in_flight_fences.size()) {
-            vkDestroyFence(m_device, m_in_flight_fences[i], nullptr);
-        }
+    // Cleanup sync objects (render-finished semaphores are per swapchain
+    // image, so iterate the full vectors, not MAX_FRAMES_IN_FLIGHT)
+    for (auto semaphore : m_render_finished_semaphores) {
+        if (semaphore != VK_NULL_HANDLE) vkDestroySemaphore(m_device, semaphore, nullptr);
     }
+    m_render_finished_semaphores.clear();
+    for (auto semaphore : m_image_available_semaphores) {
+        if (semaphore != VK_NULL_HANDLE) vkDestroySemaphore(m_device, semaphore, nullptr);
+    }
+    m_image_available_semaphores.clear();
+    for (auto fence : m_in_flight_fences) {
+        if (fence != VK_NULL_HANDLE) vkDestroyFence(m_device, fence, nullptr);
+    }
+    m_in_flight_fences.clear();
 
     // Cleanup command pool
     if (m_command_pool != VK_NULL_HANDLE) {
         vkDestroyCommandPool(m_device, m_command_pool, nullptr);
+        m_command_pool = VK_NULL_HANDLE;
     }
 
     cleanup_swapchain();
@@ -309,28 +321,33 @@ void Renderer::destroy() {
     // Cleanup render pass
     if (m_render_pass != VK_NULL_HANDLE) {
         vkDestroyRenderPass(m_device, m_render_pass, nullptr);
+        m_render_pass = VK_NULL_HANDLE;
     }
 
     // Cleanup device
     if (m_device != VK_NULL_HANDLE) {
         vkDestroyDevice(m_device, nullptr);
+        m_device = VK_NULL_HANDLE;
     }
 
-    // Cleanup debug messenger
-    if (ENABLE_VALIDATION && m_debug_messenger != VK_NULL_HANDLE) {
+    // Cleanup debug messenger (needs a live instance)
+    if (ENABLE_VALIDATION && m_debug_messenger != VK_NULL_HANDLE && m_instance != VK_NULL_HANDLE) {
         auto func = (PFN_vkDestroyDebugUtilsMessengerEXT)
             vkGetInstanceProcAddr(m_instance, "vkDestroyDebugUtilsMessengerEXT");
         if (func) {
             func(m_instance, m_debug_messenger, nullptr);
         }
+        m_debug_messenger = VK_NULL_HANDLE;
     }
 
     // Cleanup surface and instance
-    if (m_surface != VK_NULL_HANDLE) {
+    if (m_surface != VK_NULL_HANDLE && m_instance != VK_NULL_HANDLE) {
         vkDestroySurfaceKHR(m_instance, m_surface, nullptr);
+        m_surface = VK_NULL_HANDLE;
     }
     if (m_instance != VK_NULL_HANDLE) {
         vkDestroyInstance(m_instance, nullptr);
+        m_instance = VK_NULL_HANDLE;
     }
 }
 
@@ -520,6 +537,12 @@ bool Renderer::create_swapchain() {
     // Query surface capabilities
     VkSurfaceCapabilitiesKHR capabilities;
     vkGetPhysicalDeviceSurfaceCapabilitiesKHR(m_physical_device, m_surface, &capabilities);
+
+    // A minimized window reports a 0x0 extent; creating a zero-extent
+    // swapchain is invalid. Keep the old swapchain and try again later.
+    if (capabilities.currentExtent.width == 0 || capabilities.currentExtent.height == 0) {
+        return false;
+    }
 
     // Choose format
     uint32_t format_count;
@@ -802,7 +825,11 @@ bool Renderer::create_command_pool() {
 
 bool Renderer::create_sync_objects() {
     m_image_available_semaphores.resize(MAX_FRAMES_IN_FLIGHT);
-    m_render_finished_semaphores.resize(MAX_FRAMES_IN_FLIGHT);
+    // render-finished semaphores are per swapchain image, not per frame in
+    // flight: the presentation engine may still hold a pending wait on the
+    // semaphore when a per-frame slot is reused (typically 3+ images vs 2
+    // frames in flight)
+    m_render_finished_semaphores.resize(m_swapchain_images.size());
     m_in_flight_fences.resize(MAX_FRAMES_IN_FLIGHT);
 
     VkSemaphoreCreateInfo semaphore_info{};
@@ -814,8 +841,14 @@ bool Renderer::create_sync_objects() {
 
     for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
         if (vkCreateSemaphore(m_device, &semaphore_info, nullptr, &m_image_available_semaphores[i]) != VK_SUCCESS ||
-            vkCreateSemaphore(m_device, &semaphore_info, nullptr, &m_render_finished_semaphores[i]) != VK_SUCCESS ||
             vkCreateFence(m_device, &fence_info, nullptr, &m_in_flight_fences[i]) != VK_SUCCESS) {
+            std::cerr << "Failed to create sync objects\n";
+            return false;
+        }
+    }
+
+    for (auto& semaphore : m_render_finished_semaphores) {
+        if (vkCreateSemaphore(m_device, &semaphore_info, nullptr, &semaphore) != VK_SUCCESS) {
             std::cerr << "Failed to create sync objects\n";
             return false;
         }
@@ -1136,8 +1169,31 @@ void Renderer::recreate_swapchain() {
 
     cleanup_swapchain();
 
-    create_swapchain();
+    if (!create_swapchain()) {
+        // Window is minimized (0x0) or creation failed; keep the resized
+        // flag set so the next frame retries instead of drawing into
+        // destroyed framebuffers
+        m_framebuffer_resized = true;
+        return;
+    }
     create_framebuffers();
+
+    // render-finished semaphores are per swapchain image; recreate them if
+    // the image count changed (safe: device is idle at this point)
+    if (m_render_finished_semaphores.size() != m_swapchain_images.size()) {
+        for (auto semaphore : m_render_finished_semaphores) {
+            if (semaphore != VK_NULL_HANDLE) {
+                vkDestroySemaphore(m_device, semaphore, nullptr);
+            }
+        }
+        m_render_finished_semaphores.assign(m_swapchain_images.size(), VK_NULL_HANDLE);
+
+        VkSemaphoreCreateInfo semaphore_info{};
+        semaphore_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+        for (auto& semaphore : m_render_finished_semaphores) {
+            vkCreateSemaphore(m_device, &semaphore_info, nullptr, &semaphore);
+        }
+    }
 }
 
 void Renderer::resize(uint32_t width, uint32_t height) {
@@ -1148,7 +1204,23 @@ void Renderer::resize(uint32_t width, uint32_t height) {
 
 void Renderer::render_triangle(const Camera& camera) {
     // Wait for previous frame
-    vkWaitForFences(m_device, 1, &m_in_flight_fences[m_current_frame], VK_TRUE, UINT64_MAX);
+    // The swapchain can be gone after a failed recreation (e.g. minimized
+    // window); retry creating it before touching any frame resources
+    if (m_swapchain == VK_NULL_HANDLE) {
+        recreate_swapchain();
+        if (m_swapchain == VK_NULL_HANDLE) {
+            return;
+        }
+    }
+
+    // Bounded wait: if a previous submit failed the fence never signals,
+    // and an infinite wait would hang the application forever. On timeout
+    // skip the frame — the command buffer may still be pending.
+    if (vkWaitForFences(m_device, 1, &m_in_flight_fences[m_current_frame], VK_TRUE,
+                        2'000'000'000ull) != VK_SUCCESS) {
+        std::cerr << "Timed out waiting for frame fence; skipping frame\n";
+        return;
+    }
 
     // Acquire next image
     uint32_t image_index;
@@ -1244,7 +1316,7 @@ void Renderer::render_triangle(const Camera& camera) {
     submit_info.commandBufferCount = 1;
     submit_info.pCommandBuffers = &cmd;
 
-    VkSemaphore signal_semaphores[] = {m_render_finished_semaphores[m_current_frame]};
+    VkSemaphore signal_semaphores[] = {m_render_finished_semaphores[image_index]};
     submit_info.signalSemaphoreCount = 1;
     submit_info.pSignalSemaphores = signal_semaphores;
 
@@ -1284,7 +1356,23 @@ void Renderer::render(const Camera& camera, const ClusterManager& clusters) {
     }
 
     // Wait for previous frame
-    vkWaitForFences(m_device, 1, &m_in_flight_fences[m_current_frame], VK_TRUE, UINT64_MAX);
+    // The swapchain can be gone after a failed recreation (e.g. minimized
+    // window); retry creating it before touching any frame resources
+    if (m_swapchain == VK_NULL_HANDLE) {
+        recreate_swapchain();
+        if (m_swapchain == VK_NULL_HANDLE) {
+            return;
+        }
+    }
+
+    // Bounded wait: if a previous submit failed the fence never signals,
+    // and an infinite wait would hang the application forever. On timeout
+    // skip the frame — the command buffer may still be pending.
+    if (vkWaitForFences(m_device, 1, &m_in_flight_fences[m_current_frame], VK_TRUE,
+                        2'000'000'000ull) != VK_SUCCESS) {
+        std::cerr << "Timed out waiting for frame fence; skipping frame\n";
+        return;
+    }
 
     uint32_t image_index;
     VkResult result = vkAcquireNextImageKHR(m_device, m_swapchain, UINT64_MAX,
@@ -1292,6 +1380,11 @@ void Renderer::render(const Camera& camera, const ClusterManager& clusters) {
 
     if (result == VK_ERROR_OUT_OF_DATE_KHR) {
         recreate_swapchain();
+        return;
+    } else if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR) {
+        // Without this check a device/surface loss would leave image_index
+        // uninitialized and index m_framebuffers with garbage
+        std::cerr << "Failed to acquire swapchain image\n";
         return;
     }
 
@@ -1376,11 +1469,14 @@ void Renderer::render(const Camera& camera, const ClusterManager& clusters) {
     submit_info.commandBufferCount = 1;
     submit_info.pCommandBuffers = &cmd;
 
-    VkSemaphore signal_semaphores[] = {m_render_finished_semaphores[m_current_frame]};
+    VkSemaphore signal_semaphores[] = {m_render_finished_semaphores[image_index]};
     submit_info.signalSemaphoreCount = 1;
     submit_info.pSignalSemaphores = signal_semaphores;
 
-    vkQueueSubmit(m_graphics_queue, 1, &submit_info, m_in_flight_fences[m_current_frame]);
+    if (vkQueueSubmit(m_graphics_queue, 1, &submit_info, m_in_flight_fences[m_current_frame]) != VK_SUCCESS) {
+        std::cerr << "Failed to submit draw command buffer\n";
+        return;
+    }
 
     VkPresentInfoKHR present_info{};
     present_info.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
@@ -1444,7 +1540,23 @@ void Renderer::render(const Camera& camera, const ClusterManager& clusters, cons
     std::memcpy(push_data.model, model, 16 * sizeof(float));
 
     // Wait for previous frame
-    vkWaitForFences(m_device, 1, &m_in_flight_fences[m_current_frame], VK_TRUE, UINT64_MAX);
+    // The swapchain can be gone after a failed recreation (e.g. minimized
+    // window); retry creating it before touching any frame resources
+    if (m_swapchain == VK_NULL_HANDLE) {
+        recreate_swapchain();
+        if (m_swapchain == VK_NULL_HANDLE) {
+            return;
+        }
+    }
+
+    // Bounded wait: if a previous submit failed the fence never signals,
+    // and an infinite wait would hang the application forever. On timeout
+    // skip the frame — the command buffer may still be pending.
+    if (vkWaitForFences(m_device, 1, &m_in_flight_fences[m_current_frame], VK_TRUE,
+                        2'000'000'000ull) != VK_SUCCESS) {
+        std::cerr << "Timed out waiting for frame fence; skipping frame\n";
+        return;
+    }
 
     uint32_t image_index;
     VkResult result = vkAcquireNextImageKHR(m_device, m_swapchain, UINT64_MAX,
@@ -1452,6 +1564,11 @@ void Renderer::render(const Camera& camera, const ClusterManager& clusters, cons
 
     if (result == VK_ERROR_OUT_OF_DATE_KHR) {
         recreate_swapchain();
+        return;
+    } else if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR) {
+        // Without this check a device/surface loss would leave image_index
+        // uninitialized and index m_framebuffers with garbage
+        std::cerr << "Failed to acquire swapchain image\n";
         return;
     }
 
@@ -1529,11 +1646,14 @@ void Renderer::render(const Camera& camera, const ClusterManager& clusters, cons
     submit_info.commandBufferCount = 1;
     submit_info.pCommandBuffers = &cmd;
 
-    VkSemaphore signal_semaphores[] = {m_render_finished_semaphores[m_current_frame]};
+    VkSemaphore signal_semaphores[] = {m_render_finished_semaphores[image_index]};
     submit_info.signalSemaphoreCount = 1;
     submit_info.pSignalSemaphores = signal_semaphores;
 
-    vkQueueSubmit(m_graphics_queue, 1, &submit_info, m_in_flight_fences[m_current_frame]);
+    if (vkQueueSubmit(m_graphics_queue, 1, &submit_info, m_in_flight_fences[m_current_frame]) != VK_SUCCESS) {
+        std::cerr << "Failed to submit draw command buffer\n";
+        return;
+    }
 
     VkPresentInfoKHR present_info{};
     present_info.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
@@ -1558,6 +1678,34 @@ void Renderer::render(const Camera& camera, const ClusterManager& clusters, cons
 void Renderer::upload_asset(const VGeoAsset& asset) {
     // Create vertex buffer with interleaved pos + normal
     size_t vertex_count = asset.positions.size() / 3;
+
+    // An empty asset would request a zero-size buffer (invalid in Vulkan)
+    if (vertex_count == 0) {
+        std::cerr << "upload_asset: asset has no vertices\n";
+        return;
+    }
+
+    // Re-uploading: wait for in-flight frames that may still reference the
+    // old buffers, then release them (they leaked before)
+    if (m_vertex_buffer != VK_NULL_HANDLE || m_index_buffer != VK_NULL_HANDLE) {
+        vkDeviceWaitIdle(m_device);
+        if (m_vertex_buffer != VK_NULL_HANDLE) {
+            vkDestroyBuffer(m_device, m_vertex_buffer, nullptr);
+            vkFreeMemory(m_device, m_vertex_memory, nullptr);
+            m_vertex_buffer = VK_NULL_HANDLE;
+            m_vertex_memory = VK_NULL_HANDLE;
+        }
+        if (m_index_buffer != VK_NULL_HANDLE) {
+            vkDestroyBuffer(m_device, m_index_buffer, nullptr);
+            vkFreeMemory(m_device, m_index_memory, nullptr);
+            m_index_buffer = VK_NULL_HANDLE;
+            m_index_memory = VK_NULL_HANDLE;
+        }
+        m_vertex_count = 0;
+        m_index_count = 0;
+        m_has_asset = false;
+    }
+
     std::vector<float> interleaved(vertex_count * 6);
 
     for (size_t i = 0; i < vertex_count; i++) {
@@ -1595,7 +1743,10 @@ void Renderer::upload_asset(const VGeoAsset& asset) {
     buffer_info.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
     buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
-    vkCreateBuffer(m_device, &buffer_info, nullptr, &m_vertex_buffer);
+    if (vkCreateBuffer(m_device, &buffer_info, nullptr, &m_vertex_buffer) != VK_SUCCESS) {
+        std::cerr << "upload_asset: failed to create vertex buffer\n";
+        return;
+    }
 
     VkMemoryRequirements mem_reqs;
     vkGetBufferMemoryRequirements(m_device, m_vertex_buffer, &mem_reqs);
@@ -1606,11 +1757,19 @@ void Renderer::upload_asset(const VGeoAsset& asset) {
     alloc_info.memoryTypeIndex = find_memory_type(mem_reqs.memoryTypeBits,
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 
-    vkAllocateMemory(m_device, &alloc_info, nullptr, &m_vertex_memory);
+    if (vkAllocateMemory(m_device, &alloc_info, nullptr, &m_vertex_memory) != VK_SUCCESS) {
+        std::cerr << "upload_asset: failed to allocate vertex memory\n";
+        vkDestroyBuffer(m_device, m_vertex_buffer, nullptr);
+        m_vertex_buffer = VK_NULL_HANDLE;
+        return;
+    }
     vkBindBufferMemory(m_device, m_vertex_buffer, m_vertex_memory, 0);
 
-    void* data;
-    vkMapMemory(m_device, m_vertex_memory, 0, buffer_size, 0, &data);
+    void* data = nullptr;
+    if (vkMapMemory(m_device, m_vertex_memory, 0, buffer_size, 0, &data) != VK_SUCCESS) {
+        std::cerr << "upload_asset: failed to map vertex memory\n";
+        return;
+    }
     memcpy(data, interleaved.data(), buffer_size);
     vkUnmapMemory(m_device, m_vertex_memory);
 
@@ -1623,7 +1782,10 @@ void Renderer::upload_asset(const VGeoAsset& asset) {
         buffer_info.size = buffer_size;
         buffer_info.usage = VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
 
-        vkCreateBuffer(m_device, &buffer_info, nullptr, &m_index_buffer);
+        if (vkCreateBuffer(m_device, &buffer_info, nullptr, &m_index_buffer) != VK_SUCCESS) {
+            std::cerr << "upload_asset: failed to create index buffer\n";
+            return;
+        }
 
         vkGetBufferMemoryRequirements(m_device, m_index_buffer, &mem_reqs);
 
@@ -1631,10 +1793,18 @@ void Renderer::upload_asset(const VGeoAsset& asset) {
         alloc_info.memoryTypeIndex = find_memory_type(mem_reqs.memoryTypeBits,
             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 
-        vkAllocateMemory(m_device, &alloc_info, nullptr, &m_index_memory);
+        if (vkAllocateMemory(m_device, &alloc_info, nullptr, &m_index_memory) != VK_SUCCESS) {
+            std::cerr << "upload_asset: failed to allocate index memory\n";
+            vkDestroyBuffer(m_device, m_index_buffer, nullptr);
+            m_index_buffer = VK_NULL_HANDLE;
+            return;
+        }
         vkBindBufferMemory(m_device, m_index_buffer, m_index_memory, 0);
 
-        vkMapMemory(m_device, m_index_memory, 0, buffer_size, 0, &data);
+        if (vkMapMemory(m_device, m_index_memory, 0, buffer_size, 0, &data) != VK_SUCCESS) {
+            std::cerr << "upload_asset: failed to map index memory\n";
+            return;
+        }
         memcpy(data, asset.indices.data(), buffer_size);
         vkUnmapMemory(m_device, m_index_memory);
 

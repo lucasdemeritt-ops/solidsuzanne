@@ -28,6 +28,7 @@ The `.vgeo` format stores virtualized geometry data optimized for GPU-driven ren
 │   ├── MSLT chunk                                        │
 │   ├── CLST chunk                                        │
 │   ├── BVOL chunk                                        │
+│   ├── CBND chunk                                        │
 │   └── CONE chunk                                        │
 └─────────────────────────────────────────────────────────┘
 ```
@@ -66,6 +67,11 @@ The `.vgeo` format stores virtualized geometry data optimized for GPU-driven ren
 | 4 | HAS_TANGENTS | TANG chunk present |
 | 5 | 16BIT_INDICES | Indices are u16 (else u32) |
 | 6-31 | reserved | |
+
+> **Implementation note:** the current writer never sets COMPRESSED,
+> QUANTIZED_POS, or 16BIT_INDICES — data is always uncompressed, positions
+> are float32, and indices are u32. The flags are reserved for when those
+> features are implemented.
 
 ## Chunk Directory
 
@@ -126,7 +132,10 @@ struct UV {
 
 ### INDX - Triangle Indices
 
-Local indices within each meshlet. Index size determined by flags.16BIT_INDICES.
+Global vertex indices (into the VERT chunk), grouped by meshlet in MSLT
+order: meshlet *i*'s triangles occupy the `3 * triangle_count` indices
+starting at `3 * sum(triangle_count of meshlets 0..i-1)`. Index size is
+determined by flags.16BIT_INDICES (always u32 with the current writer).
 
 ```c
 // If 16BIT_INDICES: u16 per index
@@ -140,13 +149,18 @@ Defines each meshlet's data ranges.
 
 ```c
 struct MeshletDescriptor {
-    uint32_t vertex_offset;    // Offset into VERT chunk
-    uint32_t vertex_count;     // Number of vertices
-    uint32_t index_offset;     // Offset into INDX chunk
+    uint32_t vertex_offset;    // Reserved: offset into the meshlet-local
+                               // vertex remap table, which is not serialized
+    uint32_t vertex_count;     // Number of unique vertices in this meshlet
+    uint32_t index_offset;     // Reserved: offset into the pre-expansion
+                               // local index stream, which is not serialized
     uint32_t triangle_count;   // Number of triangles
-    uint32_t cluster_id;       // Parent cluster in hierarchy
+    uint32_t cluster_id;       // Owning leaf cluster in hierarchy
 };
 ```
+
+Consumers should locate a meshlet's triangles in INDX via the prefix sum
+of `triangle_count` (see INDX above), not via `index_offset`.
 
 ### CLST - Cluster Hierarchy
 
@@ -177,6 +191,12 @@ struct BoundingSphere {
 };
 ```
 
+### CBND - Cluster Bounding Volumes
+
+Per-cluster bounding spheres (same `BoundingSphere` layout as BVOL, one
+entry per CLST node) used during LOD hierarchy traversal. Written whenever
+the hierarchy has bounds; optional for consumers.
+
 ### CONE - Normal Cones
 
 Per-meshlet normal cones for backface culling.
@@ -184,11 +204,20 @@ Per-meshlet normal cones for backface culling.
 ```c
 struct NormalCone {
     int8_t axis[3];    // Normalized axis (snorm8)
-    int8_t cos_angle;  // cos(aperture/2) as snorm8
+    int8_t cos_angle;  // cos(half-aperture) as snorm8
 };
 ```
 
-Culling test: `dot(view_dir, axis) < cos_angle → cull`
+Conservative culling test, with `a = acos(cos_angle)`, `view_dir` the unit
+vector from the meshlet's bounding-sphere center to the camera, and
+`dist` that distance:
+
+```
+dot(view_dir, axis) <= -(sin(a) + radius / dist)  →  cull
+```
+
+(The naive `dot(view_dir, axis) < -cos(a)` over-culls meshlets whose
+half-aperture exceeds 45°.)
 
 ## Alignment Requirements
 
@@ -212,25 +241,29 @@ Current version: 0.1
 
 ## Example
 
-A simple cube (8 vertices, 12 triangles, 1 meshlet):
+A simple cube (8 vertices, 12 triangles, 1 meshlet, 1 cluster):
 
 ```
 Header:
   magic = "VGEO"
   version = 0.1
-  flags = 0x06 (HAS_NORMALS | HAS_UVS)
+  flags = 0x0C (HAS_NORMALS | HAS_UVS)
   meshlet_count = 1
+  cluster_count = 1
   vertex_count = 8
   index_count = 36
+  chunk_count = 9
 
-Chunks:
-  VERT: 8 * 12 = 96 bytes
-  NORM: 8 * 4 = 32 bytes
-  UVCО: 8 * 4 = 32 bytes
-  INDX: 36 * 4 = 144 bytes
-  MSLT: 1 * 20 = 20 bytes
-  BVOL: 1 * 16 = 16 bytes
-  CONE: 1 * 4 = 4 bytes
+Chunks (each padded to the next 16-byte boundary):
+  VERT: 8 * 12 = 96 bytes   @ 208
+  NORM: 8 * 4  = 32 bytes   @ 304
+  UVCО: 8 * 4  = 32 bytes   @ 336
+  INDX: 36 * 4 = 144 bytes  @ 368
+  MSLT: 1 * 20 = 20 bytes   @ 512
+  CLST: 1 * 32 = 32 bytes   @ 544
+  BVOL: 1 * 16 = 16 bytes   @ 576
+  CBND: 1 * 16 = 16 bytes   @ 592
+  CONE: 1 * 4  = 4 bytes    @ 608
 
-Total: 64 (header) + 112 (directory) + 344 (data) = 520 bytes
+Total: 64 (header) + 144 (directory) + 404 (data incl. padding) = 612 bytes
 ```

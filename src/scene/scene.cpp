@@ -419,7 +419,7 @@ void Scene::collect_draw_commands(
             cmd.meshlet_start = cluster.meshlet_start;
             cmd.meshlet_count = cluster.meshlet_count;
             cmd.lod_level = cluster.lod_level;
-            cmd.transform = obj.transform;
+            std::memcpy(cmd.transform, obj.transform, sizeof(cmd.transform));
 
             // Compute screen error (approximate using object center distance)
             float center[3] = {

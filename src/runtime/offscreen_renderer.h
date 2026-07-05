@@ -152,6 +152,7 @@ private:
     // State
     bool m_initialized = false;
     bool m_has_asset = false;
+    bool m_has_rendered = false;  // Color image is in TRANSFER_SRC layout
     bool m_debug_mode = false;
 
     // Extension function pointers

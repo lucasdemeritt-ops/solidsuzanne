@@ -57,7 +57,9 @@ struct DrawCommand {
     uint32_t meshlet_count;
     float screen_error;
     uint8_t lod_level;
-    const float* transform;  // Pointer to object's transform matrix
+    // Copy of the object's transform: a pointer into m_objects would
+    // dangle as soon as an object is added or removed (vector reallocation)
+    float transform[16];
 };
 
 // Scene statistics

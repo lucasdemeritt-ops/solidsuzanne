@@ -79,9 +79,3 @@ if(SHADER_COMPILER)
         VGEO_SHADER_DIR="${SHADER_OUTPUT_DIR}"
     )
 endif()
-
-# Copy shaders to build directory for runtime access
-add_custom_command(TARGET vgeo_runtime POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/shaders
-    COMMENT "Creating shader output directory"
-)

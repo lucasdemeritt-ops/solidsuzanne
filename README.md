@@ -97,7 +97,7 @@ src/
   runtime/               Headless Vulkan offscreen renderer
   python/                pybind11 bindings
 tools/vgeo_build/        CLI converter tool
-shaders/                 SPIR-V vertex/fragment shaders
+src/runtime/shaders/     GLSL shaders (compiled to SPIR-V at build time)
 spec/                    Format specifications
 ```
 

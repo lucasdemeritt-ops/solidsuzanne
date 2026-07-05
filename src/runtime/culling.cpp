@@ -376,10 +376,36 @@ bool CullingPipeline::create_buffers(uint32_t max_clusters) {
         return true;  // Buffers already large enough
     }
 
-    // Destroy old buffers if resizing
+    // Destroy old buffers if resizing; also free the old descriptor set,
+    // otherwise the second allocate_descriptor_sets() call exhausts the
+    // pool and culling silently stops working after the first growth
     if (m_buffers_created) {
         vkDeviceWaitIdle(m_device);
-        // Clean up old buffers...
+
+        auto destroy_buffer = [this](VkBuffer& buffer, VkDeviceMemory& memory) {
+            if (buffer != VK_NULL_HANDLE) {
+                vkDestroyBuffer(m_device, buffer, nullptr);
+                buffer = VK_NULL_HANDLE;
+            }
+            if (memory != VK_NULL_HANDLE) {
+                vkFreeMemory(m_device, memory, nullptr);
+                memory = VK_NULL_HANDLE;
+            }
+        };
+
+        destroy_buffer(m_bounds_buffer, m_bounds_memory);
+        destroy_buffer(m_cones_buffer, m_cones_memory);
+        destroy_buffer(m_cluster_info_buffer, m_cluster_info_memory);
+        destroy_buffer(m_visible_indices_buffer, m_visible_indices_memory);
+        destroy_buffer(m_visible_count_buffer, m_visible_count_memory);
+        destroy_buffer(m_indirect_buffer, m_indirect_memory);
+
+        if (m_descriptor_set != VK_NULL_HANDLE) {
+            vkFreeDescriptorSets(m_device, m_descriptor_pool, 1, &m_descriptor_set);
+            m_descriptor_set = VK_NULL_HANDLE;
+        }
+
+        m_buffers_created = false;
     }
 
     m_max_clusters = std::max(max_clusters, 1024u);  // Minimum size
@@ -848,11 +874,13 @@ bool CullingPipeline::create_hzb_resources(uint32_t width, uint32_t height) {
         }
     }
 
-    // Create sampler for HZB reads
+    // Create sampler for HZB reads. NEAREST is required: linear filtering
+    // of R32_SFLOAT is an optional format feature, and a max-reduction
+    // depth pyramid must never blend neighboring depth values anyway.
     VkSamplerCreateInfo sampler_info{};
     sampler_info.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
-    sampler_info.magFilter = VK_FILTER_LINEAR;
-    sampler_info.minFilter = VK_FILTER_LINEAR;
+    sampler_info.magFilter = VK_FILTER_NEAREST;
+    sampler_info.minFilter = VK_FILTER_NEAREST;
     sampler_info.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
     sampler_info.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     sampler_info.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;

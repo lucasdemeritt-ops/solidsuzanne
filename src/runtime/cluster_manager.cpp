@@ -162,6 +162,7 @@ void ClusterManager::update(const Camera& camera, const LODParams& params) {
         }
     } else {
         // DAG traversal from roots
+        m_visited.assign(m_asset->clusters.size(), false);
         for (uint32_t root_id : m_root_clusters) {
             traverse_cluster(root_id, camera, params, camera.frustum_planes);
         }
@@ -205,6 +206,16 @@ void ClusterManager::traverse_cluster(
 ) {
     if (cluster_id >= m_asset->clusters.size()) {
         return;
+    }
+
+    // Visit each cluster at most once per update: DAG children can be
+    // shared between parents (double draws), and a malformed file with a
+    // child pointing at an ancestor would recurse forever
+    if (cluster_id < m_visited.size()) {
+        if (m_visited[cluster_id]) {
+            return;
+        }
+        m_visited[cluster_id] = true;
     }
 
     m_stats.total_clusters_visited++;
@@ -378,9 +389,16 @@ bool ClusterManager::should_render_cluster(
 void ClusterManager::collect_leaf_meshlets(
     uint32_t cluster_id,
     std::vector<uint32_t>& meshlet_starts,
-    std::vector<uint32_t>& meshlet_counts
+    std::vector<uint32_t>& meshlet_counts,
+    uint32_t depth
 ) {
     if (cluster_id >= m_asset->clusters.size()) {
+        return;
+    }
+
+    // Hierarchies are capped at 16 LOD levels; anything deeper means a
+    // malformed file with a cycle
+    if (depth > 64) {
         return;
     }
 
@@ -394,7 +412,7 @@ void ClusterManager::collect_leaf_meshlets(
 
     // Recurse into children
     for (uint32_t i = 0; i < cluster.child_count; i++) {
-        collect_leaf_meshlets(cluster.child_start + i, meshlet_starts, meshlet_counts);
+        collect_leaf_meshlets(cluster.child_start + i, meshlet_starts, meshlet_counts, depth + 1);
     }
 }
 

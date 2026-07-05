@@ -162,6 +162,9 @@ void OffscreenRenderer::destroy() {
 }
 
 void OffscreenRenderer::cleanup_render_target() {
+    // A fresh render target starts in UNDEFINED layout again
+    m_has_rendered = false;
+
     if (m_framebuffer) {
         vkDestroyFramebuffer(m_device, m_framebuffer, nullptr);
         m_framebuffer = VK_NULL_HANDLE;
@@ -777,6 +780,34 @@ VkShaderModule OffscreenRenderer::create_shader_module(const uint32_t* code, siz
 void OffscreenRenderer::upload_asset(const VGeoAsset& asset) {
     size_t vertex_count = asset.positions.size() / 3;
 
+    // An empty asset would request a zero-size buffer (invalid in Vulkan)
+    if (vertex_count == 0) {
+        std::cerr << "upload_asset: asset has no vertices\n";
+        return;
+    }
+
+    // Re-uploading (the Blender engine does this every frame per object):
+    // wait for the in-flight frame that may still reference the old buffers,
+    // then release them — they leaked on every re-upload before
+    if (m_vertex_buffer != VK_NULL_HANDLE || m_index_buffer != VK_NULL_HANDLE) {
+        vkDeviceWaitIdle(m_device);
+        if (m_vertex_buffer != VK_NULL_HANDLE) {
+            vkDestroyBuffer(m_device, m_vertex_buffer, nullptr);
+            vkFreeMemory(m_device, m_vertex_memory, nullptr);
+            m_vertex_buffer = VK_NULL_HANDLE;
+            m_vertex_memory = VK_NULL_HANDLE;
+        }
+        if (m_index_buffer != VK_NULL_HANDLE) {
+            vkDestroyBuffer(m_device, m_index_buffer, nullptr);
+            vkFreeMemory(m_device, m_index_memory, nullptr);
+            m_index_buffer = VK_NULL_HANDLE;
+            m_index_memory = VK_NULL_HANDLE;
+        }
+        m_vertex_count = 0;
+        m_index_count = 0;
+        m_has_asset = false;
+    }
+
     // Build vertex -> meshlet mapping for debug color mode
     std::vector<uint32_t> vertex_meshlet_ids(vertex_count, 0);
     for (uint32_t m = 0; m < asset.meshlets.size(); m++) {
@@ -827,7 +858,10 @@ void OffscreenRenderer::upload_asset(const VGeoAsset& asset) {
     buffer_info.size = vertex_size;
     buffer_info.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
 
-    vkCreateBuffer(m_device, &buffer_info, nullptr, &m_vertex_buffer);
+    if (vkCreateBuffer(m_device, &buffer_info, nullptr, &m_vertex_buffer) != VK_SUCCESS) {
+        std::cerr << "upload_asset: failed to create vertex buffer\n";
+        return;
+    }
 
     VkMemoryRequirements mem_reqs;
     vkGetBufferMemoryRequirements(m_device, m_vertex_buffer, &mem_reqs);
@@ -838,11 +872,19 @@ void OffscreenRenderer::upload_asset(const VGeoAsset& asset) {
     alloc_info.memoryTypeIndex = find_memory_type(mem_reqs.memoryTypeBits,
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 
-    vkAllocateMemory(m_device, &alloc_info, nullptr, &m_vertex_memory);
+    if (vkAllocateMemory(m_device, &alloc_info, nullptr, &m_vertex_memory) != VK_SUCCESS) {
+        std::cerr << "upload_asset: failed to allocate vertex memory\n";
+        vkDestroyBuffer(m_device, m_vertex_buffer, nullptr);
+        m_vertex_buffer = VK_NULL_HANDLE;
+        return;
+    }
     vkBindBufferMemory(m_device, m_vertex_buffer, m_vertex_memory, 0);
 
-    void* data;
-    vkMapMemory(m_device, m_vertex_memory, 0, vertex_size, 0, &data);
+    void* data = nullptr;
+    if (vkMapMemory(m_device, m_vertex_memory, 0, vertex_size, 0, &data) != VK_SUCCESS) {
+        std::cerr << "upload_asset: failed to map vertex memory\n";
+        return;
+    }
     memcpy(data, verts.data(), vertex_size);
     vkUnmapMemory(m_device, m_vertex_memory);
 
@@ -855,17 +897,28 @@ void OffscreenRenderer::upload_asset(const VGeoAsset& asset) {
         buffer_info.size = index_size;
         buffer_info.usage = VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
 
-        vkCreateBuffer(m_device, &buffer_info, nullptr, &m_index_buffer);
+        if (vkCreateBuffer(m_device, &buffer_info, nullptr, &m_index_buffer) != VK_SUCCESS) {
+            std::cerr << "upload_asset: failed to create index buffer\n";
+            return;
+        }
         vkGetBufferMemoryRequirements(m_device, m_index_buffer, &mem_reqs);
 
         alloc_info.allocationSize = mem_reqs.size;
         alloc_info.memoryTypeIndex = find_memory_type(mem_reqs.memoryTypeBits,
             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 
-        vkAllocateMemory(m_device, &alloc_info, nullptr, &m_index_memory);
+        if (vkAllocateMemory(m_device, &alloc_info, nullptr, &m_index_memory) != VK_SUCCESS) {
+            std::cerr << "upload_asset: failed to allocate index memory\n";
+            vkDestroyBuffer(m_device, m_index_buffer, nullptr);
+            m_index_buffer = VK_NULL_HANDLE;
+            return;
+        }
         vkBindBufferMemory(m_device, m_index_buffer, m_index_memory, 0);
 
-        vkMapMemory(m_device, m_index_memory, 0, index_size, 0, &data);
+        if (vkMapMemory(m_device, m_index_memory, 0, index_size, 0, &data) != VK_SUCCESS) {
+            std::cerr << "upload_asset: failed to map index memory\n";
+            return;
+        }
         memcpy(data, asset.indices.data(), index_size);
         vkUnmapMemory(m_device, m_index_memory);
 
@@ -977,7 +1030,14 @@ void OffscreenRenderer::render(const Camera& camera, const ClusterManager& clust
     submit.commandBufferCount = 1;
     submit.pCommandBuffers = &m_command_buffer;
 
-    vkQueueSubmit(m_graphics_queue, 1, &submit, m_render_fence);
+    if (vkQueueSubmit(m_graphics_queue, 1, &submit, m_render_fence) != VK_SUCCESS) {
+        std::cerr << "render: queue submit failed\n";
+        return;
+    }
+
+    // The render pass's final layout leaves the color image in
+    // TRANSFER_SRC_OPTIMAL, so read_pixels is now legal
+    m_has_rendered = true;
 }
 
 SharedImageInfo OffscreenRenderer::get_shared_image_info() const {
@@ -999,6 +1059,10 @@ SharedImageInfo OffscreenRenderer::get_shared_image_info() const {
 
 bool OffscreenRenderer::read_pixels(uint8_t* out_pixels) {
     if (!m_initialized || !out_pixels) return false;
+
+    // Before the first render the color image is still in UNDEFINED layout;
+    // copying from TRANSFER_SRC_OPTIMAL would be invalid
+    if (!m_has_rendered) return false;
 
     // Wait for render to complete
     vkWaitForFences(m_device, 1, &m_render_fence, VK_TRUE, UINT64_MAX);

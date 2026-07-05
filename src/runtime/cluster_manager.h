@@ -87,13 +87,17 @@ private:
     void collect_leaf_meshlets(
         uint32_t cluster_id,
         std::vector<uint32_t>& meshlet_starts,
-        std::vector<uint32_t>& meshlet_counts
+        std::vector<uint32_t>& meshlet_counts,
+        uint32_t depth = 0
     );
 
     const VGeoAsset* m_asset = nullptr;
     std::vector<BoundingSphere> m_cluster_bounds;
     std::vector<uint32_t> m_root_clusters;
     std::vector<VisibleCluster> m_visible;
+    // Per-update visited set: prevents duplicate draws for shared DAG
+    // children and unbounded recursion on malformed files with cycles
+    std::vector<bool> m_visited;
     LODStats m_stats;
 };
 

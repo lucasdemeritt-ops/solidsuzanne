@@ -135,19 +135,24 @@ bool is_sphere_in_frustum(vec3 center, float radius) {
 
 // Test backface culling using normal cone
 // Returns true if the cluster might have visible triangles
-bool is_cone_visible(vec3 cone_axis, float cone_cos_angle, vec3 cluster_center) {
+bool is_cone_visible(vec3 cone_axis, float cone_cos_angle, vec3 cluster_center, float radius) {
     // Direction from cluster center to camera
-    vec3 view_dir = normalize(pc.camera_pos - cluster_center);
+    vec3 to_camera = pc.camera_pos - cluster_center;
+    float dist = length(to_camera);
+    if (dist < 1e-6) {
+        return true;  // Camera inside the cluster
+    }
+    vec3 view_dir = to_camera / dist;
 
-    // Dot product between view direction and cone axis
-    // cone_axis points in the average normal direction of the cluster
-    float dot_val = dot(view_dir, cone_axis);
-
-    // If view_dir is within the cone aperture (cos(angle) > cos(aperture/2)),
-    // some triangles might be frontfacing
-    // Note: cone_cos_angle is cos(aperture/2)
-    // If dot_val > -cone_cos_angle, we can see some part of the cone
-    return dot_val > -cone_cos_angle;
+    // All triangle normals lie within half-angle a of cone_axis, where
+    // cone_cos_angle = cos(a). Every normal faces away from the camera iff
+    // dot(view_dir, axis) < -sin(a), NOT -cos(a): using -cos(a) culls
+    // clusters with half-angle > 45 deg that still contain front-facing
+    // triangles. The radius/dist term keeps the test conservative for
+    // normals attached anywhere on the bounding sphere (meshoptimizer's
+    // convention).
+    float sin_a = sqrt(max(0.0, 1.0 - cone_cos_angle * cone_cos_angle));
+    return dot(view_dir, cone_axis) > -(sin_a + radius / dist);
 }
 
 // Compute screen-space error for LOD selection
@@ -216,7 +221,7 @@ void main() {
 
     // Only cull if the cone has valid data (cos_angle != 1.0, which means 180 degree cone = no culling)
     if (cone_cos_angle < 0.99) {
-        if (!is_cone_visible(cone_axis, cone_cos_angle, center)) {
+        if (!is_cone_visible(cone_axis, cone_cos_angle, center, radius)) {
             return;  // Entire cluster is backfacing
         }
     }
