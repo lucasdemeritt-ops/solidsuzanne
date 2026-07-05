@@ -19,12 +19,15 @@ except ImportError:
 
 
 def find_vgeo_build():
-    """Locate vgeo_build.exe relative to the addon directory"""
+    """Locate the vgeo_build binary relative to the addon directory"""
     addon_dir = os.path.dirname(os.path.realpath(__file__))
+    exe = "vgeo_build.exe" if os.name == "nt" else "vgeo_build"
+    tool_dir = os.path.join(addon_dir, "..", "..", "build", "tools", "vgeo_build")
     candidates = [
-        os.path.join(addon_dir, "vgeo_build.exe"),
-        os.path.join(addon_dir, "..", "..", "build", "tools", "vgeo_build", "Release", "vgeo_build.exe"),
-        os.path.join(addon_dir, "..", "..", "build", "tools", "vgeo_build", "Debug", "vgeo_build.exe"),
+        os.path.join(addon_dir, exe),
+        os.path.join(tool_dir, exe),             # Single-config (Linux/macOS)
+        os.path.join(tool_dir, "Release", exe),  # MSVC Release
+        os.path.join(tool_dir, "Debug", exe),    # MSVC Debug
     ]
     for c in candidates:
         path = os.path.realpath(c)
@@ -68,12 +71,16 @@ def import_vgeo_file(operator, filepath):
 
 class VGEO_OT_import(Operator, ImportHelper):
     """Import a .vgeo file into the scene"""
-    bl_idname = "vgeo.import"
+    # Note: not "vgeo.import" — "import" is a Python keyword, which would
+    # make bpy.ops.vgeo.import(...) unwritable in scripts
+    bl_idname = "vgeo.import_file"
     bl_label = "Import VGEO"
     bl_options = {'REGISTER', 'UNDO'}
 
     filename_ext = ".vgeo"
-    filter_glob: StringProperty(default="*.vgeo;*.glb;*.gltf", options={'HIDDEN'})
+    # Only .vgeo: the import path feeds the file straight to the native
+    # loader, which reads the VGEO format only (convert glTF via vgeo_build)
+    filter_glob: StringProperty(default="*.vgeo", options={'HIDDEN'})
 
     def execute(self, context):
         return import_vgeo_file(self, self.filepath)
@@ -95,58 +102,60 @@ class VGEO_OT_convert(Operator, ExportHelper):
     def execute(self, context):
         vgeo_build = find_vgeo_build()
         if not vgeo_build:
-            self.report({'ERROR'}, "vgeo_build.exe not found")
+            self.report({'ERROR'}, "vgeo_build tool not found (build the project first)")
             return {'CANCELLED'}
 
         source_obj = context.active_object
         tmp_obj = self.filepath.replace('.vgeo', '_tmp.obj')
 
-        # Isolate selection for export
+        # Isolate selection for export; always restore it, even when the
+        # export or conversion fails partway through
         prev_active = context.view_layer.objects.active
         prev_selected = list(context.selected_objects)
         bpy.ops.object.select_all(action='DESELECT')
         source_obj.select_set(True)
         context.view_layer.objects.active = source_obj
 
-        # Export OBJ — try Blender 4.x API first, fall back to legacy
-        exported = False
         try:
-            bpy.ops.wm.obj_export(
-                filepath=tmp_obj,
-                export_selected_objects=True,
-                export_normals=True,
-                export_uv=False,
-                export_materials=False,
-            )
-            exported = True
-        except AttributeError:
-            pass
-
-        if not exported:
+            # Export OBJ — try Blender 4.x API first, fall back to legacy
+            exported = False
             try:
-                bpy.ops.export_scene.obj(
+                bpy.ops.wm.obj_export(
                     filepath=tmp_obj,
-                    use_selection=True,
-                    use_normals=True,
-                    use_uvs=False,
-                    use_materials=False,
+                    export_selected_objects=True,
+                    export_normals=True,
+                    export_uv=False,
+                    export_materials=False,
                 )
                 exported = True
-            except Exception as e:
-                self.report({'ERROR'}, f"OBJ export failed: {e}")
-                return {'CANCELLED'}
+            except AttributeError:
+                pass
 
-        # Restore selection
-        bpy.ops.object.select_all(action='DESELECT')
-        for o in prev_selected:
-            o.select_set(True)
-        context.view_layer.objects.active = prev_active
+            if not exported:
+                try:
+                    bpy.ops.export_scene.obj(
+                        filepath=tmp_obj,
+                        use_selection=True,
+                        use_normals=True,
+                        use_uvs=False,
+                        use_materials=False,
+                    )
+                    exported = True
+                except Exception as e:
+                    self.report({'ERROR'}, f"OBJ export failed: {e}")
+                    return {'CANCELLED'}
+        finally:
+            # Restore selection
+            bpy.ops.object.select_all(action='DESELECT')
+            for o in prev_selected:
+                o.select_set(True)
+            context.view_layer.objects.active = prev_active
 
         if not os.path.exists(tmp_obj):
             self.report({'ERROR'}, "OBJ export produced no file")
             return {'CANCELLED'}
 
-        # Run vgeo_build
+        # Run vgeo_build; temp files are removed on every exit path
         print(f"VGEO: Converting {tmp_obj} -> {self.filepath}")
         try:
             result = subprocess.run(
@@ -156,15 +165,14 @@ class VGEO_OT_convert(Operator, ExportHelper):
         except subprocess.TimeoutExpired:
             self.report({'ERROR'}, "vgeo_build timed out")
             return {'CANCELLED'}
-
-        # Clean up temp OBJ
-        for ext in ['.obj', '.mtl']:
-            tmp = tmp_obj.replace('.obj', ext)
-            if os.path.exists(tmp):
-                try:
-                    os.remove(tmp)
-                except Exception:
-                    pass
+        finally:
+            for ext in ['.obj', '.mtl']:
+                tmp = tmp_obj.replace('.obj', ext)
+                if os.path.exists(tmp):
+                    try:
+                        os.remove(tmp)
+                    except Exception:
+                        pass
 
         if result.returncode != 0:
             msg = result.stderr.strip()[:300] if result.stderr else "unknown error"

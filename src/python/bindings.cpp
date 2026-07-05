@@ -12,12 +12,18 @@
 #include "cluster_manager.h"
 
 #include <memory>
+#include <optional>
 #include <vector>
 #include <cstring>
 
 namespace py = pybind11;
 
 namespace vgeo {
+
+// All matrix parameters must be C-contiguous float32: without c_style a
+// transposed/sliced numpy view would pass the size check but be read in
+// the wrong memory order, silently producing garbage transforms.
+using FloatArray = py::array_t<float, py::array::c_style | py::array::forcecast>;
 
 // Simplified camera for Python
 struct PyCamera {
@@ -61,13 +67,13 @@ public:
         return static_cast<int>(id);
     }
 
-    // Add an object using a loaded asset
-    int add_object(int asset_id, py::array_t<float> transform, const std::string& name = "") {
+    // Add an object using a loaded asset. transform may be None (identity).
+    int add_object(int asset_id, std::optional<FloatArray> transform, const std::string& name = "") {
         const float* transform_ptr = nullptr;
         float identity[16];
 
-        if (transform.size() == 16) {
-            transform_ptr = transform.data();
+        if (transform && transform->size() == 16) {
+            transform_ptr = transform->data();
         } else {
             matrix::identity(identity);
             transform_ptr = identity;
@@ -81,13 +87,13 @@ public:
         return static_cast<int>(id);
     }
 
-    // Add object directly from file path
-    int add_object_from_file(const std::string& path, py::array_t<float> transform, const std::string& name = "") {
+    // Add object directly from file path. transform may be None (identity).
+    int add_object_from_file(const std::string& path, std::optional<FloatArray> transform, const std::string& name = "") {
         const float* transform_ptr = nullptr;
         float identity[16];
 
-        if (transform.size() == 16) {
-            transform_ptr = transform.data();
+        if (transform && transform->size() == 16) {
+            transform_ptr = transform->data();
         } else {
             matrix::identity(identity);
             transform_ptr = identity;
@@ -107,7 +113,7 @@ public:
     }
 
     // Set object transform (4x4 matrix as flat array)
-    void set_transform(int object_id, py::array_t<float> transform) {
+    void set_transform(int object_id, FloatArray transform) {
         if (transform.size() != 16) {
             throw std::runtime_error("Transform must be a 4x4 matrix (16 floats)");
         }
@@ -241,13 +247,13 @@ public:
         m_renderer.render(camera.camera, clusters, model_matrix);
     }
 
-    void render_with_transform(PyCamera& camera, py::array_t<float> transform) {
+    void render_with_transform(PyCamera& camera, std::optional<FloatArray> transform) {
         camera.update();
         ClusterManager clusters;
 
         const float* model_matrix = nullptr;
-        if (transform.size() == 16) {
-            model_matrix = transform.data();
+        if (transform && transform->size() == 16) {
+            model_matrix = transform->data();
         }
 
         m_renderer.render(camera.camera, clusters, model_matrix);
@@ -260,22 +266,20 @@ public:
 
         // Create numpy array
         py::array_t<uint8_t> result({h, w, 4u});
-        auto buf = result.mutable_unchecked<3>();
 
         // Read pixels
         std::vector<uint8_t> pixels(w * h * 4);
+        uint8_t* dst = result.mutable_data();
         if (m_renderer.read_pixels(pixels.data())) {
-            // Copy to numpy array (flip Y for OpenGL convention)
+            // Copy row-by-row, flipping Y for the OpenGL convention
+            const size_t row_bytes = static_cast<size_t>(w) * 4;
             for (uint32_t y = 0; y < h; y++) {
-                for (uint32_t x = 0; x < w; x++) {
-                    uint32_t src_y = h - 1 - y;  // Flip
-                    size_t src_idx = (src_y * w + x) * 4;
-                    buf(y, x, 0) = pixels[src_idx + 0];
-                    buf(y, x, 1) = pixels[src_idx + 1];
-                    buf(y, x, 2) = pixels[src_idx + 2];
-                    buf(y, x, 3) = pixels[src_idx + 3];
-                }
+                uint32_t src_y = h - 1 - y;
+                std::memcpy(dst + y * row_bytes, pixels.data() + src_y * row_bytes, row_bytes);
             }
+        } else {
+            // numpy allocations are uninitialized; don't return garbage
+            std::memset(dst, 0, static_cast<size_t>(w) * h * 4);
         }
 
         return result;
@@ -287,11 +291,17 @@ public:
         uint32_t h = m_renderer.height();
 
         std::vector<uint8_t> pixels(w * h * 4);
-        m_renderer.read_pixels(pixels.data());
+        bool have_pixels = m_renderer.read_pixels(pixels.data());
 
         // Convert to float array (flipped)
-        py::array_t<float> result(w * h * 4);
+        py::array_t<float> result(static_cast<size_t>(w) * h * 4);
         auto buf = result.mutable_unchecked<1>();
+
+        if (!have_pixels) {
+            // numpy allocations are uninitialized; don't return garbage
+            std::memset(result.mutable_data(), 0, static_cast<size_t>(w) * h * 4 * sizeof(float));
+            return result;
+        }
 
         for (uint32_t y = 0; y < h; y++) {
             for (uint32_t x = 0; x < w; x++) {
@@ -332,9 +342,10 @@ py::dict query_visible_geometry(PyScene& scene, PyCamera& camera, float error_th
     uint32_t vertex_offset = 0;
 
     for (const auto& cmd : commands) {
-        const VGeoAsset* asset = scene.scene().get_asset(
-            scene.scene().get_object(cmd.object_id)->asset_id
-        );
+        const SceneObject* obj = scene.scene().get_object(cmd.object_id);
+        if (!obj) continue;
+
+        const VGeoAsset* asset = scene.scene().get_asset(obj->asset_id);
         if (!asset) continue;
 
         // For each meshlet in this draw command
@@ -344,12 +355,26 @@ py::dict query_visible_geometry(PyScene& scene, PyCamera& camera, float error_th
 
             // Get triangles from this meshlet
             for (uint32_t t = 0; t < meshlet.triangle_count; t++) {
+                // Validate the whole triangle up front: emitting 1-2 of its
+                // vertices would desynchronize positions from triangle_count
+                bool triangle_valid = true;
                 for (uint32_t v = 0; v < 3; v++) {
                     uint32_t local_idx_offset = meshlet.index_offset + t * 3 + v;
-                    if (local_idx_offset >= asset->indices.size()) continue;
-
+                    if (local_idx_offset >= asset->indices.size()) {
+                        triangle_valid = false;
+                        break;
+                    }
                     uint32_t global_idx = asset->indices[local_idx_offset];
-                    if (global_idx * 3 + 2 >= asset->positions.size()) continue;
+                    if (static_cast<uint64_t>(global_idx) * 3 + 2 >= asset->positions.size()) {
+                        triangle_valid = false;
+                        break;
+                    }
+                }
+                if (!triangle_valid) continue;
+
+                for (uint32_t v = 0; v < 3; v++) {
+                    uint32_t local_idx_offset = meshlet.index_offset + t * 3 + v;
+                    uint32_t global_idx = asset->indices[local_idx_offset];
 
                     // Transform position by object matrix
                     float pos[3] = {

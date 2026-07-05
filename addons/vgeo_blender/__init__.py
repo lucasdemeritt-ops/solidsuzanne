@@ -16,23 +16,30 @@ bl_info = {
 import bpy
 import sys
 import os
+import glob
 
 # Add path to vgeo_native module
 def setup_module_path():
     """Add the vgeo_native module to Python path"""
-    # Look for vgeo_native.pyd in common locations
+    # Look for the native module (.pyd on Windows, .so elsewhere)
     addon_dir = os.path.dirname(os.path.realpath(__file__))
 
     # Possible locations for the native module
     search_paths = [
         addon_dir,  # Alongside __init__.py (highest priority)
         os.path.join(addon_dir, "native"),  # Shipped with addon
-        os.path.join(addon_dir, "..", "..", "build", "src", "python", "Release"),  # Dev build (Release)
-        os.path.join(addon_dir, "..", "..", "build", "src", "python", "Debug"),  # Dev build (Debug)
+        os.path.join(addon_dir, "..", "..", "build", "src", "python"),  # Dev build (single-config)
+        os.path.join(addon_dir, "..", "..", "build", "src", "python", "Release"),  # Dev build (MSVC Release)
+        os.path.join(addon_dir, "..", "..", "build", "src", "python", "Debug"),  # Dev build (MSVC Debug)
     ]
 
     for path in search_paths:
-        if os.path.exists(path):
+        # Check for the module file itself, not just the directory: the
+        # addon dir always exists, so a directory check would stop the
+        # search before ever reaching the dev-build locations
+        if glob.glob(os.path.join(path, "vgeo_native*.pyd")) or \
+           glob.glob(os.path.join(path, "vgeo_native*.so")):
+            path = os.path.realpath(path)
             if path not in sys.path:
                 sys.path.insert(0, path)
                 print(f"VGEO: Added module path: {path}")

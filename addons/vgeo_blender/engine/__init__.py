@@ -43,8 +43,6 @@ class VGEORenderEngine(RenderEngine):
         self._initial_matrices = {}  # obj_name -> world matrix at import (row-major numpy)
         self._current_matrices = {}  # obj_name -> current world matrix (row-major numpy)
         self._upload_done = set()  # obj names whose geometry is on the GPU
-        self._texture = None
-        self._image = None  # Blender Image for pixel transfer
         self._last_width = 0
         self._last_height = 0
         self._needs_upload = False
@@ -60,17 +58,12 @@ class VGEORenderEngine(RenderEngine):
             print("VGEO Engine: Native module not available")
 
     def __del__(self):
+        # No bpy.data access here: __del__ can run at interpreter teardown
+        # or from GC during rendering, where writing ID data is prohibited
         if hasattr(self, 'renderer') and self.renderer:
             self.renderer.destroy()
         if hasattr(self, 'scene') and self.scene:
             self.scene.clear()
-        # Clean up viewport buffer image
-        if hasattr(self, '_image') and self._image:
-            try:
-                if self._image.name in bpy.data.images:
-                    bpy.data.images.remove(self._image)
-            except:
-                pass
         print("VGEO Engine: Destroyed")
 
     # =========================================================================
@@ -111,7 +104,6 @@ class VGEORenderEngine(RenderEngine):
             self.renderer.resize(width, height)
             self._last_width = width
             self._last_height = height
-            self._texture = None  # Recreate texture
 
         # Sync debug mode
         debug = context.scene.vgeo_debug_meshlets
@@ -204,6 +196,9 @@ class VGEORenderEngine(RenderEngine):
 
         region = context.region
         rv3d = context.region_data
+        if rv3d is None:
+            # Not a plain VIEW_3D region (e.g. quad view side panel)
+            return
 
         # camera-to-world in Blender Z-up space
         view_matrix = rv3d.view_matrix.inverted()
@@ -225,36 +220,23 @@ class VGEORenderEngine(RenderEngine):
         self.camera.update()
 
     def _blit_to_viewport(self, context, pixels, width, height):
-        """Blit rendered pixels to viewport using GPU texture"""
+        """Blit rendered pixels to viewport using GPU texture.
+
+        Builds a GPUTexture directly from the pixel data each frame. The
+        previous bpy.data.images route was broken in several ways: creating
+        and removing ID datablocks inside a draw callback is disallowed,
+        gpu.texture.from_image() returns a cached texture that never
+        refreshes after foreach_set, the 'Linear' colorspace name was
+        removed in Blender 4.0, and one shared image name meant two open
+        VGEO viewports destroyed each other's buffer.
+        """
         try:
-            # Create or resize the intermediate Blender Image
-            image_name = "_vgeo_viewport_buffer"
-            if self._image is None or self._image.size[0] != width or self._image.size[1] != height:
-                # Remove old image if it exists
-                if image_name in bpy.data.images:
-                    bpy.data.images.remove(bpy.data.images[image_name])
-
-                # Create new image
-                self._image = bpy.data.images.new(
-                    image_name,
-                    width=width,
-                    height=height,
-                    alpha=True,
-                    float_buffer=True
-                )
-                self._image.colorspace_settings.name = 'Linear'
-                self._texture = None  # Force texture recreation
-
-            # Upload pixels to Blender Image
-            # pixels is already a flat RGBA float array from get_pixels_float()
-            self._image.pixels.foreach_set(pixels)
-
-            # Always recreate — cached texture won't reflect updated pixels
-            self._texture = gpu.texture.from_image(self._image)
+            buf = gpu.types.Buffer('FLOAT', width * height * 4, pixels)
+            texture = gpu.types.GPUTexture((width, height), format='RGBA32F', data=buf)
 
             # Draw the texture covering the entire viewport
             gpu.state.blend_set('NONE')
-            draw_texture_2d(self._texture, (0, 0), width, height)
+            draw_texture_2d(texture, (0, 0), width, height)
 
             # Draw indicator that VGEO is active
             self._draw_indicator(context, active=True)
@@ -326,11 +308,11 @@ class VGEORenderEngine(RenderEngine):
         # For final render, we'll query geometry and pass to Cycles
         # For now, render using our Vulkan renderer
         if NATIVE_AVAILABLE and self.renderer:
-            self._render_vgeo()
+            self._render_vgeo(depsgraph)
         else:
             self._render_test_pattern()
 
-    def _render_vgeo(self):
+    def _render_vgeo(self, depsgraph):
         """Render using VGEO renderer for final output"""
         # Initialize renderer at render resolution
         if not self.renderer.is_initialized:
@@ -338,25 +320,54 @@ class VGEORenderEngine(RenderEngine):
         else:
             self.renderer.resize(self.size_x, self.size_y)
 
+        # Blender creates a fresh engine instance for F12, so the object
+        # map is empty until the scene is synced from the depsgraph
+        self._sync_scene(depsgraph)
+
         # Upload assets
         self._upload_assets()
 
-        # Set up camera for render
-        # TODO: Use render camera settings
+        # Set up camera from the scene's render camera
+        cam_obj = depsgraph.scene.camera
+        if cam_obj is not None:
+            mat = cam_obj.matrix_world
+            pos = mat.translation
+            # Blender cameras look down their local -Z axis
+            target = pos - mat.col[2].xyz * 10.0
+            # Convert Z-up (Blender) to Y-up (renderer): (x, y, z) -> (x, z, -y)
+            self.camera.set_position(pos.x, pos.z, -pos.y)
+            self.camera.set_target(target.x, target.z, -target.y)
+            if cam_obj.data and hasattr(cam_obj.data, 'angle_y'):
+                self.camera.fov = float(np.degrees(cam_obj.data.angle_y))
         self.camera.aspect = self.size_x / max(self.size_y, 1)
         self.camera.update()
 
-        # Render
+        # Render each object with its transform (last write wins for now,
+        # same limitation as the viewport path)
         identity = np.eye(4, dtype=np.float32).flatten()
-        self.renderer.render(self.camera, identity)
+        if self._object_map:
+            for obj_name in self._object_map:
+                current = self._current_matrices.get(obj_name)
+                initial = self._initial_matrices.get(obj_name)
+                model_flat = identity
+                if current is not None and initial is not None:
+                    try:
+                        delta = current @ np.linalg.inv(initial)
+                        model_flat = (self._ZUPYUP @ delta @ self._ZUPYUP.T).T.flatten()
+                    except np.linalg.LinAlgError:
+                        pass
+                self.renderer.render(self.camera, model_flat)
+        else:
+            self.renderer.render(self.camera, identity)
 
         # Get pixels
         pixels = self.renderer.get_pixels_float()
 
-        # Update render result
+        # Update render result. RenderPass.rect expects (pixel_count, 4);
+        # foreach_set accepts the flat float array directly.
         result = self.begin_result(0, 0, self.size_x, self.size_y)
         layer = result.layers[0].passes["Combined"]
-        layer.rect = pixels.tolist()
+        layer.rect.foreach_set(pixels)
         self.end_result(result)
 
     def _render_test_pattern(self):
@@ -375,10 +386,10 @@ class VGEORenderEngine(RenderEngine):
                     1.0               # A
                 ]
 
-        # Update render result
+        # Update render result (foreach_set takes the flat float array)
         result = self.begin_result(0, 0, self.size_x, self.size_y)
         layer = result.layers[0].passes["Combined"]
-        layer.rect = rect.flatten()
+        layer.rect.foreach_set(rect.flatten())
         self.end_result(result)
 
 
