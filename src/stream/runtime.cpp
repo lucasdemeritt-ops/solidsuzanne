@@ -763,9 +763,11 @@ struct WebHeaderV2 {
     uint32_t off_materials;
     uint32_t head_bytes;      // everything before the first page
     uint64_t file_size;
-    uint32_t flags;           // bit 0: page streams are meshopt-encoded
+    uint32_t flags;           // bit 0: page streams are meshopt-encoded; bit 1: cluster and group tables too
     uint32_t root_pages;      // leading pages that hold every terminal group (load with the head)
-    uint32_t reserved[8];
+    uint32_t cluster_bytes;   // with flag bit 1: encoded size of the cluster table (else 0)
+    uint32_t group_bytes;     // with flag bit 1: encoded size of the group table (else 0)
+    uint32_t reserved[6];
 };
 static_assert(sizeof(WebHeaderV2) == 160, "WebHeaderV2 layout");
 
@@ -937,6 +939,15 @@ extern "C" VGEO_API int vgeo_export_web_paged(void* handle, const char* path_utf
     w.grid_step = step;
     w.page_count = uint32_t(pages.size());
     w.flags = 1;
+    // the head is fetched before anything draws, so its tables are encoded too (lossless, the same
+    // vertex codec as the pages: clusters are 48-byte records, groups 32-byte records)
+    std::vector<uint8_t> cenc = encode(clusters, 48), genc = encode(groups, 32);
+    const bool pack_head = !clusters.empty() && !groups.empty();
+    if (pack_head) {
+        w.flags |= 2;
+        w.cluster_bytes = uint32_t(cenc.size());
+        w.group_bytes = uint32_t(genc.size());
+    }
     // root pages: the leading pages that hold every terminal group (load them with the head)
     uint32_t root_pages = 0;
     while (root_pages < pages.size() && pages[root_pages].g0 < terminal_groups) ++root_pages;
@@ -944,8 +955,8 @@ extern "C" VGEO_API int vgeo_export_web_paged(void* handle, const char* path_utf
 
     uint64_t off = sizeof(WebHeaderV2);
     auto place = [&](uint64_t bytes) { uint64_t o = off; off = vgeo2::align16(off + bytes); return o; };
-    w.off_clusters = uint32_t(place(clusters.size() * 4));
-    w.off_groups = uint32_t(place(groups.size() * 4));
+    w.off_clusters = uint32_t(place(pack_head ? cenc.size() : clusters.size() * 4));
+    w.off_groups = uint32_t(place(pack_head ? genc.size() : groups.size() * 4));
     w.off_pages = uint32_t(place(uint64_t(pages.size()) * kPageU32 * 4));
     w.off_materials = uint32_t(place(mat_section.size()));
     if (off > 0xFFFFFFF0ull) { set_err(err, err_len, "head too large for the web format"); return 1; }
@@ -979,8 +990,13 @@ extern "C" VGEO_API int vgeo_export_web_paged(void* handle, const char* path_utf
         pos += n;
     };
     put(0, &w, sizeof(w));
-    put(w.off_clusters, clusters.data(), clusters.size() * 4);
-    put(w.off_groups, groups.data(), groups.size() * 4);
+    if (pack_head) {
+        put(w.off_clusters, cenc.data(), cenc.size());
+        put(w.off_groups, genc.data(), genc.size());
+    } else {
+        put(w.off_clusters, clusters.data(), clusters.size() * 4);
+        put(w.off_groups, groups.data(), groups.size() * 4);
+    }
     put(w.off_pages, table.data(), table.size() * 4);
     put(w.off_materials, mat_section.data(), mat_section.size());
     for (size_t p = 0; p < pages.size(); ++p) {

@@ -97,6 +97,7 @@ export function parseVGEO(buffer) {
       gridOrigin: [f32(72), f32(76), f32(80)], gridStep: f32(84),
       offClusters: u32(88), offGroups: u32(92), offPages: u32(96), pageCount: u32(100),
       offMaterials: u32(104), headBytes: u32(108), fileSize: u64(112), flags: u32(120), rootPages: u32(124),
+      clusterBytes: u32(128), groupBytes: u32(132),
     };
     if (buffer.byteLength < h.headBytes) throw new Error("truncated VGEO head");
     const t = new Uint32Array(buffer, h.offPages, h.pageCount * PAGE_U32);
@@ -217,9 +218,23 @@ export class Residency {
  * `buffer` come back without vertices/triangles (the viewer fills them page by page). */
 export async function toGPULayout(buffer, h = parseVGEO(buffer), decoderUrl = DECODER_URL) {
   if (h.paged) {
+    let clusters, groups;
+    if (h.flags & 2) {
+      // encoded head tables (flag bit 1): the same meshopt vertex codec as the pages
+      const { MeshoptDecoder } = await import(decoderUrl.href);
+      await MeshoptDecoder.ready;
+      clusters = new Uint32Array(h.clusterCount * CLUSTER_U32);
+      groups = new Uint32Array(h.groupCount * GROUP_U32);
+      MeshoptDecoder.decodeVertexBuffer(new Uint8Array(clusters.buffer), h.clusterCount, CLUSTER_U32 * 4,
+        new Uint8Array(buffer, h.offClusters, h.clusterBytes));
+      MeshoptDecoder.decodeVertexBuffer(new Uint8Array(groups.buffer), h.groupCount, GROUP_U32 * 4,
+        new Uint8Array(buffer, h.offGroups, h.groupBytes));
+    } else {
+      clusters = new Uint32Array(buffer.slice(h.offClusters, h.offClusters + h.clusterCount * CLUSTER_U32 * 4));
+      groups = new Uint32Array(buffer.slice(h.offGroups, h.offGroups + h.groupCount * GROUP_U32 * 4));
+    }
     const layout = {
-      clusters: new Uint32Array(buffer.slice(h.offClusters, h.offClusters + h.clusterCount * CLUSTER_U32 * 4)),
-      groups: new Uint32Array(buffer.slice(h.offGroups, h.offGroups + h.groupCount * GROUP_U32 * 4)),
+      clusters, groups,
       vertices: null, triangles: null, gridOrigin: h.gridOrigin, gridStep: h.gridStep, pages: h.pages,
     };
     if (!h.partial) {

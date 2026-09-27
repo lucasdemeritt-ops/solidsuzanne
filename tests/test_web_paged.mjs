@@ -14,7 +14,8 @@ const [v2file, v1file, pagedFile] = process.argv.slice(2);
 const v1buf = load(v1file), pbuf = load(pagedFile);
 const h1 = parseVGEO(v1buf), hp = parseVGEO(pbuf);
 check("paged header", hp.version === 2 && hp.paged && !hp.partial && hp.pageCount > 1 && hp.rootPages >= 1,
-  `${hp.pageCount} pages, ${hp.rootPages} root, head ${(hp.headBytes / 1024).toFixed(0)} KB of ${(hp.fileSize / 1024).toFixed(0)} KB`);
+  `${hp.pageCount} pages, ${hp.rootPages} root, head ${(hp.headBytes / 1024).toFixed(0)} KB of ${(hp.fileSize / 1024).toFixed(0)} KB`
+  + (hp.flags & 2 ? `, encoded tables ${((hp.clusterBytes + hp.groupBytes) / 1024).toFixed(0)} KB` : ", tables not encoded (older file)"));
 const L1 = await toGPULayout(v1buf, h1, decoder);
 const LP = await toGPULayout(pbuf, hp, decoder);
 check("same counts as v1", LP.clusters.length === L1.clusters.length && LP.vertices.length === L1.vertices.length

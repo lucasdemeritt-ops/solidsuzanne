@@ -58,7 +58,10 @@ A paged `.vgeow` holds a *head* (header, cluster and group tables, page
 table, materials) and then pages. Each page holds whole groups (a group's
 clusters load together), groups are ordered parents first (terminal groups,
 then deepest to finest, along a Morton curve within a level), and the
-leading *root pages* hold every terminal group.
+leading *root pages* hold every terminal group. The cluster and group tables
+are encoded with the same lossless meshopt codec as the pages (header flag
+bit 1, encoded sizes at bytes 128 and 132), which makes the head about 3.7x
+smaller; files written before that (flag bit 1 clear) still load.
 
 The viewer fetches the head and the root pages with range requests and draws
 at once: that is already a complete coarse model. Every few frames it
@@ -76,9 +79,9 @@ Terrain (2.1M triangles, 33 MB), 960x600 canvas (`tests/web/paged_check.mjs`):
 
 | | |
 |---|---|
-| Before the first frame | 1.8 MB (head 1.65 MB + root page), ~0.3 s locally |
+| Before the first frame | 0.62 MB (head 0.44 MB + root page), ~0.26 s locally (1.8 MB before the head was encoded) |
 | Wide view, settled | 84 of 586 pages |
-| Close-up, settled | 193 pages, 12.4 MB of 33 MB (56 range requests) |
+| Close-up, settled | 193 pages, 11.2 MB of 31.6 MB (56 range requests) |
 | Settled cuts vs the v1 file | identical triangle and cluster counts |
 
 Servers without range support (e.g. `python -m http.server`) answer with the
@@ -96,8 +99,6 @@ triangles for the scene instead of 921k.
 ## Limits today
 
 - Needs WebGPU (current Chrome, Edge, Safari 26+, Firefox 141+ on Windows).
-- The head is not compressed: the cluster table is 48 bytes per cluster
-  (about 5% of a paged file).
 - GPU buffers are allocated at full size up front; paging saves download,
   not GPU memory.
 - Simple sun + sky lighting; no textures yet.
