@@ -65,7 +65,7 @@ async function open(source, label) {
       },
     });
     const h = viewer.header;
-    $("src").textContent = fmt(h.sourceTriangles) + " tris";
+    $("src").textContent = fmt(viewer.stats.sourceTriangles) + " tris";
     $("lv").textContent = h.lodLevels;
     $("hud").hidden = false;
     $("msg").hidden = true;
