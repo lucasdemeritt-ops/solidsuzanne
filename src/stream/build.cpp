@@ -406,6 +406,12 @@ extern "C" VGEO_API int vgeo_build(const vgeo_build_input* in, const char* path_
             names.append(reinterpret_cast<const char*>(&len), 4);
             names.append(s, len);
         }
+        // optional block after the names (older readers stop before it):
+        // "MATP" + material_count * float4 (base color rgb, roughness)
+        if (in->material_params && n) {
+            names.append("MATP", 4);
+            names.append(reinterpret_cast<const char*>(in->material_params), size_t(n) * 16);
+        }
     }
 
     uint64_t off = vgeo2::align16(sizeof(h));

@@ -85,6 +85,29 @@ def evaluated_materials(obj, ev, me):
     return out
 
 
+def material_params(materials):
+    """Per material (base color rgb, roughness) for viewers outside Blender.
+
+    Uses the Principled BSDF's unlinked inputs; when an input is driven by
+    nodes, falls back to the material's viewport display color/roughness.
+    """
+    out = []
+    for m in materials:
+        color, rough = (0.7, 0.7, 0.7), 0.6
+        if m is not None:
+            color, rough = tuple(m.diffuse_color[:3]), float(m.roughness)
+            nt = m.node_tree if m.use_nodes else None
+            bsdf = next((n for n in nt.nodes if n.type == 'BSDF_PRINCIPLED'), None) if nt else None
+            if bsdf is not None:
+                bc, rg = bsdf.inputs.get("Base Color"), bsdf.inputs.get("Roughness")
+                if bc is not None and not bc.is_linked:
+                    color = tuple(bc.default_value[:3])
+                if rg is not None and not rg.is_linked:
+                    rough = float(rg.default_value)
+        out.append((*color, rough))
+    return out
+
+
 def default_path(obj, uid):
     name = f"{bpy.path.clean_name(obj.name)}_{uid[:6]}.vgeo"
     if bpy.data.filepath:
@@ -99,7 +122,8 @@ def default_path(obj, uid):
 class Job:
     """Runs native.build on a worker thread; the GIL is released inside the DLL."""
 
-    def __init__(self, arrays, path, material_names, max_triangles, target_chunks=0):
+    def __init__(self, arrays, path, material_names, max_triangles, target_chunks=0, material_params=None):
+        self.material_params = material_params
         self.arrays = arrays
         self.path = path
         self.material_names = material_names
@@ -122,7 +146,7 @@ class Job:
             self.result = native.build(self.path, a["positions"], a["normals"], a["uvs"], a["materials"],
                                        self.material_names, max_triangles=self.max_triangles,
                                        target_chunks=self.target_chunks, progress=self._progress,
-                                       indices=a["indices"])
+                                       indices=a["indices"], material_params=self.material_params)
         except BaseException as e:
             self.error = e
         finally:

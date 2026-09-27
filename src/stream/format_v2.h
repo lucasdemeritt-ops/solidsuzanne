@@ -50,7 +50,8 @@ struct Header {
     uint64_t off_groups;      // Group[group_count]
     uint64_t off_chunks;      // Chunk[chunk_count]
     uint64_t off_chunk_clusters; // uint32[chunk_cluster_count]
-    uint64_t off_materials;   // uint32 count, then per name: uint32 length + UTF-8 bytes
+    uint64_t off_materials;   // uint32 count, then per name: uint32 length + UTF-8 bytes,
+                              // then optionally "MATP" + count * float4 (base rgb, roughness)
     uint64_t file_size;
     uint64_t reserved[4];
 };

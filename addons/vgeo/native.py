@@ -29,6 +29,7 @@ class BuildInput(ctypes.Structure):
         ("material_names", ctypes.POINTER(ctypes.c_char_p)),
         ("max_triangles", ctypes.c_uint32),
         ("target_chunks", ctypes.c_uint32),
+        ("material_params", ctypes.c_void_p),
     ]
 
 
@@ -158,7 +159,7 @@ def _ptr(a):
 
 
 def build(path, positions, normals=None, uvs=None, materials=None, material_names=(),
-          max_triangles=128, target_chunks=0, progress=None, indices=None):
+          max_triangles=128, target_chunks=0, progress=None, indices=None, material_params=None):
     """Build a .vgeo.
 
     Without indices, positions/normals/uvs hold one row per triangle corner.
@@ -201,6 +202,11 @@ def build(path, positions, normals=None, uvs=None, materials=None, material_name
     inp.material_names = name_arr
     inp.max_triangles = max_triangles
     inp.target_chunks = target_chunks
+    if material_params is not None and len(names):
+        material_params = np.ascontiguousarray(material_params, dtype=np.float32).reshape(len(names), 4)
+    else:
+        material_params = None
+    inp.material_params = _ptr(material_params)
 
     def _cb(_user, stage, frac):
         try:

@@ -48,6 +48,11 @@ def dense_rock(subdiv=8):
     mat_a.diffuse_color = (0.55, 0.5, 0.45, 1)
     mat_b = bpy.data.materials.new("Moss")
     mat_b.diffuse_color = (0.2, 0.4, 0.15, 1)
+    for m, c, r in ((mat_a, (0.55, 0.5, 0.45, 1), 0.8), (mat_b, (0.2, 0.4, 0.15, 1), 0.9)):
+        m.use_nodes = True
+        bsdf = next(n for n in m.node_tree.nodes if n.type == 'BSDF_PRINCIPLED')
+        bsdf.inputs["Base Color"].default_value = c
+        bsdf.inputs["Roughness"].default_value = r
     ob.data.materials.append(mat_a)
     ob.data.materials.append(mat_b)
     # upper half gets the second material, so there is a material border to keep
@@ -134,6 +139,15 @@ def run():
     check("vgeo file written", os.path.exists(stream.asset_path(proxy)))
     check("source hidden, kept", src.hide_render and src.hide_get() and proxy.vgeo.source == src)
     check("materials carried", [m.name for m in proxy.data.materials] == ["Stone", "Moss"])
+    import struct
+    blob = open(stream.asset_path(proxy), "rb").read()
+    k = blob.find(b"MATP")
+    params = struct.unpack_from("<8f", blob, k + 4) if k > 0 else ()
+    check("material colors embedded for web viewers",
+          k > 0 and abs(params[0] - 0.55) < 1e-5 and abs(params[3] - 0.8) < 1e-5 and abs(params[5] - 0.4) < 1e-5,
+          str([round(x, 3) for x in params]))
+    with open(os.path.join(OUT, "last_asset.txt"), "w") as f:
+        f.write(stream.asset_path(proxy))
     rt = stream.runtime_for(proxy)
     src_tris = rt.asset.info["source_triangles"]
     check("source triangle count", src_tris == 327680, str(src_tris))

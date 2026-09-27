@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VGEO Viewer</title>
+<style>
+  :root { color-scheme: dark; --ink: #e8ecf2; --dim: #9aa6b6; --panel: rgba(14, 18, 24, 0.72); --line: rgba(255,255,255,0.1); --accent: #7fb2ff; }
+  html, body { margin: 0; height: 100%; background: #0d1117; color: var(--ink); font: 13px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+  .hud { position: fixed; left: 16px; top: 16px; background: var(--panel); backdrop-filter: blur(8px); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; min-width: 230px; display: grid; gap: 8px; }
+  .hud h1 { font-size: 13px; margin: 0; letter-spacing: 0.06em; text-transform: uppercase; color: var(--dim); font-weight: 600; }
+  .row { display: flex; justify-content: space-between; gap: 16px; font-variant-numeric: tabular-nums; }
+  .row span:first-child { color: var(--dim); }
+  .modes { display: flex; gap: 4px; }
+  .modes button { flex: 1; background: transparent; color: var(--ink); border: 1px solid var(--line); border-radius: 6px; padding: 4px 6px; font: inherit; cursor: pointer; }
+  .modes button[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); }
+  input[type=range] { width: 100%; }
+  .msg { position: fixed; inset: 0; display: grid; place-items: center; pointer-events: none; color: var(--dim); font-size: 15px; text-align: center; padding: 16px; }
+  [hidden] { display: none !important; }
+  .drop { outline: 2px dashed var(--accent); outline-offset: -12px; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div class="hud" id="hud" hidden>
+  <h1>VGEO · streamed geometry</h1>
+  <div class="row"><span>Source</span><span id="src">–</span></div>
+  <div class="row"><span>Drawn</span><span id="tri">–</span></div>
+  <div class="row"><span>Clusters</span><span id="cl">–</span></div>
+  <div class="row"><span>LOD levels</span><span id="lv">–</span></div>
+  <div class="row"><span>Frame rate</span><span id="fps">–</span></div>
+  <label class="row"><span>Pixel error</span><span id="pxv">1.0 px</span></label>
+  <input id="px" type="range" min="0.25" max="8" step="0.25" value="1">
+  <div class="modes" role="group" aria-label="View">
+    <button data-mode="shaded" aria-pressed="true">Shaded</button>
+    <button data-mode="lod">LOD</button>
+    <button data-mode="clusters">Clusters</button>
+  </div>
+  <label class="row"><span>Freeze cut</span><input id="freeze" type="checkbox"></label>
+</div>
+<div class="msg" id="msg">Loading…</div>
+<script type="module">
+import { createViewer } from "./vgeo-viewer.js";
+
+const $ = (id) => document.getElementById(id);
+const fmt = (n) => n >= 1e6 ? (n / 1e6).toFixed(2) + "M" : n >= 1e3 ? (n / 1e3).toFixed(1) + "k" : String(n);
+const params = new URLSearchParams(location.search);
+let viewer = null;
+
+async function open(source, label) {
+  viewer?.destroy();
+  $("msg").hidden = false;
+  $("msg").textContent = `Loading ${label}…`;
+  try {
+    viewer = await createViewer($("c"), source, {
+      pixelError: Number($("px").value),
+      fog: Number(params.get("fog") || 0),
+      onProgress: (f) => { $("msg").textContent = `Loading ${label}… ${Math.round(f * 100)}%`; },
+      onStats: (s) => {
+        $("tri").textContent = `${fmt(s.triangles)} (${(100 * s.triangles / s.sourceTriangles).toFixed(1)}%)`;
+        $("cl").textContent = fmt(s.clusters);
+        $("fps").textContent = s.fps ? s.fps.toFixed(0) + " fps" : "–";
+        document.title = `VGEO Viewer · ${fmt(s.triangles)} tris`;
+      },
+    });
+    const h = viewer.header;
+    $("src").textContent = fmt(h.sourceTriangles) + " tris";
+    $("lv").textContent = h.lodLevels;
+    $("hud").hidden = false;
+    $("msg").hidden = true;
+    window.vgeoViewer = viewer;
+  } catch (e) {
+    $("msg").textContent = String(e.message || e);
+    console.error(e);
+  }
+}
+
+$("px").addEventListener("input", () => {
+  $("pxv").textContent = Number($("px").value).toFixed(2).replace(/0$/, "") + " px";
+  viewer?.setPixelError(Number($("px").value));
+});
+document.querySelectorAll(".modes button").forEach((b) => b.addEventListener("click", () => {
+  document.querySelectorAll(".modes button").forEach((x) => x.setAttribute("aria-pressed", String(x === b)));
+  viewer?.setMode(b.dataset.mode);
+}));
+$("freeze").addEventListener("change", () => viewer?.setFrozen($("freeze").checked));
+
+// drop any .vgeo file onto the page
+addEventListener("dragover", (e) => { e.preventDefault(); document.body.classList.add("drop"); });
+addEventListener("dragleave", () => document.body.classList.remove("drop"));
+addEventListener("drop", async (e) => {
+  e.preventDefault();
+  document.body.classList.remove("drop");
+  const f = e.dataTransfer.files[0];
+  if (f) open(await f.arrayBuffer(), f.name);
+});
+
+const src = params.get("src");
+if (src) open(src, src.split("/").pop());
+else $("msg").textContent = "Drop a .vgeo file here, or open ?src=asset.vgeo";
+</script>
+</body>
+</html>

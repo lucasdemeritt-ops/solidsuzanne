@@ -1,0 +1,22 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>VGEO web/native comparison</title>
+<style>html,body{margin:0;height:100%} canvas{width:800px;height:600px;display:block}</style>
+<canvas id="c"></canvas>
+<script type="module">
+// Renders an asset from fixed cameras with culling off and publishes the GPU cut sizes in window.result,
+// so tests can compare them with the native runtime's cut for the same views.
+import { createViewer } from "../../web/vgeo-viewer.js";
+const p = new URLSearchParams(location.search);
+const views = JSON.parse(p.get("views") || '[{"distance":2.5,"yaw":0.3,"pitch":0.2,"px":1}]');
+const viewer = await createViewer(document.getElementById("c"), p.get("src"), { cull: false, ...views[0] });
+const out = [];
+for (const v of views) {
+  Object.assign(viewer.camera, { distance: v.distance, yaw: v.yaw, pitch: v.pitch });
+  viewer.setPixelError(v.px);
+  const f0 = viewer.frames();
+  await new Promise((r) => { const t = () => (viewer.frames() > f0 + 25 ? r() : requestAnimationFrame(t)); t(); });
+  out.push({ ...v, ...viewer.view, triangles: viewer.stats.triangles, clusters: viewer.stats.clusters });
+}
+window.result = out;
+</script>

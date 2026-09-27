@@ -44,6 +44,7 @@ typedef struct vgeo_build_input {
     const char* const* material_names;  // material_count UTF-8 strings, or NULL
     uint32_t max_triangles;       // triangles per cluster, 0 = 128
     uint32_t target_chunks;       // streaming chunks, 0 = auto
+    const float* material_params; // material_count * 4 (r, g, b, roughness), or NULL
 } vgeo_build_input;
 
 // stage: 0 = welding, 1 = building DAG (progress 0..1 is approximate), 2 = writing

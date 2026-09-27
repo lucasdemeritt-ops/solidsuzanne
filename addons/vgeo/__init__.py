@@ -97,7 +97,8 @@ class VGEO_OT_virtualize(bpy.types.Operator):
         self._full, self._setting = build.default_path(src, self._uid)
         self._materials = [m.name if m else None for m in arrays["material_list"]]
         names = [n or "" for n in self._materials]
-        return build.Job(arrays, self._full, names, self.max_triangles, self.target_chunks)
+        params = build.material_params(arrays["material_list"])
+        return build.Job(arrays, self._full, names, self.max_triangles, self.target_chunks, params)
 
     def _finish(self, context, job):
         src = bpy.data.objects.get(self._src_name)
