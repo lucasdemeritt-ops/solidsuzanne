@@ -48,3 +48,6 @@ desktop.ini
 !tests/assets/**/*.vscene
 
 build-*/
+*.vgeow
+*.vgeo.part
+*.vgeow.part
