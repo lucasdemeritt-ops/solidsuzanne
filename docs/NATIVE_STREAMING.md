@@ -158,7 +158,25 @@ boulder = 2.6 billion source triangles.
 | Build | virtualize 3.6 s, 15 level meshes 0.3 s |
 | Viewport cut at 1 px | 6.6M triangles (0.25 %) |
 | Final render at 0.5 px, 1600x900 | 19.4M triangles: EEVEE 1.7 s, Cycles 8.3 s (64 samples, OptiX) |
-| Viewport while flying | Solid ~117 fps, EEVEE ~68 fps, worst frame 45 ms |
+| Viewport while flying | Solid ~117 fps, EEVEE ~68-79 fps, worst frame 42-45 ms |
+
+**Streamed copies.** A whole-asset level wastes triangles on a copy seen up
+close: level 0 is the entire asset at full detail, though most of it is far
+away or facing away. Copies that want level 0 (nearest first, up to
+**Streamed Copies**, default 4, only for assets whose level 0 is at least
+20k triangles) are shown by a streamed copy instead: a VGEO proxy parented
+to the instancer, placed like the copy, hidden from selection, streaming a
+view-dependent cut through the same live loop. It starts empty; the copy
+keeps its instance until the streamed cut has landed, then the instance is
+dropped (a `vgeo_streamed` point attribute feeds Instance on Points'
+Selection) in the same tick, so there is never a gap or a doubled surface.
+Walking away hands the copy back and empties the streamed copy. Final
+renders make the streamed cuts synchronously.
+
+Scatter demo, viewport 1.8 radii from a boulder (`tests/slot_gui_check.py`):
+the boulder's streamed cut is 353k triangles instead of 1.31M for level 0,
+and it takes over 0.85-0.95 s after the view arrives (5.0.1 and 5.1.2,
+Solid and EEVEE).
 
 ## On the web
 
@@ -207,8 +225,8 @@ cut selection if needed.
 
 ## Not yet
 
-- Instances use whole-asset levels; a placement close enough to need a
-  streamed cut of its own (very large assets filling the view) is next.
+- A streamed copy's first assignment creates its chunk objects (one
+  relations rebuild, ~0.1 s in EEVEE); later reassignments reuse them.
 - Building without a full Blender mesh in memory (import straight from
   disk, or tiled builds), for sources beyond what Blender can hold.
 - Rare back-to-back "fins" left by simplification (about 3 per 100k

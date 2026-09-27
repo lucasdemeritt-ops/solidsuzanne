@@ -29,7 +29,8 @@ def _invalidate(self, _context):
 
 class VGEOObjectSettings(bpy.types.PropertyGroup):
     uid: StringProperty(name="Asset ID", options={'HIDDEN'})
-    path: StringProperty(name="File", subtype='FILE_PATH', update=_invalidate)
+    path: StringProperty(name="File", subtype='FILE_PATH', update=_invalidate,
+                         options={'PATH_SUPPORTS_BLEND_RELATIVE'})
     collection: PointerProperty(type=bpy.types.Collection, name="Chunks")
     source: PointerProperty(type=bpy.types.Object, name="Source")
     source_triangles: IntProperty(name="Source Triangles", options={'HIDDEN'})
@@ -54,6 +55,10 @@ class VGEOObjectSettings(bpy.types.PropertyGroup):
     lod_colors: BoolProperty(name="LOD Colors", default=False, update=_invalidate,
                              description="Write a 'vgeo_lod' color attribute (view it with Solid shading, "
                                          "Color: Attribute)")
+    # set on the streamed copies an instancer manages (see instances.py): owning instancer's uid,
+    # and the placement this copy currently shows (-1 = none)
+    slot_of: StringProperty(options={'HIDDEN'})
+    slot_index: IntProperty(default=-1, options={'HIDDEN'})
 
 
 class VGEOInstanceSettings(bpy.types.PropertyGroup):
@@ -65,6 +70,10 @@ class VGEOInstanceSettings(bpy.types.PropertyGroup):
     render_pixel_error: FloatProperty(name="Render Error", default=0.5, min=0.05, soft_max=4.0, subtype='PIXEL')
     min_level: IntProperty(name="Finest Level", default=0, min=0, soft_max=8,
                            description="Never use levels finer than this (caps memory for very dense assets)")
+    stream_slots: IntProperty(name="Streamed Copies", default=4, min=0, max=16,
+                              description="Copies close enough to want full detail get a view-dependent "
+                                          "streamed cut of their own instead of a whole-asset level "
+                                          "(fine where you look, coarse elsewhere); at most this many")
     freeze: BoolProperty(name="Freeze", default=False)
     shown_triangles: IntProperty(name="Shown Triangles", options={'HIDDEN'})
 
@@ -334,6 +343,7 @@ class VGEO_PT_panel(bpy.types.Panel):
             layout.prop(vi, "pixel_error")
             layout.prop(vi, "render_pixel_error")
             layout.prop(vi, "min_level")
+            layout.prop(vi, "stream_slots")
             row = layout.row(align=True)
             row.prop(vi, "freeze", toggle=True, icon='FREEZE')
             row.operator(VGEO_OT_rebuild_levels.bl_idname, icon='FILE_REFRESH')

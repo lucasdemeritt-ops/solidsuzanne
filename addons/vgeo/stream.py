@@ -311,6 +311,8 @@ def redirect_selection(view_layer=None):
     for ob in list(vl.objects.selected):
         p = ob.parent
         if p is not None and p.vgeo.uid and ob.name.startswith(f"vgeo.{p.vgeo.uid}."):
+            if p.vgeo.slot_of and p.parent is not None:
+                p = p.parent  # a streamed copy's chunk: select the instancer
             ob.select_set(False)
             try:
                 p.select_set(True)
@@ -810,18 +812,19 @@ def update_for_render(scene, depsgraph=None):
     view = camera_view(scene, depsgraph)
     if view is None:
         return
+    from . import instances
+    # instancers first: they choose which copies get a streamed cut and make it now
+    for inst in instances.instancers(scene):
+        if not inst.hide_render:
+            instances.update(inst, [view], inst.vgeo_inst.render_pixel_error, render=True)
     for obj in proxies(scene):
         if obj.vgeo.collection is not None:
             sync_visibility(obj)
-        if obj.hide_render:
+        if obj.hide_render or obj.vgeo.slot_of:  # streamed copies were cut by their instancer
             continue
         # final renders never cull: off-screen geometry still casts shadows and shows in reflections
         mode = "FULL" if obj.vgeo.offscreen == "FULL" else "COARSEN"
         apply_cut(obj, [view], obj.vgeo.render_pixel_error, mode, obj.vgeo.offscreen_scale)
-    from . import instances
-    for inst in instances.instancers(scene):
-        if not inst.hide_render:
-            instances.update(inst, [view], inst.vgeo_inst.render_pixel_error)
 
 
 # ---------------------------------------------------------------- live loop
@@ -836,6 +839,8 @@ def _orphan_check():
     if now - _last_orphan_check < 1.0:
         return False
     _last_orphan_check = now
+    from . import instances
+    instances.unlink_orphan_slots()
     unlink_orphans()
     return True
 
@@ -859,7 +864,8 @@ def _tick():
         return 0.25
     try:
         from . import instances
-        objs = [o for o in proxies() if not o.vgeo.freeze]
+        # idle streamed copies (slot_index < 0) belong to an instancer and show nothing
+        objs = [o for o in proxies() if not o.vgeo.freeze and not (o.vgeo.slot_of and o.vgeo.slot_index < 0)]
         insts = [o for o in instances.instancers() if not o.vgeo_inst.freeze]
         if not objs and not insts:
             _orphan_check()  # a deleted proxy's chunks must not linger
@@ -899,12 +905,16 @@ def _tick():
                     rt.settle_key, rt.settle_t = key, now
                 elif now - rt.settle_t >= CYCLES_SETTLE and (key != rt.key or not rt.valid.all()):
                     apply_cut(obj, views, v.pixel_error, v.offscreen, v.offscreen_scale)
+            for inst in insts:
+                instances.sync_slots(inst)
             return TICK
         busy = False
         budget = TICK_BUDGET / max(1, len(visible))
         for obj in visible:
             v = obj.vgeo
             busy |= stream_step(obj, views, v.pixel_error, v.offscreen, v.offscreen_scale, budget, strategy)
+        for inst in insts:   # copies whose streamed cut just landed take over in this same tick
+            instances.sync_slots(inst)
         # keep cranking (UI events still run between ticks) until the swap lands
         return 0.0 if busy else TICK
     except Exception as e:  # never let the timer die

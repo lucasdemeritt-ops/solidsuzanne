@@ -8,6 +8,15 @@ stays under the pixel threshold for the current views, and writes it to an
 integer attribute; a Geometry Nodes tree instances the chosen level mesh at
 each point. Navigating never rebuilds geometry, and EEVEE and Cycles get
 real instances (one copy of each level in memory, however many placements).
+
+Whole-asset levels waste triangles on a copy seen up close: level 0 is the
+entire asset at full detail, though most of it is far away or off-screen.
+The few copies that want level 0 (`stream_slots`, nearest first) are shown
+by streamed copies instead: hidden-from-selection VGEO proxies parented to
+the instancer, placed like the copy, streaming a view-dependent cut through
+the normal live loop. A copy is only switched over (its instance dropped via
+the `vgeo_streamed` attribute) once its streamed cut has landed, in the same
+tick, so the surface never shows a gap or two overlapping versions.
 """
 
 import math
@@ -21,6 +30,8 @@ NODE_GROUP = "VGEO Instances"
 LEVEL_ATTR = "vgeo_level"
 ROT_ATTR = "vgeo_rot"
 SCALE_ATTR = "vgeo_scale"
+STREAMED_ATTR = "vgeo_streamed"   # bool per point: shown by a streamed copy, not an instance
+STREAM_MIN_TRIS = 20_000          # below this, a whole-asset level 0 is cheap enough
 
 _levels_cache = {}   # instancer uid -> (errors ndarray, tris ndarray)
 
@@ -33,6 +44,7 @@ def instancers(scene=None):
 def ensure_node_group():
     ng = bpy.data.node_groups.get(NODE_GROUP)
     if ng and ng.bl_idname == "GeometryNodeTree" and "Levels" in ng.interface.items_tree:
+        _ensure_streamed_selection(ng)
         return ng
     ng = bpy.data.node_groups.new(NODE_GROUP, "GeometryNodeTree")
     ng.interface.new_socket("Geometry", in_out="INPUT", socket_type="NodeSocketGeometry")
@@ -66,7 +78,26 @@ def ensure_node_group():
     L.new(scl.outputs["Attribute"], iop.inputs["Scale"])
     out = n.new("NodeGroupOutput")
     L.new(iop.outputs["Instances"], out.inputs["Geometry"])
+    _ensure_streamed_selection(ng)
     return ng
+
+
+def _ensure_streamed_selection(ng):
+    """Placements shown by a streamed copy are left out: Selection = not vgeo_streamed.
+    Added in place, so node groups from older files keep working."""
+    if ng.nodes.get("VGEO streamed") is not None:
+        return
+    iop = next((x for x in ng.nodes if x.bl_idname == "GeometryNodeInstanceOnPoints"), None)
+    if iop is None:
+        return
+    a = ng.nodes.new("GeometryNodeInputNamedAttribute")
+    a.name = a.label = "VGEO streamed"
+    a.data_type = 'BOOLEAN'
+    a.inputs["Name"].default_value = STREAMED_ATTR
+    inv = ng.nodes.new("FunctionNodeBooleanMath")
+    inv.operation = 'NOT'
+    ng.links.new(a.outputs["Attribute"], inv.inputs[0])
+    ng.links.new(inv.outputs[0], iop.inputs["Selection"])
 
 
 def _socket_id(ng, name):
@@ -146,11 +177,16 @@ def _points(inst):
 
 def choose_levels(inst, views, pixel_error, mode="COARSEN", offscreen_scale=8.0):
     """Per placement, the coarsest level that keeps the error under the threshold in every view."""
+    return _choose(inst, views, pixel_error, mode, offscreen_scale)[0]
+
+
+def _choose(inst, views, pixel_error, mode="COARSEN", offscreen_scale=8.0):
+    """(levels, allowed error in asset units) per placement."""
     errors, _tris = _level_tables(inst)
     co, scale = _points(inst)
     n = len(co)
     if n == 0:
-        return np.zeros(0, np.int32)
+        return np.zeros(0, np.int32), np.zeros(0)
     mw = np.array(inst.matrix_world, dtype=np.float64)
     world = co @ mw[:3, :3].T + mw[:3, 3]
     s = scale.astype(np.float64) * max(abs(x) for x in inst.matrix_world.to_scale())
@@ -174,7 +210,7 @@ def choose_levels(inst, views, pixel_error, mode="COARSEN", offscreen_scale=8.0)
         budget = np.minimum(budget, b / s)   # error allowed in asset units
     levels = np.searchsorted(errors, budget, side="right") - 1
     levels = np.clip(levels, int(inst.vgeo_inst.min_level), len(errors) - 1)
-    return levels.astype(np.int32)
+    return levels.astype(np.int32), budget
 
 
 def apply_levels(inst, levels):
@@ -194,16 +230,255 @@ def apply_levels(inst, levels):
     return True
 
 
-def triangles_for(inst, levels):
+def triangles_for(inst, levels, streamed=None):
     _errors, tris = _level_tables(inst)
-    return int(tris[levels].sum()) if len(levels) else 0
+    if not len(levels):
+        return 0
+    if streamed is not None and streamed.any():
+        return int(tris[levels[~streamed]].sum())
+    return int(tris[levels].sum())
 
 
-def update(inst, views, pixel_error, mode="COARSEN", offscreen_scale=8.0):
-    levels = choose_levels(inst, views, pixel_error, mode, offscreen_scale)
+def update(inst, views, pixel_error, mode="COARSEN", offscreen_scale=8.0, render=False):
+    """Choose levels and streamed copies for these views. render=True: the streamed copies get
+    their cut now and take over at once (final renders are synchronous)."""
+    levels, budget = _choose(inst, views, pixel_error, mode, offscreen_scale)
     changed = apply_levels(inst, levels)
-    inst.vgeo_inst.shown_triangles = triangles_for(inst, levels)
+    wanted = _wanted_slots(inst, levels, budget)
+    changed |= assign_slots(inst, wanted, views if render else None, pixel_error, mode, offscreen_scale)
+    streamed = _streamed_flags(inst)
+    shown = triangles_for(inst, levels, streamed)
+    for ob in slots(inst):
+        rt = stream._runtimes.get(ob.vgeo.uid)
+        if ob.vgeo.slot_index >= 0 and rt is not None and rt.asset is not None and streamed[ob.vgeo.slot_index]:
+            shown += rt.triangles
+    inst.vgeo_inst.shown_triangles = shown
     return changed
+
+
+# ---------------------------------------------------------------- streamed copies
+
+def slots(inst):
+    """The streamed copies this instancer manages (children marked with its uid)."""
+    uid = inst.vgeo_inst.uid
+    return [o for o in inst.children if o.vgeo.slot_of == uid and o.vgeo.uid]
+
+
+def _slot_name(inst, k):
+    return f"vgeo.{inst.vgeo_inst.uid}.S{k:02d}"
+
+
+def ensure_slots(inst):
+    """Create or drop streamed copies to match stream_slots. Returns them in slot order."""
+    src = inst.vgeo_inst.source
+    want = int(inst.vgeo_inst.stream_slots) if src is not None and src.vgeo.path else 0
+    have = sorted(slots(inst), key=lambda o: o.name)
+    for ob in have[want:]:
+        _release_slot(inst, ob)
+        _remove_slot(ob)
+    have = have[:want]
+    names = {o.name for o in have}
+    for k in range(want):
+        name = _slot_name(inst, k)
+        if name in names:
+            continue
+        me = bpy.data.meshes.new(name)
+        stream._sync_materials(me, tuple(src.data.materials))
+        ob = bpy.data.objects.new(name, me)
+        for col in inst.users_collection:
+            col.objects.link(ob)
+        ob.parent = inst
+        ob.matrix_parent_inverse.identity()
+        ob.hide_select = True
+        v = ob.vgeo
+        v.uid = f"{inst.vgeo_inst.uid}s{k}"
+        v.path = src.vgeo.path
+        v.slot_of = inst.vgeo_inst.uid
+        v.slot_index = -1         # idle: the live loop skips it
+        v.offscreen = 'COARSEN'
+        have.append(ob)
+    for ob in have:
+        v = ob.vgeo
+        if v.pixel_error != inst.vgeo_inst.pixel_error:
+            v.pixel_error = inst.vgeo_inst.pixel_error
+        if v.render_pixel_error != inst.vgeo_inst.render_pixel_error:
+            v.render_pixel_error = inst.vgeo_inst.render_pixel_error
+        if ob.hide_render != inst.hide_render:
+            ob.hide_render = inst.hide_render
+        if ob.hide_viewport != inst.hide_viewport:
+            ob.hide_viewport = inst.hide_viewport
+        try:
+            if ob.hide_get() != inst.hide_get():
+                ob.hide_set(inst.hide_get())
+        except RuntimeError:  # not in the current view layer
+            pass
+    return sorted(have, key=lambda o: o.name)
+
+
+def _remove_slot(ob):
+    col = ob.vgeo.collection
+    rt = stream._runtimes.pop(ob.vgeo.uid, None)
+    if rt:
+        rt.close()
+    if col is not None:
+        for c in list(col.objects):
+            me = c.data
+            bpy.data.objects.remove(c)
+            if me is not None and me.users == 0:
+                bpy.data.meshes.remove(me)
+        bpy.data.collections.remove(col)
+    me = ob.data
+    bpy.data.objects.remove(ob)
+    if me is not None and me.users == 0:
+        bpy.data.meshes.remove(me)
+
+
+def _wanted_slots(inst, levels, budget):
+    """Placements that should be streamed: they want the finest level and it is big, nearest first."""
+    k = int(inst.vgeo_inst.stream_slots)
+    _errors, tris = _level_tables(inst)
+    if k <= 0 or not len(levels) or tris[0] < STREAM_MIN_TRIS or int(inst.vgeo_inst.min_level) > 0:
+        return []
+    cand = np.nonzero(levels == 0)[0]
+    if not len(cand):
+        return []
+    return [int(i) for i in cand[np.argsort(budget[cand], kind="stable")][:k]]
+
+
+def _streamed_flags(inst):
+    me = inst.data
+    n = len(me.vertices)
+    a = me.attributes.get(STREAMED_ATTR)
+    out = np.zeros(n, bool)
+    if a is not None and a.domain == 'POINT' and a.data_type == 'BOOLEAN':
+        a.data.foreach_get("value", out)
+    return out
+
+
+def _write_streamed(inst, flags):
+    me = inst.data
+    a = me.attributes.get(STREAMED_ATTR)
+    if a is None or a.domain != 'POINT' or a.data_type != 'BOOLEAN':
+        if a is not None:
+            me.attributes.remove(a)
+        a = me.attributes.new(STREAMED_ATTR, 'BOOLEAN', 'POINT')
+    a.data.foreach_set("value", flags)
+    me.update()
+
+
+def placement_matrix(inst, i):
+    """A placement's matrix in the instancer's space (what Instance on Points uses)."""
+    from mathutils import Euler, Matrix, Vector
+    me = inst.data
+    co = Vector(me.vertices[i].co)
+    rot = Euler((0.0, 0.0, 0.0))
+    a = me.attributes.get(ROT_ATTR)
+    if a is not None and a.domain == 'POINT':
+        rot = Euler(tuple(a.data[i].vector))
+    sc = 1.0
+    a = me.attributes.get(SCALE_ATTR)
+    if a is not None and a.domain == 'POINT':
+        sc = float(a.data[i].value)
+    return Matrix.Translation(co) @ rot.to_matrix().to_4x4() @ Matrix.Diagonal((sc, sc, sc, 1.0))
+
+
+def _clear_fronts(ob):
+    if ob.vgeo.collection is None:   # never streamed: no chunk objects to empty (none are created)
+        return
+    rt = stream.runtime_for(ob)
+    if rt.asset is None:
+        return
+    for pair in stream.chunk_objects(ob, rt):
+        for c in pair:
+            if len(c.data.vertices):
+                c.data.clear_geometry()
+    rt.invalidate()
+
+
+def _release_slot(inst, ob, flags=None):
+    """Hand a placement back to its instance; empties the copy. Returns True if flags changed."""
+    i = ob.vgeo.slot_index
+    ob.vgeo.slot_index = -1
+    _clear_fronts(ob)
+    if flags is not None and 0 <= i < len(flags) and flags[i]:
+        flags[i] = False
+        return True
+    return False
+
+
+def assign_slots(inst, wanted, render_views=None, pixel_error=1.0, mode="COARSEN", offscreen_scale=8.0):
+    """Give the wanted placements a streamed copy (keeping copies that still have one).
+    A new assignment starts empty and takes over in sync_slots once its cut has landed;
+    with render_views the cut is made now. Returns True if the streamed flags changed."""
+    obs = ensure_slots(inst)
+    if not obs and not _streamed_flags(inst).any():
+        return False
+    flags = _streamed_flags(inst)
+    before = flags.copy()
+    wanted_set = set(wanted)
+    kept = set()
+    free = []
+    for ob in obs:
+        i = ob.vgeo.slot_index
+        if i in wanted_set and i not in kept:
+            kept.add(i)
+        else:
+            _release_slot(inst, ob, flags)
+            free.append(ob)
+    for i in [i for i in wanted if i not in kept]:
+        if not free:
+            break
+        ob = free.pop(0)
+        ob.vgeo.slot_index = i
+        # matrix_world, not matrix_basis: it is current at once (a render cut follows right away)
+        ob.matrix_world = inst.matrix_world @ placement_matrix(inst, i)
+        rt = stream.runtime_for(ob)
+        ob["vgeo_slot_updates"] = rt.updates if rt.asset is not None else 0
+    # anything flagged without a copy goes back to its instance
+    owned = {ob.vgeo.slot_index for ob in obs if ob.vgeo.slot_index >= 0}
+    for i in np.nonzero(flags)[0]:
+        if int(i) not in owned:
+            flags[i] = False
+    if render_views is not None:
+        for ob in obs:
+            if ob.vgeo.slot_index >= 0:
+                stream.apply_cut(ob, render_views, ob.vgeo.render_pixel_error, "COARSEN", offscreen_scale)
+                flags[ob.vgeo.slot_index] = True
+    if not np.array_equal(flags, before):
+        _write_streamed(inst, flags)
+        return True
+    return False
+
+
+def sync_slots(inst):
+    """Switch placements over to their streamed copy once its first cut has landed. Called right
+    after the live loop streamed, so the swap happens in the frame the cut appears."""
+    obs = slots(inst)
+    if not obs:
+        return False
+    flags = _streamed_flags(inst)
+    before = flags.copy()
+    for ob in obs:
+        i = ob.vgeo.slot_index
+        if i < 0 or i >= len(flags) or flags[i]:
+            continue
+        rt = stream._runtimes.get(ob.vgeo.uid)
+        if (rt is not None and rt.asset is not None and rt.target is None and rt.key is not None
+                and rt.valid.all() and rt.updates > ob.get("vgeo_slot_updates", 0)):
+            flags[i] = True
+    if not np.array_equal(flags, before):
+        _write_streamed(inst, flags)
+        return True
+    return False
+
+
+def unlink_orphan_slots():
+    """Streamed copies whose instancer was deleted: take them out of the scene."""
+    live = {o.vgeo_inst.uid for o in bpy.data.objects if o.vgeo_inst.uid and o.users}
+    for ob in [o for o in bpy.data.objects if o.vgeo.slot_of and o.users]:
+        if ob.vgeo.slot_of not in live or ob.parent is None or ob.parent.vgeo_inst.uid != ob.vgeo.slot_of:
+            for col in list(ob.users_collection):
+                col.objects.unlink(ob)
 
 
 # ---------------------------------------------------------------- scattering

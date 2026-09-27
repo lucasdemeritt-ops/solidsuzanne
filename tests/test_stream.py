@@ -460,6 +460,63 @@ def run():
     check("instances show a fraction of full detail", inst.vgeo_inst.shown_triangles < full * 0.25,
           f"{inst.vgeo_inst.shown_triangles:,} of {full:,}")
     check("unchanged view writes nothing", instances.update(inst, [stream.camera_view(scene)], 1.0) is False)
+
+    # streamed copies: the copy right in front of the camera wants level 0 (the whole asset at full
+    # detail); a view-dependent cut of its own is lighter, and takes over only once it has landed
+    inst.vgeo_inst.stream_slots = 2
+    pts = np.empty(1200, np.float32)
+    inst.data.vertices.foreach_get("co", pts)
+    pts = pts.reshape(-1, 3)
+    target = int(np.argmin(np.linalg.norm(pts - np.array([0, 10, -1]), axis=1)))
+    p_world = inst.matrix_world @ Vector(pts[target])
+    r_target = float(inst["vgeo_radius"]) * float(inst.data.attributes["vgeo_scale"].data[target].value)
+    eye = p_world + Vector((0.0, -1.7, 0.6)) * r_target
+    camera(tuple(eye), target=tuple(p_world), lens=24)
+    views = [stream.camera_view(scene)]
+    instances.update(inst, views, 1.0)
+    sl = instances.slots(inst)
+    assigned = sorted(o.vgeo.slot_index for o in sl if o.vgeo.slot_index >= 0)
+    flags = instances._streamed_flags(inst)
+    check("streamed copies assigned to the nearest full-detail copies",
+          len(sl) == 2 and target in assigned and all(o.hide_select for o in sl), str(assigned))
+    check("instance kept until the streamed cut lands", not flags.any())
+    for _ in range(400):
+        busy = False
+        for o in sl:
+            if o.vgeo.slot_index >= 0:
+                busy |= stream.stream_step(o, views, 1.0, "COARSEN", 8.0, budget=0.01)
+        instances.sync_slots(inst)
+        if not busy and instances._streamed_flags(inst).sum() == len(assigned):
+            break
+    flags = instances._streamed_flags(inst)
+    check("landed copies switch to their streamed cut", sorted(np.nonzero(flags)[0].tolist()) == assigned)
+    near = next(o for o in sl if o.vgeo.slot_index == target)
+    rt_near = stream._runtimes[near.vgeo.uid]
+    check("streamed copy is lighter than full detail", 0 < rt_near.triangles < lvl_tris[0] * 0.8,
+          f"{rt_near.triangles:,} vs level 0 {lvl_tris[0]:,}")
+    mw = near.matrix_world
+    check("streamed copy sits on its placement",
+          (mw.translation - p_world).length < 1e-4 and abs(mw.to_scale()[0] - float(
+              inst.data.attributes["vgeo_scale"].data[target].value)) < 1e-4)
+    dg = bpy.context.evaluated_depsgraph_get()
+    n_inst = sum(1 for i in dg.object_instances if i.is_instance and i.parent and i.parent.original == inst)
+    check("streamed placements leave the instancing", n_inst == 400 - len(assigned), str(n_inst))
+    check("shown triangles count the streamed cuts", inst.vgeo_inst.shown_triangles > 0)
+    # walking away hands them back
+    camera((0, -150, 60), target=(0, 30, -1), lens=35)
+    instances.update(inst, [stream.camera_view(scene)], 1.0)
+    left = [c.name for o in sl if o.vgeo.collection for c in o.vgeo.collection.objects if len(c.data.vertices)]
+    check("far view returns copies to instances", not instances._streamed_flags(inst).any()
+          and all(o.vgeo.slot_index < 0 for o in sl) and not left,
+          f"flags {int(instances._streamed_flags(inst).sum())}, slots {[o.vgeo.slot_index for o in sl]}, "
+          f"non-empty {left[:3]}")
+    # final renders make the streamed cut on the spot
+    camera(tuple(eye), target=tuple(p_world), lens=24)
+    stream.update_for_render(scene)
+    check("render cuts streamed copies at once", instances._streamed_flags(inst)[target]
+          and stream._runtimes[near.vgeo.uid].triangles > 0)
+    camera((0, -12, 1.5), target=(0, 30, -1), lens=35)
+    instances.update(inst, [stream.camera_view(scene)], 1.0)
     world = bpy.data.worlds.get("W") or bpy.data.worlds.new("W")
     scene.world = world
     if not any(o.type == 'LIGHT' for o in scene.objects):
