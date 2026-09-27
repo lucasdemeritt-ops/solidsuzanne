@@ -42,6 +42,17 @@ if(VGEO_HAS_VULKAN)
     FetchContent_MakeAvailable(glfw)
 endif()
 
+# Streaming library (cluster LOD builder + runtime used by the Blender add-on).
+# Needs no Vulkan; configure with -DVGEO_STREAM_ONLY=ON to build just this.
+option(VGEO_BUILD_STREAM "Build the vgeo_stream shared library" ON)
+option(VGEO_STREAM_ONLY "Build only vgeo_stream" OFF)
+if(VGEO_BUILD_STREAM OR VGEO_STREAM_ONLY)
+    add_subdirectory(src/stream)
+endif()
+if(VGEO_STREAM_ONLY)
+    return()
+endif()
+
 # Subdirectories
 add_subdirectory(src/core)
 add_subdirectory(src/preprocess)

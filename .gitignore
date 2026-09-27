@@ -46,3 +46,5 @@ desktop.ini
 *.vscene
 !tests/assets/**/*.vgeo
 !tests/assets/**/*.vscene
+
+build-*/

@@ -1,0 +1,294 @@
+"""ctypes binding for vgeo_stream (the C++ builder + runtime).
+
+ctypes keeps the add-on independent of Blender's Python version: the same
+DLL loads in 5.0 (Python 3.11) and 5.1 (Python 3.13).
+"""
+
+import ctypes
+import os
+import sys
+
+import numpy as np
+
+_lib = None
+_lib_error = None
+
+MAX_ERR = 1024
+
+
+class BuildInput(ctypes.Structure):
+    _fields_ = [
+        ("tri_count", ctypes.c_uint32),
+        ("positions", ctypes.c_void_p),
+        ("normals", ctypes.c_void_p),
+        ("uvs", ctypes.c_void_p),
+        ("materials", ctypes.c_void_p),
+        ("material_count", ctypes.c_uint32),
+        ("material_names", ctypes.POINTER(ctypes.c_char_p)),
+        ("max_triangles", ctypes.c_uint32),
+        ("target_chunks", ctypes.c_uint32),
+    ]
+
+
+class BuildStats(ctypes.Structure):
+    _fields_ = [
+        ("source_triangles", ctypes.c_uint32),
+        ("vertices", ctypes.c_uint32),
+        ("clusters", ctypes.c_uint32),
+        ("groups", ctypes.c_uint32),
+        ("chunks", ctypes.c_uint32),
+        ("lod_levels", ctypes.c_uint32),
+        ("coarsest_triangles", ctypes.c_uint32),
+        ("file_bytes", ctypes.c_uint64),
+        ("seconds", ctypes.c_double),
+    ]
+
+
+class Info(ctypes.Structure):
+    _fields_ = [
+        ("vertex_count", ctypes.c_uint32),
+        ("cluster_count", ctypes.c_uint32),
+        ("group_count", ctypes.c_uint32),
+        ("chunk_count", ctypes.c_uint32),
+        ("material_count", ctypes.c_uint32),
+        ("lod_levels", ctypes.c_uint32),
+        ("flags", ctypes.c_uint32),
+        ("source_triangles", ctypes.c_uint32),
+        ("aabb_min", ctypes.c_float * 3),
+        ("aabb_max", ctypes.c_float * 3),
+    ]
+
+
+class View(ctypes.Structure):
+    _fields_ = [
+        ("camera", ctypes.c_float * 3),
+        ("proj", ctypes.c_float),
+        ("znear", ctypes.c_float),
+        ("threshold", ctypes.c_float),
+        ("ortho", ctypes.c_int32),
+        ("ortho_height", ctypes.c_float),
+        ("use_frustum", ctypes.c_int32),
+        ("planes", (ctypes.c_float * 4) * 6),
+    ]
+
+
+class CutStats(ctypes.Structure):
+    _fields_ = [
+        ("triangles", ctypes.c_uint64),
+        ("clusters", ctypes.c_uint32),
+        ("changed_chunks", ctypes.c_uint32),
+    ]
+
+
+class ChunkData(ctypes.Structure):
+    _fields_ = [
+        ("vertex_count", ctypes.c_uint32),
+        ("tri_count", ctypes.c_uint32),
+        ("positions", ctypes.POINTER(ctypes.c_float)),
+        ("normals", ctypes.POINTER(ctypes.c_float)),
+        ("uvs", ctypes.POINTER(ctypes.c_float)),
+        ("corner_verts", ctypes.POINTER(ctypes.c_int32)),
+        ("face_materials", ctypes.POINTER(ctypes.c_int32)),
+        ("face_lod", ctypes.POINTER(ctypes.c_int32)),
+    ]
+
+
+PROGRESS_FN = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_int, ctypes.c_float)
+
+
+def _library_name():
+    if sys.platform == "win32":
+        return "vgeo_stream.dll"
+    if sys.platform == "darwin":
+        return "vgeo_stream.dylib"
+    return "vgeo_stream.so"
+
+
+def library_path():
+    return os.path.join(os.path.dirname(__file__), "bin", _library_name())
+
+
+def lib():
+    """Load the library once; raises RuntimeError with a readable reason."""
+    global _lib, _lib_error
+    if _lib is not None:
+        return _lib
+    if _lib_error is not None:
+        raise RuntimeError(_lib_error)
+    path = library_path()
+    try:
+        L = ctypes.CDLL(path)
+    except OSError as e:
+        _lib_error = f"VGEO native library not loadable ({path}): {e}"
+        raise RuntimeError(_lib_error)
+    c = ctypes
+    L.vgeo_version.restype = c.c_int
+    L.vgeo_build.argtypes = [c.POINTER(BuildInput), c.c_char_p, PROGRESS_FN, c.c_void_p,
+                             c.POINTER(BuildStats), c.c_char_p, c.c_int]
+    L.vgeo_build.restype = c.c_int
+    L.vgeo_open.argtypes = [c.c_char_p, c.c_char_p, c.c_int]
+    L.vgeo_open.restype = c.c_void_p
+    L.vgeo_close.argtypes = [c.c_void_p]
+    L.vgeo_close.restype = None
+    L.vgeo_get_info.argtypes = [c.c_void_p, c.POINTER(Info)]
+    L.vgeo_material_name.argtypes = [c.c_void_p, c.c_uint32, c.c_char_p, c.c_int]
+    L.vgeo_select.argtypes = [c.c_void_p, c.POINTER(View), c.c_int, c.c_void_p, c.POINTER(CutStats)]
+    L.vgeo_select_level.argtypes = [c.c_void_p, c.c_int, c.c_void_p, c.POINTER(CutStats)]
+    L.vgeo_extract.argtypes = [c.c_void_p, c.c_uint32, c.POINTER(ChunkData)]
+    _lib = L
+    return L
+
+
+def available():
+    try:
+        lib()
+        return True
+    except RuntimeError:
+        return False
+
+
+def _ptr(a):
+    return a.ctypes.data_as(ctypes.c_void_p) if a is not None else None
+
+
+def build(path, positions, normals=None, uvs=None, materials=None, material_names=(),
+          max_triangles=128, target_chunks=0, progress=None):
+    """Build a .vgeo from per-corner arrays (tri_count*3 corners).
+
+    progress(stage, fraction) -> truthy to cancel. Runs without holding the
+    GIL (ctypes releases it), so it can be called from a worker thread.
+    """
+    L = lib()
+    positions = np.ascontiguousarray(positions, dtype=np.float32).reshape(-1, 3)
+    corners = positions.shape[0]
+    if corners == 0 or corners % 3:
+        raise ValueError("positions must hold 3 corners per triangle")
+    tri_count = corners // 3
+    if normals is not None:
+        normals = np.ascontiguousarray(normals, dtype=np.float32).reshape(corners, 3)
+    if uvs is not None:
+        uvs = np.ascontiguousarray(uvs, dtype=np.float32).reshape(corners, 2)
+    if materials is not None:
+        materials = np.ascontiguousarray(materials, dtype=np.uint16).reshape(tri_count)
+    names = [str(n).encode("utf-8") for n in material_names]
+    name_arr = (ctypes.c_char_p * max(1, len(names)))(*names)
+
+    inp = BuildInput()
+    inp.tri_count = tri_count
+    inp.positions = _ptr(positions)
+    inp.normals = _ptr(normals)
+    inp.uvs = _ptr(uvs)
+    inp.materials = _ptr(materials)
+    inp.material_count = len(names)
+    inp.material_names = name_arr
+    inp.max_triangles = max_triangles
+    inp.target_chunks = target_chunks
+
+    def _cb(_user, stage, frac):
+        try:
+            return 1 if (progress and progress(stage, frac)) else 0
+        except Exception:
+            return 0
+
+    cb = PROGRESS_FN(_cb)
+    stats = BuildStats()
+    err = ctypes.create_string_buffer(MAX_ERR)
+    rc = L.vgeo_build(ctypes.byref(inp), path.encode("utf-8"), cb, None, ctypes.byref(stats), err, MAX_ERR)
+    if rc == 2:
+        raise InterruptedError("build cancelled")
+    if rc != 0:
+        raise RuntimeError(err.value.decode("utf-8", "replace") or "vgeo_build failed")
+    return {f: getattr(stats, f) for f, _t in BuildStats._fields_}
+
+
+class Asset:
+    """An opened .vgeo file plus its current cut."""
+
+    def __init__(self, path):
+        L = lib()
+        err = ctypes.create_string_buffer(MAX_ERR)
+        h = L.vgeo_open(path.encode("utf-8"), err, MAX_ERR)
+        if not h:
+            raise RuntimeError(err.value.decode("utf-8", "replace"))
+        self._h = h
+        self.path = path
+        info = Info()
+        L.vgeo_get_info(h, ctypes.byref(info))
+        self.info = {f: (list(getattr(info, f)) if f.startswith("aabb") else getattr(info, f))
+                     for f, _t in Info._fields_}
+        self.chunk_count = info.chunk_count
+        self.has_uvs = bool(info.flags & 2)
+        buf = ctypes.create_string_buffer(512)
+        self.material_names = []
+        for i in range(info.material_count):
+            L.vgeo_material_name(h, i, buf, 512)
+            self.material_names.append(buf.value.decode("utf-8", "replace"))
+        self.sigs = np.zeros(self.chunk_count, dtype=np.uint64)
+        self.last = CutStats()
+
+    def close(self):
+        if self._h:
+            lib().vgeo_close(self._h)
+            self._h = None
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def select(self, views):
+        arr = (View * len(views))(*views)
+        stats = CutStats()
+        if lib().vgeo_select(self._h, arr, len(views), _ptr(self.sigs), ctypes.byref(stats)) != 0:
+            raise RuntimeError("vgeo_select failed")
+        self.last = stats
+        return self.sigs
+
+    def select_level(self, depth):
+        stats = CutStats()
+        lib().vgeo_select_level(self._h, int(depth), _ptr(self.sigs), ctypes.byref(stats))
+        self.last = stats
+        return self.sigs
+
+    def extract(self, chunk):
+        """Return numpy copies of one chunk's selected geometry (None if empty)."""
+        d = ChunkData()
+        if lib().vgeo_extract(self._h, chunk, ctypes.byref(d)) != 0:
+            raise RuntimeError("vgeo_extract failed")
+        nv, nt = d.vertex_count, d.tri_count
+        if nt == 0:
+            return None
+
+        def grab(ptr, n, dtype):
+            # memmove into a fresh array: much cheaper than np.ctypeslib.as_array per call
+            out = np.empty(n, dtype=dtype)
+            ctypes.memmove(out.ctypes.data, ctypes.cast(ptr, ctypes.c_void_p).value, out.nbytes)
+            return out
+
+        return {
+            "positions": grab(d.positions, nv * 3, np.float32),
+            "normals": grab(d.normals, nv * 3, np.float32),
+            "uvs": grab(d.uvs, nv * 2, np.float32) if d.uvs else None,
+            "corner_verts": grab(d.corner_verts, nt * 3, np.int32),
+            "face_materials": grab(d.face_materials, nt, np.int32),
+            "face_lod": grab(d.face_lod, nt, np.int32),
+            "vertex_count": nv,
+            "tri_count": nt,
+        }
+
+
+def make_view(camera, proj, znear, threshold, ortho=False, ortho_height=1.0, planes=None):
+    v = View()
+    v.camera[:] = [float(x) for x in camera]
+    v.proj = float(proj)
+    v.znear = float(znear)
+    v.threshold = float(threshold)
+    v.ortho = 1 if ortho else 0
+    v.ortho_height = float(ortho_height)
+    if planes is not None:
+        v.use_frustum = 1
+        for i in range(6):
+            for j in range(4):
+                v.planes[i][j] = float(planes[i][j])
+    return v

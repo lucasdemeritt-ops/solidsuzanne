@@ -1,0 +1,130 @@
+// VGEO stream - C API for building and streaming cluster-LOD geometry.
+//
+// One shared library, called from Blender through ctypes (so a single binary
+// serves every Blender/Python version) and later compiled to WebAssembly for
+// the web runtime. Everything here is plain C types.
+//
+// Build:   triangle soup (per-corner attributes) -> .vgeo (format v2)
+// Runtime: open .vgeo -> select a DAG cut for one or more views ->
+//          extract the cut chunk by chunk as indexed meshes.
+#pragma once
+
+#include <stdint.h>
+
+#ifdef _WIN32
+#define VGEO_API __declspec(dllexport)
+#else
+#define VGEO_API __attribute__((visibility("default")))
+#endif
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#define VGEO_STREAM_VERSION 1
+
+// ---------------------------------------------------------------- build
+
+typedef struct vgeo_build_input {
+    uint32_t tri_count;
+    const float* positions;       // tri_count*3 corners * 3 floats
+    const float* normals;         // tri_count*3 corners * 3 floats, or NULL
+    const float* uvs;             // tri_count*3 corners * 2 floats, or NULL
+    const uint16_t* materials;    // tri_count, or NULL
+    uint32_t material_count;
+    const char* const* material_names;  // material_count UTF-8 strings, or NULL
+    uint32_t max_triangles;       // triangles per cluster, 0 = 128
+    uint32_t target_chunks;       // streaming chunks, 0 = auto
+} vgeo_build_input;
+
+// stage: 0 = welding, 1 = building DAG (progress 0..1 is approximate), 2 = writing
+// return nonzero to cancel
+typedef int (*vgeo_progress_fn)(void* user, int stage, float progress);
+
+typedef struct vgeo_build_stats {
+    uint32_t source_triangles;
+    uint32_t vertices;
+    uint32_t clusters;
+    uint32_t groups;
+    uint32_t chunks;
+    uint32_t lod_levels;
+    uint32_t coarsest_triangles;  // triangles in the least detailed full cut
+    uint64_t file_bytes;
+    double seconds;
+} vgeo_build_stats;
+
+// returns 0 on success; on failure writes a message to err
+VGEO_API int vgeo_build(const vgeo_build_input* input, const char* path_utf8,
+                        vgeo_progress_fn progress, void* user,
+                        vgeo_build_stats* stats, char* err, int err_len);
+
+// ---------------------------------------------------------------- runtime
+
+typedef struct vgeo_info {
+    uint32_t vertex_count;
+    uint32_t cluster_count;
+    uint32_t group_count;
+    uint32_t chunk_count;
+    uint32_t material_count;
+    uint32_t lod_levels;
+    uint32_t flags;               // bit0 normals, bit1 uvs
+    uint32_t source_triangles;
+    float aabb_min[3];
+    float aabb_max[3];
+} vgeo_info;
+
+// A view, in the asset's local space.
+// perspective: proj = cot(fov_y / 2); ortho: ortho_height = visible height.
+// threshold is the allowed error as a fraction of the view height
+// (pixels / viewport height in pixels).
+typedef struct vgeo_view {
+    float camera[3];
+    float proj;
+    float znear;
+    float threshold;
+    int32_t ortho;
+    float ortho_height;
+    int32_t use_frustum;
+    float planes[6][4];           // inward-facing: dot(n, p) + d >= 0 inside
+} vgeo_view;
+
+typedef struct vgeo_cut_stats {
+    uint64_t triangles;
+    uint32_t clusters;
+    uint32_t changed_chunks;
+} vgeo_cut_stats;
+
+// Chunk contents, valid until the next vgeo_extract/vgeo_close on this handle.
+typedef struct vgeo_chunk_data {
+    uint32_t vertex_count;
+    uint32_t tri_count;
+    const float* positions;       // vertex_count * 3
+    const float* normals;         // vertex_count * 3 (NULL if absent)
+    const float* uvs;             // vertex_count * 2 (NULL if absent)
+    const int32_t* corner_verts;  // tri_count * 3
+    const int32_t* face_materials;// tri_count
+    const int32_t* face_lod;      // tri_count, DAG depth (for debug views)
+} vgeo_chunk_data;
+
+VGEO_API void* vgeo_open(const char* path_utf8, char* err, int err_len);
+VGEO_API void vgeo_close(void* handle);
+VGEO_API int vgeo_get_info(void* handle, vgeo_info* info);
+VGEO_API int vgeo_material_name(void* handle, uint32_t index, char* buf, int buf_len);
+
+// Select the cut that satisfies every view (a cluster is refined while its
+// error is above threshold in any view). chunk_sig receives one signature per
+// chunk; a chunk needs rebuilding when its signature changed.
+VGEO_API int vgeo_select(void* handle, const vgeo_view* views, int view_count,
+                         uint64_t* chunk_sig, vgeo_cut_stats* stats);
+
+// Select the whole asset at a fixed DAG depth (-1 = coarsest, 0 = full detail).
+VGEO_API int vgeo_select_level(void* handle, int depth, uint64_t* chunk_sig, vgeo_cut_stats* stats);
+
+// Extract the currently selected geometry of one chunk.
+VGEO_API int vgeo_extract(void* handle, uint32_t chunk, vgeo_chunk_data* out);
+
+VGEO_API int vgeo_version(void);
+
+#ifdef __cplusplus
+}
+#endif
