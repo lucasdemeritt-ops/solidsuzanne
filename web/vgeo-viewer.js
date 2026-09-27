@@ -1,8 +1,10 @@
-// VGEO web viewer: streams a cluster-LOD DAG (.vgeo v2) with WebGPU.
+// VGEO web viewer: streams a cluster-LOD DAG (.vgeow / .vgeo) with WebGPU.
 //
-// One ES module, no build step, no dependencies:
+// One ES module, no build step:
 //   import { createViewer } from "./vgeo-viewer.js";
-//   const viewer = await createViewer(canvas, "asset.vgeo", { pixelError: 1 });
+//   const viewer = await createViewer(canvas, "asset.vgeow", { pixelError: 1 });
+// Compressed .vgeow files also need meshopt_decoder.mjs next to this file
+// (loaded on demand); .vgeo v2 files need nothing else.
 //
 // Every frame a compute pass decides, per cluster, whether it belongs to the
 // cut (the same rule as the Blender add-on: a cluster is drawn when its group
@@ -12,31 +14,20 @@
 // straight from storage buffers. The CPU never touches the geometry after
 // upload, so the cost per frame does not depend on how much the view changed.
 
-const HEADER_BYTES = 200;
-const CLUSTER_U32 = 10;   // index_offset, tri_count, group, refined, chunk, depth, center xyz, radius
-const GROUP_U32 = 8;      // center xyz, radius, error, depth, reserved x2
+// GPU layout, shared by both file formats:
+//   clusters  12 u32: vertex offset, triangle offset, group, refined, vcount | tcount << 16, depth,
+//                     center xyz, radius, 0, 0
+//   groups     8 u32: center xyz, radius, error, depth, 0, 0
+//   vertices   4 u32: x, y, z on a global 21-bit grid (crack-free), oct normal (snorm16 x 2)
+//   triangles  1 u32: i0 | i1 << 8 | i2 << 16 | material << 24 (cluster-local indices)
+const CLUSTER_U32 = 12;
+const GROUP_U32 = 8;
+const GRID_MAX = (1 << 21) - 1;
 
-export function parseVGEO(buffer) {
-  const dv = new DataView(buffer);
-  const magic = String.fromCharCode(...new Uint8Array(buffer, 0, 5));
-  if (magic !== "VGEO2") throw new Error("not a VGEO v2 file");
+function readMaterials(buffer, dv, p, h) {
   const u32 = (o) => dv.getUint32(o, true);
   const f32 = (o) => dv.getFloat32(o, true);
-  const u64 = (o) => Number(dv.getBigUint64(o, true));
-  const h = {
-    version: u32(8),
-    vertexCount: u32(16), indexCount: u32(20), clusterCount: u32(24), groupCount: u32(28),
-    chunkCount: u32(32), chunkClusterCount: u32(36), materialCount: u32(40), flags: u32(44),
-    lodLevels: u32(48), sourceTriangles: u32(52),
-    aabbMin: [f32(56), f32(60), f32(64)], aabbMax: [f32(68), f32(72), f32(76)],
-    offPositions: u64(80), offNormals: u64(88), offUVs: u64(96), offVmat: u64(104),
-    offIndices: u64(112), offClusters: u64(120), offGroups: u64(128), offChunks: u64(136),
-    offChunkClusters: u64(144), offMaterials: u64(152), fileSize: u64(160),
-  };
-  if (h.version !== 2) throw new Error("unsupported VGEO version " + h.version);
-  if (h.fileSize > buffer.byteLength) throw new Error("truncated VGEO file");
   const names = [];
-  let p = h.offMaterials;
   const n = u32(p); p += 4;
   const dec = new TextDecoder();
   for (let i = 0; i < n && p + 4 <= buffer.byteLength; i++) {
@@ -53,12 +44,145 @@ export function parseVGEO(buffer) {
       h.materialParams.push({ color: [f32(o), f32(o + 4), f32(o + 8)], roughness: f32(o + 12) });
     }
   }
-  // widest cluster decides how many vertices each instance of the draw covers
-  const clusters = new Uint32Array(buffer, h.offClusters, h.clusterCount * CLUSTER_U32);
-  let maxTris = 0;
-  for (let i = 0; i < h.clusterCount; i++) maxTris = Math.max(maxTris, clusters[i * CLUSTER_U32 + 1]);
-  h.maxClusterTris = maxTris;
+}
+
+/** Parse a .vgeo (v2) or .vgeow header. Throws on anything else. */
+export function parseVGEO(buffer) {
+  const dv = new DataView(buffer);
+  const magic = String.fromCharCode(...new Uint8Array(buffer, 0, 5));
+  const u32 = (o) => dv.getUint32(o, true);
+  const f32 = (o) => dv.getFloat32(o, true);
+  const u64 = (o) => Number(dv.getBigUint64(o, true));
+  let h;
+  if (magic === "VGEO2") {
+    h = {
+      format: "vgeo", version: u32(8),
+      vertexCount: u32(16), indexCount: u32(20), clusterCount: u32(24), groupCount: u32(28),
+      materialCount: u32(40), flags: u32(44), lodLevels: u32(48), sourceTriangles: u32(52),
+      aabbMin: [f32(56), f32(60), f32(64)], aabbMax: [f32(68), f32(72), f32(76)],
+      offPositions: u64(80), offNormals: u64(88), offVmat: u64(104), offIndices: u64(112),
+      offClusters: u64(120), offGroups: u64(128), offMaterials: u64(152), fileSize: u64(160),
+    };
+    if (h.version !== 2) throw new Error("unsupported VGEO version " + h.version);
+    const cl = new Uint32Array(buffer, h.offClusters, h.clusterCount * 10);
+    let maxTris = 0;
+    for (let i = 0; i < h.clusterCount; i++) maxTris = Math.max(maxTris, cl[i * 10 + 1]);
+    h.maxClusterTris = maxTris;
+  } else if (magic === "VGEOW") {
+    h = {
+      format: "vgeow", version: u32(8),
+      clusterCount: u32(16), groupCount: u32(20), vertexCount: u32(24), triangleCount: u32(28),
+      materialCount: u32(32), lodLevels: u32(36), sourceTriangles: u32(40), maxClusterTris: u32(44),
+      aabbMin: [f32(48), f32(52), f32(56)], aabbMax: [f32(60), f32(64), f32(68)],
+      gridOrigin: [f32(72), f32(76), f32(80)], gridStep: f32(84),
+      offClusters: u32(88), offGroups: u32(92), offVertices: u32(96), offTriangles: u32(100),
+      offMaterials: u32(104), fileSize: u32(108), vertexBytes: u32(112), triangleBytes: u32(116),
+      flags: u32(120),
+    };
+    if (h.version !== 1) throw new Error("unsupported VGEOW version " + h.version);
+  } else {
+    throw new Error("not a VGEO file");
+  }
+  if (h.fileSize > buffer.byteLength) throw new Error("truncated VGEO file");
+  readMaterials(buffer, dv, h.offMaterials, h);
   return h;
+}
+
+// float32 arithmetic and C lround(), so the in-browser conversion of .vgeo files is
+// bit-identical to the native exporter's .vgeow
+const f = Math.fround;
+const lround = (v) => (v < 0 ? -Math.floor(-v + 0.5) : Math.floor(v + 0.5));
+
+function octEncode(x, y, z) {
+  const s = f(f(Math.abs(x) + Math.abs(y)) + Math.abs(z));
+  if (s <= 0) return 0;
+  x = f(x / s); y = f(y / s);
+  if (z < 0) {
+    const ox = f(f(1 - Math.abs(y)) * (x >= 0 ? 1 : -1));
+    const oy = f(f(1 - Math.abs(x)) * (y >= 0 ? 1 : -1));
+    x = ox; y = oy;
+  }
+  const q = (v) => (lround(f(Math.max(-1, Math.min(1, v)) * 32767)) & 0xFFFF);
+  return (q(x) | (q(y) << 16)) >>> 0;
+}
+
+/** Decode either format into the shared GPU layout. */
+export async function toGPULayout(buffer, h = parseVGEO(buffer),
+                                  decoderUrl = new URL("./meshopt_decoder.mjs", import.meta.url)) {
+  if (h.format === "vgeow") {
+    const clusters = new Uint32Array(buffer.slice(h.offClusters, h.offClusters + h.clusterCount * CLUSTER_U32 * 4));
+    const groups = new Uint32Array(buffer.slice(h.offGroups, h.offGroups + h.groupCount * GROUP_U32 * 4));
+    const vertices = new Uint32Array(h.vertexCount * 4);
+    const triangles = new Uint32Array(h.triangleCount);
+    if (h.flags & 1) {
+      const { MeshoptDecoder } = await import(decoderUrl.href);
+      await MeshoptDecoder.ready;
+      MeshoptDecoder.decodeVertexBuffer(new Uint8Array(vertices.buffer), h.vertexCount, 16,
+        new Uint8Array(buffer, h.offVertices, h.vertexBytes));
+      MeshoptDecoder.decodeVertexBuffer(new Uint8Array(triangles.buffer), h.triangleCount, 4,
+        new Uint8Array(buffer, h.offTriangles, h.triangleBytes));
+    } else {
+      vertices.set(new Uint32Array(buffer, h.offVertices, h.vertexCount * 4));
+      triangles.set(new Uint32Array(buffer, h.offTriangles, h.triangleCount));
+    }
+    return { clusters, groups, vertices, triangles, gridOrigin: h.gridOrigin, gridStep: h.gridStep };
+  }
+  // .vgeo v2: global vertices + global indices -> self-contained clusters on the exporter's grid
+  const lo = h.aabbMin, hi = h.aabbMax;
+  const extent = Math.max(f(hi[0] - lo[0]), f(hi[1] - lo[1]), f(hi[2] - lo[2]));
+  const step = extent > 0 ? f(extent / GRID_MAX) : 1;
+  const pos = new Float32Array(buffer, h.offPositions, h.vertexCount * 3);
+  const nrm = new Float32Array(buffer, h.offNormals, h.vertexCount * 3);
+  const vmat = new Uint16Array(buffer, h.offVmat, h.vertexCount);
+  const idx = new Uint32Array(buffer, h.offIndices, h.indexCount);
+  const src = new Uint32Array(buffer, h.offClusters, h.clusterCount * 10);
+  const clusters = new Uint32Array(h.clusterCount * CLUSTER_U32);
+  const triangles = new Uint32Array(h.indexCount / 3);
+  let vertices = new Uint32Array(Math.max(16, h.indexCount * 2));
+  const local = new Int32Array(h.vertexCount).fill(-1);
+  const touched = [];
+  let nv = 0, nt = 0;
+  for (let c = 0; c < h.clusterCount; c++) {
+    const off = src[c * 10], tc = src[c * 10 + 1];
+    const vtxOff = nv, triOff = nt;
+    touched.length = 0;
+    for (let t = 0; t < tc; t++) {
+      let word = 0;
+      for (let j = 0; j < 3; j++) {
+        const v = idx[off + t * 3 + j];
+        if (local[v] < 0) {
+          local[v] = touched.length;
+          touched.push(v);
+          if ((nv + 1) * 4 > vertices.length) {
+            const grown = new Uint32Array(vertices.length * 2);
+            grown.set(vertices);
+            vertices = grown;
+          }
+          for (let k = 0; k < 3; k++) {
+            vertices[nv * 4 + k] = lround(Math.max(0, Math.min(GRID_MAX, f(f(pos[v * 3 + k] - lo[k]) / step))));
+          }
+          vertices[nv * 4 + 3] = octEncode(nrm[v * 3], nrm[v * 3 + 1], nrm[v * 3 + 2]);
+          nv++;
+        }
+        word |= local[v] << (8 * j);
+      }
+      triangles[nt++] = (word | (Math.min(vmat[idx[off + t * 3]], 255) << 24)) >>> 0;
+    }
+    for (const v of touched) local[v] = -1;
+    const o = c * CLUSTER_U32;
+    clusters[o] = vtxOff;
+    clusters[o + 1] = triOff;
+    clusters[o + 2] = src[c * 10 + 2];
+    clusters[o + 3] = src[c * 10 + 3];
+    clusters[o + 4] = (touched.length | (tc << 16)) >>> 0;
+    clusters[o + 5] = src[c * 10 + 5];
+    for (let k = 0; k < 4; k++) clusters[o + 6 + k] = src[c * 10 + 6 + k];
+  }
+  const groups = new Uint32Array(buffer.slice(h.offGroups, h.offGroups + h.groupCount * GROUP_U32 * 4));
+  return {
+    clusters, groups, vertices: vertices.subarray(0, Math.max(4, nv * 4)), triangles: triangles.subarray(0, nt),
+    gridOrigin: [...lo], gridStep: step,
+  };
 }
 
 const SELECT_WGSL = /* wgsl */`
@@ -108,7 +232,7 @@ fn main(@builtin(global_invocation_id) id : vec3u, @builtin(num_workgroups) nwg 
   if (!inFrustum(c, bitcast<f32>(clusters[b + 9u]))) { return; }
   let slot = atomicAdd(&args[1], 1u);
   visible[slot] = i;
-  atomicAdd(&args[4], clusters[b + 1u]);   // triangles, for stats
+  atomicAdd(&args[4], clusters[b + 4u] >> 16u);   // triangles, for stats
 }
 `;
 
@@ -125,16 +249,25 @@ struct Look {
   skyColor : vec4f,
   groundColor : vec4f,
   fog : vec4f,        // rgb, density
+  grid : vec4f,       // quantization grid origin xyz, step
   materials : array<vec4f, 64>,   // base color rgb, roughness
 };
 @group(0) @binding(0) var<uniform> cam : Cam;
 @group(0) @binding(1) var<storage, read> clusters : array<u32>;
-@group(0) @binding(2) var<storage, read> indices : array<u32>;
-@group(0) @binding(3) var<storage, read> positions : array<f32>;
-@group(0) @binding(4) var<storage, read> normals : array<f32>;
-@group(0) @binding(5) var<storage, read> vmat : array<u32>;
-@group(0) @binding(6) var<storage, read> visible : array<u32>;
-@group(0) @binding(7) var<uniform> look : Look;
+@group(0) @binding(2) var<storage, read> triangles : array<u32>;
+@group(0) @binding(3) var<storage, read> vertices : array<u32>;
+@group(0) @binding(4) var<storage, read> visible : array<u32>;
+@group(0) @binding(5) var<uniform> look : Look;
+
+fn octDecode(w : u32) -> vec3f {
+  let x = f32(bitcast<i32>(w << 16u) >> 16u) / 32767.0;
+  let y = f32(bitcast<i32>(w) >> 16u) / 32767.0;
+  var n = vec3f(x, y, 1.0 - abs(x) - abs(y));
+  if (n.z < 0.0) {
+    n = vec3f((1.0 - abs(n.y)) * select(-1.0, 1.0, n.x >= 0.0), (1.0 - abs(n.x)) * select(-1.0, 1.0, n.y >= 0.0), n.z);
+  }
+  return normalize(n);
+}
 
 struct VOut {
   @builtin(position) pos : vec4f,
@@ -148,17 +281,18 @@ fn vs(@builtin(vertex_index) vi : u32, @builtin(instance_index) ii : u32) -> VOu
   var o : VOut;
   let cid = visible[ii];
   let b = cid * ${CLUSTER_U32}u;
-  if (vi / 3u >= clusters[b + 1u]) {   // past this cluster's last triangle: degenerate, never rasterized
+  let tri = vi / 3u;
+  if (tri >= (clusters[b + 4u] >> 16u)) {   // past this cluster's last triangle: degenerate, never rasterized
     o.pos = vec4f(0.0, 0.0, 2.0, 1.0);
     return o;
   }
-  let v = indices[clusters[b] + vi];
-  let p = vec3f(positions[v * 3u], positions[v * 3u + 1u], positions[v * 3u + 2u]);
+  let t = triangles[clusters[b + 1u] + tri];
+  let v = (clusters[b] + ((t >> (8u * (vi % 3u))) & 255u)) * 4u;
+  let p = look.grid.xyz + vec3f(f32(vertices[v]), f32(vertices[v + 1u]), f32(vertices[v + 2u])) * look.grid.w;
   o.world = p;
-  o.normal = vec3f(normals[v * 3u], normals[v * 3u + 1u], normals[v * 3u + 2u]);
+  o.normal = octDecode(vertices[v + 3u]);
   o.pos = cam.viewProj * vec4f(p, 1.0);
-  let m = (vmat[v >> 1u] >> ((v & 1u) * 16u)) & 0xFFFFu;
-  o.info = vec3u(m, clusters[b + 5u], cid);
+  o.info = vec3u(t >> 24u, clusters[b + 5u], cid);
   return o;
 }
 
@@ -278,8 +412,9 @@ export async function createViewer(canvas, source, options = {}) {
   if (!adapter) throw new Error("no WebGPU adapter");
   const buffer = typeof source === "string" ? await fetchWithProgress(source, options.onProgress) : source;
   const h = parseVGEO(buffer);
+  const layout = await toGPULayout(buffer, h, options.decoderUrl ? new URL(options.decoderUrl, location.href) : undefined);
 
-  const need = Math.max(h.indexCount * 4, h.vertexCount * 12, h.clusterCount * 4) + 256;
+  const need = Math.max(layout.vertices.byteLength, layout.triangles.byteLength, layout.clusters.byteLength) + 256;
   if (need > adapter.limits.maxStorageBufferBindingSize) {
     throw new Error(`asset needs ${(need / 2 ** 20).toFixed(0)} MB buffers; this GPU allows ` +
       `${(adapter.limits.maxStorageBufferBindingSize / 2 ** 20).toFixed(0)} MB`);
@@ -296,26 +431,24 @@ export async function createViewer(canvas, source, options = {}) {
   context.configure({ device, format, alphaMode: "opaque" });
 
   const S = GPUBufferUsage;
-  const upload = (byteOffset, byteLength, usage = S.STORAGE) => {
-    const size = Math.max(16, Math.ceil(byteLength / 4) * 4);
-    const b = device.createBuffer({ size, usage: usage | S.COPY_DST, mappedAtCreation: true });
-    new Uint8Array(b.getMappedRange()).set(new Uint8Array(buffer, byteOffset, byteLength));
+  const upload = (array) => {
+    const size = Math.max(16, Math.ceil(array.byteLength / 4) * 4);
+    const b = device.createBuffer({ size, usage: S.STORAGE | S.COPY_DST, mappedAtCreation: true });
+    new Uint8Array(b.getMappedRange()).set(new Uint8Array(array.buffer, array.byteOffset, array.byteLength));
     b.unmap();
     return b;
   };
   const gpu = {
-    positions: upload(h.offPositions, h.vertexCount * 12),
-    normals: upload(h.offNormals, h.vertexCount * 12),
-    vmat: upload(h.offVmat, h.vertexCount * 2),
-    indices: upload(h.offIndices, h.indexCount * 4),
-    clusters: upload(h.offClusters, h.clusterCount * CLUSTER_U32 * 4),
-    groups: upload(h.offGroups, h.groupCount * GROUP_U32 * 4),
+    clusters: upload(layout.clusters),
+    groups: upload(layout.groups),
+    vertices: upload(layout.vertices),
+    triangles: upload(layout.triangles),
   };
   gpu.visible = device.createBuffer({ size: Math.max(16, h.clusterCount * 4), usage: S.STORAGE });
   gpu.args = device.createBuffer({ size: 32, usage: S.STORAGE | S.INDIRECT | S.COPY_DST | S.COPY_SRC });
   gpu.readback = device.createBuffer({ size: 32, usage: S.MAP_READ | S.COPY_DST });
   gpu.cam = device.createBuffer({ size: 256, usage: S.UNIFORM | S.COPY_DST });
-  gpu.look = device.createBuffer({ size: 80 + 64 * 16, usage: S.UNIFORM | S.COPY_DST });
+  gpu.look = device.createBuffer({ size: 96 + 64 * 16, usage: S.UNIFORM | S.COPY_DST });
 
   const selectPipeline = device.createComputePipeline({
     layout: "auto",
@@ -335,7 +468,7 @@ export async function createViewer(canvas, source, options = {}) {
   });
   const renderBind = device.createBindGroup({
     layout: renderPipeline.getBindGroupLayout(0),
-    entries: [gpu.cam, gpu.clusters, gpu.indices, gpu.positions, gpu.normals, gpu.vmat, gpu.visible, gpu.look]
+    entries: [gpu.cam, gpu.clusters, gpu.triangles, gpu.vertices, gpu.visible, gpu.look]
       .map((b, i) => ({ binding: i, resource: { buffer: b } })),
   });
 
@@ -357,7 +490,7 @@ export async function createViewer(canvas, source, options = {}) {
     running: true, dirty: true,
   };
 
-  const lookData = new Float32Array(20 + 64 * 4);
+  const lookData = new Float32Array(24 + 64 * 4);
   const writeLook = () => {
     const sun = options.sun ?? [0.4, -0.6, 0.7];
     const l = Math.hypot(...sun);
@@ -367,12 +500,13 @@ export async function createViewer(canvas, source, options = {}) {
     lookData.set([...(options.skyColor ?? [0.32, 0.38, 0.48]), 0], 8);
     lookData.set([...(options.groundColor ?? [0.16, 0.14, 0.12]), 0], 12);
     lookData.set([...(options.fogColor ?? [0.62, 0.7, 0.8]), options.fog ?? 0], 16);
+    lookData.set([...layout.gridOrigin, layout.gridStep], 20);
     const mats = options.materials || [];
     for (let i = 0; i < 64; i++) {
       let m = Array.isArray(mats) ? mats[i] : mats[h.materialNames[i]];
       if (!m && h.materialParams) m = h.materialParams[i];
       if (!m) m = { color: DEFAULT_MATERIALS[i % DEFAULT_MATERIALS.length].slice(0, 3), roughness: DEFAULT_MATERIALS[i % 4][3] };
-      lookData.set([...m.color, m.roughness ?? 0.6], 20 + i * 4);
+      lookData.set([...m.color, m.roughness ?? 0.6], 24 + i * 4);
     }
     device.queue.writeBuffer(gpu.look, 0, lookData);
   };

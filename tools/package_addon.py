@@ -27,6 +27,9 @@ def main():
                     continue
                 full = os.path.join(root, f)
                 z.write(full, os.path.join("vgeo", os.path.relpath(full, SRC)))
+        # the web viewer ships inside the add-on for Export for Web
+        for f in ("vgeo-viewer.js", "meshopt_decoder.mjs"):
+            z.write(os.path.join(REPO, "web", f), os.path.join("vgeo", "web", f))
     print("wrote", out)
 
 

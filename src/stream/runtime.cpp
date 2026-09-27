@@ -5,6 +5,8 @@
 #include "format_v2.h"
 #include "io_util.h"
 
+#include "meshoptimizer.h"
+
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
@@ -339,5 +341,205 @@ extern "C" VGEO_API int vgeo_extract(void* handle, uint32_t chunk, vgeo_chunk_da
     out->corner_verts = a->out_corner.data();
     out->face_materials = a->out_mat.data();
     out->face_lod = a->out_lod.data();
+    return 0;
+}
+
+// ---------------------------------------------------------------- web export
+
+namespace {
+
+struct WebHeader {
+    char magic[8];            // "VGEOW\0\0\0"
+    uint32_t version;         // 1
+    uint32_t header_size;     // 128
+    uint32_t cluster_count;
+    uint32_t group_count;
+    uint32_t vertex_count;    // cluster-local vertices over all clusters
+    uint32_t tri_count;
+    uint32_t material_count;
+    uint32_t lod_levels;
+    uint32_t source_triangles;
+    uint32_t max_cluster_tris;
+    float aabb_min[3];
+    float aabb_max[3];
+    float grid_origin[3];
+    float grid_step;
+    uint32_t off_clusters;    // 12 u32 per cluster
+    uint32_t off_groups;      // 8 u32 per group (same as v2)
+    // vertex stream: 4 u32 per vertex (x, y, z on the 21-bit grid, oct normal snorm16 x 2)
+    // triangle stream: 1 u32 per triangle (i0 | i1 << 8 | i2 << 16 | material << 24)
+    // both meshopt-encoded (meshopt_encodeVertexBuffer, vertex size 16 and 4)
+    uint32_t off_vertices;
+    uint32_t off_triangles;
+    uint32_t off_materials;   // same layout as v2 (names, optional MATP)
+    uint32_t file_size;
+    uint32_t vertex_bytes;    // encoded sizes
+    uint32_t triangle_bytes;
+    uint32_t flags;           // bit 0: streams are meshopt-encoded
+    uint32_t reserved;
+};
+static_assert(sizeof(WebHeader) == 128, "WebHeader layout");
+
+inline uint32_t oct_encode(float x, float y, float z) {
+    float s = std::fabs(x) + std::fabs(y) + std::fabs(z);
+    if (s <= 0.f) return 0;
+    x /= s;
+    y /= s;
+    if (z < 0.f) {
+        float ox = (1.f - std::fabs(y)) * (x >= 0.f ? 1.f : -1.f);
+        float oy = (1.f - std::fabs(x)) * (y >= 0.f ? 1.f : -1.f);
+        x = ox;
+        y = oy;
+    }
+    auto q = [](float v) {
+        long i = std::lround(std::max(-1.f, std::min(1.f, v)) * 32767.f);
+        return uint32_t(uint16_t(int16_t(i)));
+    };
+    return q(x) | (q(y) << 16);
+}
+
+}  // namespace
+
+extern "C" VGEO_API int vgeo_export_web(void* handle, const char* path_utf8, uint64_t* out_bytes,
+                                        char* err, int err_len) {
+    Asset* a = static_cast<Asset*>(handle);
+    if (!a || !path_utf8) { set_err(err, err_len, "no asset or path"); return 1; }
+    const vgeo2::Header& h = a->h;
+    if (a->materials.size() > 256) { set_err(err, err_len, "web format supports at most 256 materials"); return 1; }
+
+    // one global grid: a vertex shared by neighbouring clusters quantizes to the same value in both
+    const float kMax = float((1u << 21) - 1);
+    float extent = 0.f;
+    for (int k = 0; k < 3; ++k) extent = std::max(extent, h.aabb_max[k] - h.aabb_min[k]);
+    const float step = extent > 0.f ? extent / kMax : 1.f;
+
+    std::vector<uint32_t> clusters(size_t(h.cluster_count) * 12, 0);
+    std::vector<uint32_t> verts;
+    std::vector<uint32_t> tris;
+    verts.reserve(size_t(h.index_count) * 4 / 2);
+    tris.reserve(h.index_count / 3);
+    std::vector<int32_t> local(h.vertex_count, -1);
+    std::vector<uint32_t> touched;
+    uint32_t max_tris = 0;
+
+    for (uint32_t i = 0; i < h.cluster_count; ++i) {
+        const vgeo2::Cluster& c = a->clusters[i];
+        if (c.tri_count > 256) { set_err(err, err_len, "cluster larger than 256 triangles"); return 1; }
+        const uint32_t vtx_off = uint32_t(verts.size() / 4);
+        const uint32_t tri_off = uint32_t(tris.size());
+        touched.clear();
+        const uint32_t* idx = a->indices + c.index_offset;
+        for (uint32_t t = 0; t < c.tri_count; ++t) {
+            uint32_t lv[3];
+            for (int j = 0; j < 3; ++j) {
+                uint32_t v = idx[t * 3 + j];
+                if (local[v] < 0) {
+                    local[v] = int32_t(touched.size());
+                    touched.push_back(v);
+                    const float* p = a->positions + size_t(v) * 3;
+                    uint32_t q[3];
+                    for (int k = 0; k < 3; ++k) {
+                        float f = (p[k] - h.aabb_min[k]) / step;
+                        q[k] = uint32_t(std::lround(std::max(0.f, std::min(kMax, f))));
+                    }
+                    const float* n = a->normals + size_t(v) * 3;
+                    verts.push_back(q[0]);
+                    verts.push_back(q[1]);
+                    verts.push_back(q[2]);
+                    verts.push_back(oct_encode(n[0], n[1], n[2]));
+                }
+                lv[j] = uint32_t(local[v]);
+            }
+            if (touched.size() > 256) {
+                for (uint32_t v : touched) local[v] = -1;
+                set_err(err, err_len, "cluster with more than 256 vertices");
+                return 1;
+            }
+            uint32_t mat = a->vmat[idx[t * 3]];
+            tris.push_back(lv[0] | (lv[1] << 8) | (lv[2] << 16) | (std::min(mat, 255u) << 24));
+        }
+        for (uint32_t v : touched) local[v] = -1;
+        uint32_t* o = &clusters[size_t(i) * 12];
+        o[0] = vtx_off;
+        o[1] = tri_off;
+        o[2] = uint32_t(c.group);
+        o[3] = uint32_t(c.refined);
+        o[4] = uint32_t(touched.size()) | (c.tri_count << 16);
+        o[5] = c.depth;
+        std::memcpy(&o[6], c.center, 12);
+        std::memcpy(&o[9], &c.radius, 4);
+        max_tris = std::max(max_tris, c.tri_count);
+    }
+
+    // materials section copied from the v2 file (names + optional MATP), without tail padding
+    const uint8_t* mat_begin = a->blob.data() + h.off_materials;
+    const uint8_t* mat_end = a->blob.data() + std::min<uint64_t>(h.file_size, a->blob.size());
+    std::vector<uint8_t> mat_section(mat_begin, mat_end);
+    while (!mat_section.empty() && mat_section.back() == 0) mat_section.pop_back();
+
+    WebHeader w = {};
+    std::memcpy(w.magic, "VGEOW\0\0\0", 8);
+    w.version = 1;
+    w.header_size = sizeof(WebHeader);
+    w.cluster_count = h.cluster_count;
+    w.group_count = h.group_count;
+    w.vertex_count = uint32_t(verts.size() / 4);
+    w.tri_count = uint32_t(tris.size());
+    w.material_count = uint32_t(a->materials.size());
+    w.lod_levels = h.lod_levels;
+    w.source_triangles = h.source_triangles;
+    w.max_cluster_tris = max_tris;
+    std::memcpy(w.aabb_min, h.aabb_min, 12);
+    std::memcpy(w.aabb_max, h.aabb_max, 12);
+    std::memcpy(w.grid_origin, h.aabb_min, 12);
+    w.grid_step = step;
+
+    // meshopt vertex codec on both streams (byte-wise deltas + entropy coding; decoded in the browser)
+    auto encode = [](const std::vector<uint32_t>& data, size_t stride_bytes) {
+        const size_t count = data.size() * 4 / stride_bytes;
+        std::vector<uint8_t> enc(meshopt_encodeVertexBufferBound(count, stride_bytes));
+        enc.resize(meshopt_encodeVertexBufferLevel(enc.data(), enc.size(), data.data(), count, stride_bytes, 3, 1));
+        return enc;
+    };
+    const std::vector<uint8_t> venc = encode(verts, 16);
+    const std::vector<uint8_t> tenc = encode(tris, 4);
+    w.vertex_bytes = uint32_t(venc.size());
+    w.triangle_bytes = uint32_t(tenc.size());
+    w.flags = 1;
+
+    uint64_t off = sizeof(WebHeader);
+    auto place = [&](uint64_t bytes) { uint64_t o = off; off = vgeo2::align16(off + bytes); return o; };
+    const uint64_t oc = place(clusters.size() * 4);
+    const uint64_t og = place(uint64_t(h.group_count) * 32);
+    const uint64_t ov = place(venc.size());
+    const uint64_t ot = place(tenc.size());
+    const uint64_t om = place(mat_section.size());
+    if (off > 0xFFFFFFF0ull) { set_err(err, err_len, "asset too large for the web format (4 GB)"); return 1; }
+    w.off_clusters = uint32_t(oc);
+    w.off_groups = uint32_t(og);
+    w.off_vertices = uint32_t(ov);
+    w.off_triangles = uint32_t(ot);
+    w.off_materials = uint32_t(om);
+    w.file_size = uint32_t(off);
+
+    std::vector<uint8_t> out(size_t(off), 0);
+    std::memcpy(out.data(), &w, sizeof(w));
+    std::memcpy(out.data() + oc, clusters.data(), clusters.size() * 4);
+    std::memcpy(out.data() + og, a->groups, size_t(h.group_count) * 32);
+    std::memcpy(out.data() + ov, venc.data(), venc.size());
+    std::memcpy(out.data() + ot, tenc.data(), tenc.size());
+    if (!mat_section.empty()) std::memcpy(out.data() + om, mat_section.data(), mat_section.size());
+
+    std::string tmp = std::string(path_utf8) + ".part";
+    FILE* f = vgeo_io::open_utf8(tmp.c_str(), "wb");
+    if (!f) { set_err(err, err_len, "cannot open for writing: " + tmp); return 1; }
+    bool ok = std::fwrite(out.data(), 1, out.size(), f) == out.size();
+    ok = (std::fclose(f) == 0) && ok;
+    if (!ok || !vgeo_io::replace_utf8(tmp.c_str(), path_utf8)) {
+        vgeo_io::remove_utf8(tmp.c_str());
+        set_err(err, err_len, "write failed");
+        return 1;
+    }
+    if (out_bytes) *out_bytes = out.size();
     return 0;
 }

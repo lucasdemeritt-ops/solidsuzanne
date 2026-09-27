@@ -195,6 +195,35 @@ class VGEO_OT_restore(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class VGEO_OT_export_web(bpy.types.Operator):
+    """Write a ready-to-host web folder: compact .vgeow asset, WebGPU viewer and a page"""
+    bl_idname = "vgeo.export_web"
+    bl_label = "Export for Web"
+
+    directory: StringProperty(subtype='DIR_PATH')
+    with_page: BoolProperty(name="Include Viewer Page", default=True,
+                            description="Also write the viewer module, decoder and an index.html")
+
+    @classmethod
+    def poll(cls, context):
+        ob = context.active_object
+        return ob is not None and ob.vgeo.uid
+
+    def invoke(self, context, event):
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+    def execute(self, context):
+        from . import webexport
+        try:
+            out = webexport.export(context.active_object, bpy.path.abspath(self.directory), self.with_page)
+        except (RuntimeError, OSError) as e:
+            self.report({'ERROR'}, f"Web export failed: {e}")
+            return {'CANCELLED'}
+        self.report({'INFO'}, f"Web export: {out['asset']} ({out['bytes'] / 2**20:.1f} MB)")
+        return {'FINISHED'}
+
+
 class VGEO_OT_refresh(bpy.types.Operator):
     """Reopen the .vgeo file and rebuild every chunk"""
     bl_idname = "vgeo.refresh"
@@ -259,9 +288,11 @@ class VGEO_PT_panel(bpy.types.Panel):
         row = layout.row(align=True)
         row.operator(VGEO_OT_refresh.bl_idname, icon='FILE_REFRESH')
         row.operator(VGEO_OT_restore.bl_idname, icon='LOOP_BACK')
+        layout.operator(VGEO_OT_export_web.bl_idname, icon='WORLD')
 
 
-classes = (VGEOObjectSettings, VGEO_OT_virtualize, VGEO_OT_restore, VGEO_OT_refresh, VGEO_PT_panel)
+classes = (VGEOObjectSettings, VGEO_OT_virtualize, VGEO_OT_restore, VGEO_OT_export_web, VGEO_OT_refresh,
+           VGEO_PT_panel)
 
 
 def _menu(self, _context):

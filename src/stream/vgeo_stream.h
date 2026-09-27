@@ -147,6 +147,13 @@ VGEO_API int vgeo_select_level(void* handle, int depth, uint64_t* chunk_sig, vge
 // Extract the currently selected geometry of one chunk.
 VGEO_API int vgeo_extract(void* handle, uint32_t chunk, vgeo_chunk_data* out);
 
+// Write the compact web variant (.vgeow) of an opened asset: self-contained
+// clusters (8-bit local indices, material per triangle), positions on a global
+// 21-bit grid (identical inputs quantize identically, so cuts stay crack-free),
+// octahedral normals. About a third of the v2 size, in the layout the WebGPU
+// viewer reads directly. Returns 0 on success.
+VGEO_API int vgeo_export_web(void* handle, const char* path_utf8, uint64_t* out_bytes, char* err, int err_len);
+
 VGEO_API int vgeo_version(void);
 
 #ifdef __cplusplus

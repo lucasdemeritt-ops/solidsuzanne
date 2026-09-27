@@ -344,6 +344,24 @@ def run():
     check("LOD color render", os.path.exists(scene.render.filepath))
     proxy.vgeo.lod_colors = False
 
+    # export for web: compact asset + viewer + page, never overwriting a page it did not write
+    from vgeo import webexport
+    web_dir = os.path.join(OUT, "web_export")
+    os.makedirs(web_dir, exist_ok=True)
+    with open(os.path.join(web_dir, "index.html"), "w") as f:
+        f.write("<p>hand written</p>")
+    res = webexport.export(proxy, web_dir)
+    check("web export writes asset, viewer, decoder",
+          all(os.path.exists(os.path.join(web_dir, f)) for f in res["files"]) and res["asset"].endswith(".vgeow"),
+          ", ".join(res["files"]))
+    check("web export keeps a foreign index.html",
+          open(os.path.join(web_dir, "index.html")).read() == "<p>hand written</p>"
+          and res["files"][-1].endswith(".html") and res["files"][-1] != "index.html", res["files"][-1])
+    check("web asset smaller than .vgeo", res["bytes"] < os.path.getsize(stream.asset_path(proxy)),
+          f"{res['bytes'] / 2**20:.1f} MB")
+    with open(os.path.join(web_dir, "last_web.txt"), "w") as f:
+        f.write(res["files"][-1])
+
     # save / reload: chunk meshes persist, runtime reopens
     bpy.ops.wm.save_mainfile()
     tris_saved = sum(len(o.data.polygons) for o in stream.fronts(proxy))

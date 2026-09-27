@@ -142,6 +142,8 @@ def lib():
     L.vgeo_select.argtypes = [c.c_void_p, c.POINTER(View), c.c_int, c.c_void_p, c.POINTER(CutStats)]
     L.vgeo_select_level.argtypes = [c.c_void_p, c.c_int, c.c_void_p, c.POINTER(CutStats)]
     L.vgeo_extract.argtypes = [c.c_void_p, c.c_uint32, c.POINTER(ChunkData)]
+    L.vgeo_export_web.argtypes = [c.c_void_p, c.c_char_p, c.POINTER(c.c_uint64), c.c_char_p, c.c_int]
+    L.vgeo_export_web.restype = c.c_int
     _lib = L
     return L
 
@@ -274,6 +276,14 @@ class Asset:
         lib().vgeo_select_level(self._h, int(depth), _ptr(self.sigs), ctypes.byref(stats))
         self.last = stats
         return self.sigs
+
+    def export_web(self, path):
+        """Write the compact web variant (.vgeow); returns its size in bytes."""
+        size = ctypes.c_uint64(0)
+        err = ctypes.create_string_buffer(MAX_ERR)
+        if lib().vgeo_export_web(self._h, path.encode("utf-8"), ctypes.byref(size), err, MAX_ERR) != 0:
+            raise RuntimeError(err.value.decode("utf-8", "replace") or "vgeo_export_web failed")
+        return size.value
 
     def extract(self, chunk):
         """Return numpy copies of one chunk's selected geometry (None if empty)."""
