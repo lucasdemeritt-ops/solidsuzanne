@@ -18,7 +18,12 @@
 namespace {
 
 struct Asset {
-    std::vector<uint8_t> blob;
+    // the file is memory-mapped (read into `owned` only if mapping fails): pages load on first
+    // touch, so opening costs nothing and memory is bounded by what the cuts actually use
+    vgeo_io::MappedFile map;
+    std::vector<uint8_t> owned;
+    const uint8_t* base = nullptr;
+    uint64_t size = 0;
     vgeo2::Header h;
     const float* positions = nullptr;
     const float* normals = nullptr;
@@ -35,10 +40,16 @@ struct Asset {
     std::vector<uint8_t> group_pass;
     std::vector<uint8_t> selected;
 
-    // extraction scratch
-    std::vector<uint32_t> stamp;
-    std::vector<int32_t> local;
-    uint32_t stamp_id = 0;
+    // clusters are validated when first used (0 unchecked, 1 ok, 2 bad), not all at open:
+    // a full scan would read the whole file
+    std::vector<uint8_t> checked;
+    std::vector<uint32_t> vmin, vmax;   // vertex range per checked cluster (for prefetch)
+    bool corrupt = false;
+
+    // extraction scratch: global vertex -> chunk-local index, a hash sized to the chunk
+    // (per-vertex arrays would cost 8 bytes per vertex of the asset, per handle)
+    std::vector<uint32_t> remap_key;
+    std::vector<int32_t> remap_val;
     std::vector<float> out_pos, out_nrm, out_uv;
     std::vector<int32_t> out_corner, out_mat, out_lod;
     std::vector<int32_t> out_edges, out_corner_edge;
@@ -81,7 +92,31 @@ void set_err(char* err, int err_len, const std::string& msg) {
 }
 
 bool section_ok(const Asset& a, uint64_t off, uint64_t bytes) {
-    return off >= sizeof(vgeo2::Header) && off <= a.blob.size() && bytes <= a.blob.size() - off;
+    return off >= sizeof(vgeo2::Header) && off <= a.size && bytes <= a.size - off;
+}
+
+// Check a cluster's indices once; bad clusters are skipped (and the asset marked corrupt).
+bool cluster_ok(Asset& a, uint32_t id) {
+    uint8_t& st = a.checked[id];
+    if (st) return st == 1;
+    const vgeo2::Cluster& c = a.clusters[id];
+    const uint32_t* idx = a.indices + c.index_offset;
+    uint32_t lo = ~0u, hi = 0;
+    bool ok = true;
+    for (uint32_t k = 0; k < c.tri_count * 3; ++k) {
+        uint32_t v = idx[k];
+        if (v >= a.h.vertex_count) { ok = false; break; }
+        lo = std::min(lo, v);
+        hi = std::max(hi, v);
+    }
+    st = ok ? 1 : 2;
+    if (ok) {
+        a.vmin[id] = lo;
+        a.vmax[id] = hi;
+    } else {
+        a.corrupt = true;
+    }
+    return ok;
 }
 
 inline bool in_frustum(const vgeo_view& v, const float* c, float r) {
@@ -154,33 +189,42 @@ void signatures(Asset& a, uint64_t* chunk_sig, vgeo_cut_stats* stats) {
 
 extern "C" VGEO_API void* vgeo_open(const char* path_utf8, char* err, int err_len) {
     if (!path_utf8) { set_err(err, err_len, "no path"); return nullptr; }
-    FILE* f = vgeo_io::open_utf8(path_utf8, "rb");
-    if (!f) { set_err(err, err_len, std::string("cannot open ") + path_utf8); return nullptr; }
     Asset* a = new Asset();
-    std::fseek(f, 0, SEEK_END);
-    int64_t size = vgeo_io::tell(f);
-    vgeo_io::seek(f, 0);
-    if (size < int64_t(sizeof(vgeo2::Header))) {
-        std::fclose(f); delete a;
-        set_err(err, err_len, "file too small");
-        return nullptr;
+    if (a->map.open(path_utf8)) {
+        a->base = a->map.data;
+        a->size = a->map.size;
+    } else {
+        // mapping unavailable (or an empty file): read it whole
+        FILE* f = vgeo_io::open_utf8(path_utf8, "rb");
+        if (!f) { delete a; set_err(err, err_len, std::string("cannot open ") + path_utf8); return nullptr; }
+        std::fseek(f, 0, SEEK_END);
+        int64_t size = vgeo_io::tell(f);
+        vgeo_io::seek(f, 0);
+        if (size < int64_t(sizeof(vgeo2::Header))) {
+            std::fclose(f); delete a;
+            set_err(err, err_len, "file too small");
+            return nullptr;
+        }
+        try {
+            a->owned.resize(size_t(size));
+        } catch (...) {
+            std::fclose(f); delete a;
+            set_err(err, err_len, "out of memory");
+            return nullptr;
+        }
+        size_t got = std::fread(a->owned.data(), 1, size_t(size), f);
+        std::fclose(f);
+        if (got != size_t(size)) { delete a; set_err(err, err_len, "read failed"); return nullptr; }
+        a->base = a->owned.data();
+        a->size = uint64_t(size);
     }
-    try {
-        a->blob.resize(size_t(size));
-    } catch (...) {
-        std::fclose(f); delete a;
-        set_err(err, err_len, "out of memory");
-        return nullptr;
-    }
-    size_t got = std::fread(a->blob.data(), 1, size_t(size), f);
-    std::fclose(f);
-    if (got != size_t(size)) { delete a; set_err(err, err_len, "read failed"); return nullptr; }
+    if (a->size < sizeof(vgeo2::Header)) { delete a; set_err(err, err_len, "file too small"); return nullptr; }
 
-    std::memcpy(&a->h, a->blob.data(), sizeof(vgeo2::Header));
+    std::memcpy(&a->h, a->base, sizeof(vgeo2::Header));
     const vgeo2::Header& h = a->h;
     if (std::memcmp(h.magic, vgeo2::kMagic, 8) != 0) { delete a; set_err(err, err_len, "not a VGEO v2 file"); return nullptr; }
     if (h.version != vgeo2::kVersion) { delete a; set_err(err, err_len, "unsupported VGEO version"); return nullptr; }
-    bool ok = h.file_size <= a->blob.size()
+    bool ok = h.file_size <= a->size
         && section_ok(*a, h.off_positions, uint64_t(h.vertex_count) * 12)
         && section_ok(*a, h.off_normals, uint64_t(h.vertex_count) * 12)
         && (!(h.flags & vgeo2::kHasUVs) || section_ok(*a, h.off_uvs, uint64_t(h.vertex_count) * 8))
@@ -193,7 +237,7 @@ extern "C" VGEO_API void* vgeo_open(const char* path_utf8, char* err, int err_le
         && section_ok(*a, h.off_materials, 4);
     if (!ok) { delete a; set_err(err, err_len, "corrupt file (section out of range)"); return nullptr; }
 
-    const uint8_t* b = a->blob.data();
+    const uint8_t* b = a->base;
     a->positions = reinterpret_cast<const float*>(b + h.off_positions);
     a->normals = reinterpret_cast<const float*>(b + h.off_normals);
     a->uvs = (h.flags & vgeo2::kHasUVs) ? reinterpret_cast<const float*>(b + h.off_uvs) : nullptr;
@@ -212,7 +256,8 @@ extern "C" VGEO_API void* vgeo_open(const char* path_utf8, char* err, int err_le
             && c.refined >= -1 && c.refined < int32_t(h.group_count)
             && c.chunk < h.chunk_count;
     }
-    for (uint32_t i = 0; i < h.index_count && ok; ++i) ok = a->indices[i] < h.vertex_count;
+    // indices are checked per cluster on first use (cluster_ok): scanning them all here would
+    // read the whole file
     for (uint32_t i = 0; i < h.chunk_count && ok; ++i)
         ok = uint64_t(a->chunks[i].cluster_offset) + a->chunks[i].cluster_count <= h.chunk_cluster_count;
     for (uint32_t i = 0; i < h.chunk_cluster_count && ok; ++i) ok = a->chunk_clusters[i] < h.cluster_count;
@@ -220,7 +265,7 @@ extern "C" VGEO_API void* vgeo_open(const char* path_utf8, char* err, int err_le
 
     {
         const uint8_t* p = b + h.off_materials;
-        const uint8_t* end = b + a->blob.size();
+        const uint8_t* end = b + a->size;
         uint32_t n;
         std::memcpy(&n, p, 4);
         p += 4;
@@ -237,8 +282,9 @@ extern "C" VGEO_API void* vgeo_open(const char* path_utf8, char* err, int err_le
 
     a->group_pass.assign(h.group_count, 0);
     a->selected.assign(h.cluster_count, 0);
-    a->stamp.assign(h.vertex_count, 0);
-    a->local.assign(h.vertex_count, 0);
+    a->checked.assign(h.cluster_count, 0);
+    a->vmin.assign(h.cluster_count, 0);
+    a->vmax.assign(h.cluster_count, 0);
     return a;
 }
 
@@ -318,30 +364,39 @@ extern "C" VGEO_API int vgeo_extract(void* handle, uint32_t chunk, vgeo_chunk_da
     if (!a || !out || chunk >= a->h.chunk_count) return 1;
     const vgeo2::Chunk& ch = a->chunks[chunk];
 
-    if (++a->stamp_id == 0) {  // wrapped: reset stamps
-        std::fill(a->stamp.begin(), a->stamp.end(), 0);
-        a->stamp_id = 1;
-    }
     a->out_pos.clear(); a->out_nrm.clear(); a->out_uv.clear();
     a->out_corner.clear(); a->out_mat.clear(); a->out_lod.clear();
+
+    uint64_t corners = 0;
+    for (uint32_t k = 0; k < ch.cluster_count; ++k) {
+        uint32_t id = a->chunk_clusters[ch.cluster_offset + k];
+        if (a->selected[id] && cluster_ok(*a, id)) corners += uint64_t(a->clusters[id].tri_count) * 3;
+    }
+    size_t cap = 64;
+    while (cap < corners * 2) cap <<= 1;   // load factor < 50% even if every corner is unique
+    a->remap_key.assign(cap, ~0u);
+    a->remap_val.resize(cap);
+    const size_t mask = cap - 1;
 
     int32_t next = 0;
     for (uint32_t k = 0; k < ch.cluster_count; ++k) {
         uint32_t id = a->chunk_clusters[ch.cluster_offset + k];
-        if (!a->selected[id]) continue;
+        if (!a->selected[id] || a->checked[id] != 1) continue;
         const vgeo2::Cluster& c = a->clusters[id];
         const uint32_t* idx = a->indices + c.index_offset;
         for (uint32_t t = 0; t < c.tri_count; ++t) {
             for (int j = 0; j < 3; ++j) {
                 uint32_t v = idx[t * 3 + j];
-                if (a->stamp[v] != a->stamp_id) {
-                    a->stamp[v] = a->stamp_id;
-                    a->local[v] = next++;
-                    a->out_pos.insert(a->out_pos.end(), a->positions + v * 3, a->positions + v * 3 + 3);
-                    a->out_nrm.insert(a->out_nrm.end(), a->normals + v * 3, a->normals + v * 3 + 3);
-                    if (a->uvs) a->out_uv.insert(a->out_uv.end(), a->uvs + v * 2, a->uvs + v * 2 + 2);
+                size_t slot = size_t((uint64_t(v) * 0x9E3779B97F4A7C15ull) >> 32) & mask;
+                while (a->remap_key[slot] != ~0u && a->remap_key[slot] != v) slot = (slot + 1) & mask;
+                if (a->remap_key[slot] == ~0u) {
+                    a->remap_key[slot] = v;
+                    a->remap_val[slot] = next++;
+                    a->out_pos.insert(a->out_pos.end(), a->positions + size_t(v) * 3, a->positions + size_t(v) * 3 + 3);
+                    a->out_nrm.insert(a->out_nrm.end(), a->normals + size_t(v) * 3, a->normals + size_t(v) * 3 + 3);
+                    if (a->uvs) a->out_uv.insert(a->out_uv.end(), a->uvs + size_t(v) * 2, a->uvs + size_t(v) * 2 + 2);
                 }
-                a->out_corner.push_back(a->local[v]);
+                a->out_corner.push_back(a->remap_val[slot]);
             }
             a->out_mat.push_back(int32_t(a->vmat[idx[t * 3]]));
             a->out_lod.push_back(int32_t(c.depth));
@@ -360,6 +415,65 @@ extern "C" VGEO_API int vgeo_extract(void* handle, uint32_t chunk, vgeo_chunk_da
     out->face_materials = a->out_mat.data();
     out->face_lod = a->out_lod.data();
     return 0;
+}
+
+extern "C" VGEO_API int vgeo_prefetch(void* handle, const uint32_t* chunks, int count) {
+    Asset* a = static_cast<Asset*>(handle);
+    if (!a || (!chunks && count > 0)) return 1;
+    if (a->owned.size() || count <= 0) return 0;   // nothing to fetch when the file is in memory
+    // byte ranges of the selected clusters' indices, plus their vertex data once known
+    std::vector<uint64_t> r;
+    auto add = [&](uint64_t off, uint64_t bytes) {
+        if (bytes == 0 || off >= a->size) return;
+        bytes = std::min(bytes, a->size - off);
+        if (!r.empty() && r[r.size() - 2] + r.back() + 4096 >= off && r[r.size() - 2] <= off) {
+            uint64_t end = std::max(r[r.size() - 2] + r.back(), off + bytes);
+            r.back() = end - r[r.size() - 2];
+        } else {
+            r.push_back(off);
+            r.push_back(bytes);
+        }
+    };
+    const vgeo2::Header& h = a->h;
+    for (int i = 0; i < count; ++i) {
+        if (chunks[i] >= h.chunk_count) continue;
+        const vgeo2::Chunk& ch = a->chunks[chunks[i]];
+        for (uint32_t k = 0; k < ch.cluster_count; ++k) {
+            uint32_t id = a->chunk_clusters[ch.cluster_offset + k];
+            if (!a->selected[id]) continue;
+            const vgeo2::Cluster& c = a->clusters[id];
+            add(h.off_indices + uint64_t(c.index_offset) * 4, uint64_t(c.tri_count) * 12);
+            if (a->checked[id] == 1) {
+                uint64_t v0 = a->vmin[id], n = uint64_t(a->vmax[id]) - v0 + 1;
+                add(h.off_positions + v0 * 12, n * 12);
+                add(h.off_normals + v0 * 12, n * 12);
+                if (a->uvs) add(h.off_uvs + v0 * 8, n * 8);
+                add(h.off_vmat + v0 * 2, n * 2);
+            }
+        }
+    }
+    a->map.prefetch(r.data(), r.size() / 2);
+    return 0;
+}
+
+extern "C" VGEO_API int vgeo_memory(void* handle, uint64_t* mapped_bytes, uint64_t* heap_bytes) {
+    Asset* a = static_cast<Asset*>(handle);
+    if (!a) return 1;
+    uint64_t heap = a->owned.capacity() + a->group_pass.capacity() + a->selected.capacity()
+        + a->checked.capacity() + (a->vmin.capacity() + a->vmax.capacity()) * 4
+        + (a->remap_key.capacity() + a->remap_val.capacity()) * 4
+        + (a->out_pos.capacity() + a->out_nrm.capacity() + a->out_uv.capacity()) * 4
+        + (a->out_corner.capacity() + a->out_mat.capacity() + a->out_lod.capacity()) * 4
+        + (a->out_edges.capacity() + a->out_corner_edge.capacity() + a->edge_ids.capacity()) * 4
+        + a->edge_keys.capacity() * 8;
+    if (mapped_bytes) *mapped_bytes = a->owned.size() ? 0 : a->size;
+    if (heap_bytes) *heap_bytes = heap;
+    return 0;
+}
+
+extern "C" VGEO_API int vgeo_corrupt(void* handle) {
+    Asset* a = static_cast<Asset*>(handle);
+    return a && a->corrupt ? 1 : 0;
 }
 
 // ---------------------------------------------------------------- web export
@@ -443,6 +557,7 @@ extern "C" VGEO_API int vgeo_export_web(void* handle, const char* path_utf8, uin
     for (uint32_t i = 0; i < h.cluster_count; ++i) {
         const vgeo2::Cluster& c = a->clusters[i];
         if (c.tri_count > 256) { set_err(err, err_len, "cluster larger than 256 triangles"); return 1; }
+        if (!cluster_ok(*a, i)) { set_err(err, err_len, "corrupt file (bad index)"); return 1; }
         const uint32_t vtx_off = uint32_t(verts.size() / 4);
         const uint32_t tri_off = uint32_t(tris.size());
         touched.clear();
@@ -490,8 +605,8 @@ extern "C" VGEO_API int vgeo_export_web(void* handle, const char* path_utf8, uin
     }
 
     // materials section copied from the v2 file (names + optional MATP), without tail padding
-    const uint8_t* mat_begin = a->blob.data() + h.off_materials;
-    const uint8_t* mat_end = a->blob.data() + std::min<uint64_t>(h.file_size, a->blob.size());
+    const uint8_t* mat_begin = a->base + h.off_materials;
+    const uint8_t* mat_end = a->base + std::min<uint64_t>(h.file_size, a->size);
     std::vector<uint8_t> mat_section(mat_begin, mat_end);
     while (!mat_section.empty() && mat_section.back() == 0) mat_section.pop_back();
 

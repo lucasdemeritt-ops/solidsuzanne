@@ -111,6 +111,35 @@ Terrain demo: 33.5M triangles from Geometry Nodes (`examples/terrain_demo.py`).
 | Cycles, same frame from the VGEO cut (9.8M triangles, 0.5 px) | 49-51 s |
 | Difference between the two images | mean 0.02/255, 99th percentile 1/255 |
 
+## Memory: the file is mapped, not read
+
+`vgeo_open` memory-maps the .vgeo instead of reading it. Opening reads the
+header and the cluster, group and chunk tables; geometry pages load when a
+cut first touches them, and the OS evicts them under memory pressure, so an
+asset larger than RAM can be opened and streamed, and every handle on the
+same file (the proxy, instancer level builds, web export, per-placement
+cuts) shares one copy of the pages. Indices are validated per cluster on
+first use instead of by a scan at open (a bad cluster is skipped and
+`vgeo_corrupt` reports it). The per-handle scratch that mapped global vertex
+indices to chunk-local ones (8 bytes per vertex of the asset) is now a hash
+sized to the chunk. Before extracting, the add-on calls `vgeo_prefetch` for
+the changed chunks, which asks the OS to start reading their index and
+vertex ranges in the background.
+
+Terrain asset (1.2 GB, 33.5M triangles), two handles, plain Python
+(`tests/mapped_bench.py`):
+
+| | Read whole file (before) | Mapped |
+|---|---|---|
+| Open, per handle | 760-900 ms | 10-12 ms |
+| Process private memory after opening two handles | +2.7 GB | +15 MB |
+| Extract a close-up cut (6.4M tris), warm cache | 1.15 s | 0.98 s |
+| Extract full detail (33.5M tris), warm cache | 4.9 s | 3.3 s |
+| Same, first run after boot-level cold cache | | 1.5 s / 6.1 s |
+
+On Windows the file stays open (shared for reading and deleting) while a
+handle is open; Reload or Restore closes it.
+
 ## Instancing (full scenes)
 
 `Scatter Instances` (active VGEO object + another selected mesh) creates an
@@ -182,6 +211,5 @@ cut selection if needed.
   streamed cut of its own (very large assets filling the view) is next.
 - Building without a full Blender mesh in memory (import straight from
   disk, or tiled builds), for sources beyond what Blender can hold.
-- Streaming clusters from disk (the file is read whole today).
 - Rare back-to-back "fins" left by simplification (about 3 per 100k
   triangles at coarse levels) are harmless but could be filtered.

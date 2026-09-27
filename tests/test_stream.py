@@ -495,6 +495,32 @@ def run():
     except RuntimeError as e:
         check("corrupt file rejected", True, str(e))
 
+    # the file is memory-mapped: a handle allocates little of its own, however big the asset
+    good = open(os.path.join(OUT, "last_asset.txt")).read()
+    a = native.Asset(good)
+    mapped, heap = a.memory()
+    check("asset is memory-mapped", mapped == os.path.getsize(good) and heap < mapped * 0.25,
+          f"mapped {mapped / 2**20:.1f} MB, own {heap / 2**20:.2f} MB")
+    a.select_level(0)
+    a.prefetch(np.arange(a.chunk_count))
+    full = sum(d["tri_count"] for d in (a.extract(c) for c in range(a.chunk_count)) if d)
+    check("prefetch + extract after mapping", full == a.info["source_triangles"] and not a.corrupt, f"{full:,}")
+    a.close()
+    # indices are validated per cluster on first use (a full scan would read the whole file):
+    # a bad cluster is skipped and reported, the rest still extracts
+    import struct
+    blob = bytearray(open(good, "rb").read())
+    off_indices = struct.unpack_from("<Q", blob, 80 + 4 * 8)[0]   # Header.off_indices
+    struct.pack_into("<3I", blob, off_indices, 0xFFFFFFF0, 0xFFFFFFF1, 0xFFFFFFF2)
+    bad_idx = os.path.join(OUT, "bad_index.vgeo")
+    with open(bad_idx, "wb") as f:
+        f.write(blob)
+    a = native.Asset(bad_idx)
+    a.select_level(0)
+    got = sum(d["tri_count"] for d in (a.extract(c) for c in range(a.chunk_count)) if d)
+    check("bad cluster skipped and reported", a.corrupt and 0 < got < full, f"{got:,} of {full:,}")
+    a.close()
+
     # indexed build path: smooth, no UVs, material border split automatically
     from vgeo import build as vbuild
     rock2 = dense_rock(7)

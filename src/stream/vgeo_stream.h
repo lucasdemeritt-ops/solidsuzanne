@@ -21,7 +21,7 @@
 extern "C" {
 #endif
 
-#define VGEO_STREAM_VERSION 1
+#define VGEO_STREAM_VERSION 2
 
 // ---------------------------------------------------------------- build
 
@@ -152,6 +152,19 @@ VGEO_API int vgeo_level_errors(void* handle, float* out, int max_levels);
 
 // Extract the currently selected geometry of one chunk.
 VGEO_API int vgeo_extract(void* handle, uint32_t chunk, vgeo_chunk_data* out);
+
+// Files are memory-mapped: opening reads only the header and cluster tables, and
+// geometry pages load when a cut first touches them (the OS evicts them under
+// memory pressure, so assets larger than RAM work). Ask the OS to start reading
+// what these chunks' current selection needs, before extracting them. A hint:
+// returns immediately.
+VGEO_API int vgeo_prefetch(void* handle, const uint32_t* chunks, int count);
+
+// Bytes mapped from the file, and bytes this handle allocated itself.
+VGEO_API int vgeo_memory(void* handle, uint64_t* mapped_bytes, uint64_t* heap_bytes);
+
+// 1 if a cluster with out-of-range indices was found (and skipped) so far.
+VGEO_API int vgeo_corrupt(void* handle);
 
 // Write the compact web variant (.vgeow) of an opened asset: self-contained
 // clusters (8-bit local indices, material per triangle), positions on a global

@@ -146,6 +146,13 @@ def lib():
     L.vgeo_export_web.restype = c.c_int
     L.vgeo_level_errors.argtypes = [c.c_void_p, c.c_void_p, c.c_int]
     L.vgeo_level_errors.restype = c.c_int
+    if hasattr(L, "vgeo_prefetch"):  # library version 2+
+        L.vgeo_prefetch.argtypes = [c.c_void_p, c.c_void_p, c.c_int]
+        L.vgeo_prefetch.restype = c.c_int
+        L.vgeo_memory.argtypes = [c.c_void_p, c.POINTER(c.c_uint64), c.POINTER(c.c_uint64)]
+        L.vgeo_memory.restype = c.c_int
+        L.vgeo_corrupt.argtypes = [c.c_void_p]
+        L.vgeo_corrupt.restype = c.c_int
     _lib = L
     return L
 
@@ -272,6 +279,29 @@ class Asset:
             raise RuntimeError("vgeo_select failed")
         self.last = stats
         return self.sigs
+
+    def prefetch(self, chunks):
+        """Ask the OS to start reading what these chunks' current selection needs (a hint)."""
+        L = lib()
+        if not hasattr(L, "vgeo_prefetch") or len(chunks) == 0:
+            return
+        arr = np.ascontiguousarray(chunks, dtype=np.uint32)
+        L.vgeo_prefetch(self._h, _ptr(arr), len(arr))
+
+    def memory(self):
+        """(bytes mapped from the file, bytes the handle allocated itself)."""
+        L = lib()
+        if not hasattr(L, "vgeo_memory"):
+            return (0, os.path.getsize(self.path))
+        mapped, heap = ctypes.c_uint64(0), ctypes.c_uint64(0)
+        L.vgeo_memory(self._h, ctypes.byref(mapped), ctypes.byref(heap))
+        return (mapped.value, heap.value)
+
+    @property
+    def corrupt(self):
+        """True once a cluster with bad indices was found (it is skipped)."""
+        L = lib()
+        return bool(hasattr(L, "vgeo_corrupt") and L.vgeo_corrupt(self._h))
 
     def select_level(self, depth):
         stats = CutStats()

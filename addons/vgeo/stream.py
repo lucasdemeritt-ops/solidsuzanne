@@ -648,6 +648,7 @@ def stream_step(obj, views, pixel_error, mode="COARSEN", offscreen_scale=8.0, bu
             return False
         rt.target = sigs.copy()
         rt.todo = [int(c) for c in changed[::-1]]  # pop() takes them in order
+        rt.asset.prefetch(changed)  # the file is mapped: start reading pages the build will touch
         rt.build_s = 0.0
         rt.strategy = strategy
         if strategy == 'BATCH' and len(rt.spare) < rt.asset.chunk_count:
@@ -761,6 +762,7 @@ def apply_cut(obj, views, pixel_error, mode="FULL", offscreen_scale=8.0, force=F
         rt.valid[:] = False
         rt.lod_colors = lod_colors
     changed = np.nonzero(~rt.valid | (sigs != rt.applied))[0]
+    rt.asset.prefetch(changed)
     materials = tuple(obj.data.materials)
     chunks = chunk_objects(obj, rt)
     for c in changed:  # fronts are rewritten in place: atomic within this call
