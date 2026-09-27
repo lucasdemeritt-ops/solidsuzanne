@@ -99,6 +99,57 @@ def build_web_asset(obj, path, depsgraph=None, max_triangles=128):
             shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+FALLBACK_OBJECT = "vgeo_fallback_temp"
+
+
+def build_fallback_object(obj, max_triangles=150_000, depsgraph=None):
+    """A temporary mesh object with the finest uniform level under `max_triangles`, placed like
+    `obj` and with its materials: a light stand-in for glTF export (e.g. no-WebGPU fallbacks).
+    Remove it with remove_fallback_object."""
+    import tempfile
+    from . import build
+    tmpdir = None
+    if obj.vgeo.uid and obj.vgeo.path:
+        asset = native.Asset(stream.asset_path(obj))
+        materials = tuple(obj.data.materials)
+    else:
+        tmpdir = tempfile.mkdtemp(prefix="vgeo_fb_")
+        src = os.path.join(tmpdir, "asset.vgeo")
+        arrays = build.mesh_arrays(obj, depsgraph or bpy.context.evaluated_depsgraph_get())
+        mats = arrays["material_list"]
+        native.build(src, arrays["positions"], arrays["normals"], arrays["uvs"], arrays["materials"],
+                     [m.name if m else "" for m in mats], indices=arrays["indices"],
+                     material_params=build.material_params(mats))
+        asset = native.Asset(src)
+        materials = tuple(mats)
+    try:
+        chosen = None
+        for depth in range(asset.info["lod_levels"]):
+            asset.select_level(depth)
+            if asset.last.triangles <= max_triangles:
+                chosen = depth
+                break
+        data = asset.level_mesh_data(chosen if chosen is not None else -1)
+        me = bpy.data.meshes.new(FALLBACK_OBJECT)
+        stream._sync_materials(me, materials)
+        stream.fill_mesh(me, data, materials, False)
+        temp = bpy.data.objects.new(FALLBACK_OBJECT, me)
+        bpy.context.scene.collection.objects.link(temp)
+        temp.matrix_world = obj.matrix_world.copy()
+        return temp
+    finally:
+        asset.close()
+        if tmpdir:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def remove_fallback_object(temp):
+    me = temp.data
+    bpy.data.objects.remove(temp)
+    if me is not None and me.users == 0:
+        bpy.data.meshes.remove(me)
+
+
 def export(obj, directory, with_page=True):
     if not directory:
         raise RuntimeError("no output folder")
