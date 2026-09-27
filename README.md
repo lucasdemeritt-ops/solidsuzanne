@@ -10,6 +10,20 @@
 
 ---
 
+## New: native streaming (EEVEE + Cycles)
+
+`addons/vgeo` + `src/stream` virtualize the geometry instead of replacing
+Blender's renderer: a Nanite-style cluster DAG (built with meshoptimizer's
+clusterlod) stays on disk, and only the view-dependent, crack-free cut is
+streamed into ordinary meshes, so EEVEE and Cycles render it with full
+materials, lights and shadows. A 33.5M-triangle terrain streams at ~28 fps
+while moving and renders in Cycles from a cut of a few million triangles.
+See [docs/NATIVE_STREAMING.md](docs/NATIVE_STREAMING.md).
+
+The sections below describe the original Vulkan proof of concept.
+
+---
+
 ## What it does
 
 VGEO converts meshes into a compact meshlet format and renders them live inside Blender's viewport using a headless Vulkan renderer. The current proof-of-concept renders full meshlet color debug visualization — each cluster gets a unique color, matching the kind of view Unreal's Nanite debug mode shows.

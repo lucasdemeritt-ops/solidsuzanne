@@ -95,7 +95,8 @@ class VGEO_OT_virtualize(bpy.types.Operator):
         self._src_name = src.name
         self._uid = stream.new_uid()
         self._full, self._setting = build.default_path(src, self._uid)
-        names = [s.material.name if s.material else "" for s in src.material_slots]
+        self._materials = [m.name if m else None for m in arrays["material_list"]]
+        names = [n or "" for n in self._materials]
         return build.Job(arrays, self._full, names, self.max_triangles, self.target_chunks)
 
     def _finish(self, context, job):
@@ -110,7 +111,8 @@ class VGEO_OT_virtualize(bpy.types.Operator):
             self.report({'ERROR'}, "Source object disappeared during the build")
             return {'CANCELLED'}
         s = job.result
-        build.create_proxy(context, src, self._setting, self._uid, s, self.remove_source)
+        materials = [bpy.data.materials.get(n) if n else None for n in self._materials]
+        build.create_proxy(context, src, self._setting, self._uid, s, self.remove_source, materials)
         self.report({'INFO'}, f"VGEO: {s['source_triangles']:,} triangles -> {s['clusters']:,} clusters, "
                               f"{s['lod_levels']} levels in {s['seconds']:.1f}s")
         return {'FINISHED'}

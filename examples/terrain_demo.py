@@ -42,7 +42,7 @@ def log(msg):
     print(f"[demo {time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
-def terrain_nodes():
+def terrain_nodes(material):
     ng = bpy.data.node_groups.new("Mountains", "GeometryNodeTree")
     ng.interface.new_socket("Geometry", in_out="OUTPUT", socket_type="NodeSocketGeometry")
     n, L = ng.nodes, ng.links
@@ -128,9 +128,18 @@ def terrain_nodes():
     L.new(grid.outputs["UV Map"], store.inputs["Value"])
     smooth = n.new("GeometryNodeSetShadeSmooth")
     L.new(store.outputs[0], smooth.inputs["Geometry"])
+    # generated meshes carry their own materials: without this the raw terrain renders unshaded
+    setm = n.new("GeometryNodeSetMaterial")
+    setm.inputs["Material"].default_value = material
+    L.new(smooth.outputs[0], setm.inputs["Geometry"])
     out = n.new("NodeGroupOutput")
-    L.new(smooth.outputs[0], out.inputs[0])
+    L.new(setm.outputs[0], out.inputs[0])
     return ng
+
+
+def sock(sockets, name):
+    """The enabled socket with this name (Mix nodes have float/vector/color sockets of the same name)."""
+    return next(s for s in sockets if s.name == name and s.enabled)
 
 
 def terrain_material():
@@ -171,19 +180,24 @@ def terrain_material():
     L.new(sepn.outputs["Z"], slope.inputs[1])
     slope_n = n.new("ShaderNodeMath")
     slope_n.operation = 'MULTIPLY_ADD'
+    # centred noise: (fac - 0.5) * 0.16 + slope
+    slope_c = n.new("ShaderNodeMath")
+    slope_c.operation = 'SUBTRACT'
+    slope_c.inputs[1].default_value = 0.08
+    L.new(slope.outputs[0], slope_c.inputs[0])
     L.new(brk.outputs["Fac"], slope_n.inputs[0])
-    slope_n.inputs[1].default_value = 0.18
-    L.new(slope.outputs[0], slope_n.inputs[2])
+    slope_n.inputs[1].default_value = 0.16
+    L.new(slope_c.outputs[0], slope_n.inputs[2])
 
     ground = ramp(brk.outputs["Fac"], [(0.3, (0.035, 0.06, 0.02, 1)), (0.5, (0.09, 0.10, 0.035, 1)),
                                        (0.72, (0.17, 0.14, 0.08, 1))], "grass")
     rock = ramp(brk.outputs["Fac"], [(0.3, (0.16, 0.15, 0.14, 1)), (0.7, (0.36, 0.33, 0.30, 1))], "rock")
-    rockmix = ramp(slope_n.outputs[0], [(0.12, (0, 0, 0, 1)), (0.2, (1, 1, 1, 1))], "slope mask")
+    rockmix = ramp(slope_n.outputs[0], [(0.2, (0, 0, 0, 1)), (0.3, (1, 1, 1, 1))], "slope mask")
     mix1 = n.new("ShaderNodeMix")
     mix1.data_type = 'RGBA'
-    L.new(rockmix.outputs["Color"], mix1.inputs["Factor"])
-    L.new(ground.outputs["Color"], mix1.inputs["A"])
-    L.new(rock.outputs["Color"], mix1.inputs["B"])
+    L.new(rockmix.outputs["Color"], sock(mix1.inputs, "Factor"))
+    L.new(ground.outputs["Color"], sock(mix1.inputs, "A"))
+    L.new(rock.outputs["Color"], sock(mix1.inputs, "B"))
 
     # snow: high and not too steep
     hn = n.new("ShaderNodeMath")
@@ -196,8 +210,8 @@ def terrain_material():
     snow_h.inputs["From Max"].default_value = PEAK * 0.70
     L.new(hn.outputs[0], snow_h.inputs["Value"])
     snow_s = n.new("ShaderNodeMapRange")
-    snow_s.inputs["From Min"].default_value = 0.42
-    snow_s.inputs["From Max"].default_value = 0.30
+    snow_s.inputs["From Min"].default_value = 0.62
+    snow_s.inputs["From Max"].default_value = 0.42
     L.new(slope_n.outputs[0], snow_s.inputs["Value"])
     snow = n.new("ShaderNodeMath")
     snow.operation = 'MULTIPLY'
@@ -205,14 +219,16 @@ def terrain_material():
     L.new(snow_s.outputs["Result"], snow.inputs[1])
     mix2 = n.new("ShaderNodeMix")
     mix2.data_type = 'RGBA'
-    L.new(snow.outputs[0], mix2.inputs["Factor"])
-    L.new(mix1.outputs["Result"], mix2.inputs["A"])
-    mix2.inputs["B"].default_value = (0.85, 0.87, 0.9, 1)
-    L.new(mix2.outputs["Result"], bsdf.inputs["Base Color"])
+    L.new(snow.outputs[0], sock(mix2.inputs, "Factor"))
+    L.new(sock(mix1.outputs, "Result"), sock(mix2.inputs, "A"))
+    sock(mix2.inputs, "B").default_value = (0.85, 0.87, 0.9, 1)
+    L.new(sock(mix2.outputs, "Result"), bsdf.inputs["Base Color"])
 
     rough = n.new("ShaderNodeMapRange")
-    rough.inputs["To Min"].default_value = 0.85
-    rough.inputs["To Max"].default_value = 0.45
+    rough.inputs["To Min"].default_value = 0.97
+    rough.inputs["To Max"].default_value = 0.55
+    # soil, grass and rock barely reflect: without this, grazing views mirror the sky (pale blue ground)
+    bsdf.inputs["Specular IOR Level"].default_value = 0.12
     L.new(snow.outputs[0], rough.inputs["Value"])
     L.new(rough.outputs["Result"], bsdf.inputs["Roughness"])
 
@@ -332,12 +348,16 @@ def render(scene, engine, name, samples=64):
     t0 = time.perf_counter()
     bpy.ops.render.render(write_still=True)
     dt = time.perf_counter() - t0
-    log(f"render {name}: {dt:.1f}s  {_stats.get('last', '')}")
+    log(f"render {name}: {dt:.1f}s  peak memory {_stats.get('peak', '?')}")
     return dt
 
 
 def _on_stats(stats):
-    _stats["last"] = stats.split("|")[-3:] if "|" in stats else stats
+    import re
+    m = re.search(r"Peak:\s*([\d.]+\s*\w+)", stats) or re.search(r"Mem:\s*([\d.]+\s*\w+)", stats)
+    if m:
+        _stats["peak"] = m.group(1)
+    _stats["last"] = stats
 
 
 def main():
@@ -356,8 +376,9 @@ def main():
     obj = bpy.data.objects.new("Mountains", me)
     scene.collection.objects.link(obj)
     mod = obj.modifiers.new("Mountains", 'NODES')
-    mod.node_group = terrain_nodes()
-    me.materials.append(terrain_material())
+    mat = terrain_material()
+    mod.node_group = terrain_nodes(mat)
+    me.materials.append(mat)
     setup_world(scene)
     t0 = time.perf_counter()
     bpy.context.view_layer.update()
@@ -401,7 +422,7 @@ def main():
     proxy.vgeo.lod_colors = False
     render(scene, "BLENDER_EEVEE", f"eevee_{RES}.png")
     if not PREVIEW:
-        render(scene, "CYCLES", f"cycles_{RES}.png", samples=128)
+        render(scene, "CYCLES", f"cycles_{RES}.png", samples=64)
     bpy.ops.wm.save_mainfile()
     vgeo.unregister()
 

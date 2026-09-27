@@ -44,7 +44,8 @@ def mesh_arrays(obj, depsgraph):
             uv = uv.reshape(-1, 2)
         pm = np.empty(len(me.polygons), np.int32)
         me.polygons.foreach_get("material_index", pm)
-        slots = max(1, len(obj.material_slots))
+        mat_list = evaluated_materials(obj, ev, me)
+        slots = max(1, len(mat_list))
         materials = np.clip(pm[tp], 0, slots - 1).astype(np.uint16)
 
         # per-vertex attributes taken from any corner of each vertex
@@ -57,11 +58,31 @@ def mesh_arrays(obj, depsgraph):
         seamless = uv is None or np.allclose(uv, uv[first][cv], atol=1e-6)
         if smooth and seamless:
             return {"positions": co, "normals": vn, "uvs": None if uv is None else uv[first],
-                    "materials": materials, "indices": cv[tl].astype(np.uint32)}
+                    "materials": materials, "indices": cv[tl].astype(np.uint32), "material_list": mat_list}
         return {"positions": co[cv[tl]], "normals": cn[tl], "uvs": None if uv is None else uv[tl],
-                "materials": materials, "indices": None}
+                "materials": materials, "indices": None, "material_list": mat_list}
     finally:
         ev.to_mesh_clear()
+
+
+def evaluated_materials(obj, ev, me):
+    """The materials Blender actually renders the evaluated mesh with.
+
+    Geometry Nodes can replace the mesh and its materials (Set Material), so
+    the original object's slots are not authoritative. Object-linked slots
+    still override the mesh, as in Blender.
+    """
+    mesh_mats = list(me.materials)
+    out = []
+    for i in range(max(len(mesh_mats), len(ev.material_slots))):
+        slot = ev.material_slots[i] if i < len(ev.material_slots) else None
+        if slot is not None and slot.link == 'OBJECT' and slot.material is not None:
+            out.append(slot.material)
+        elif i < len(mesh_mats):
+            out.append(mesh_mats[i])
+        else:
+            out.append(slot.material if slot is not None else None)
+    return out
 
 
 def default_path(obj, uid):
@@ -113,11 +134,11 @@ class Job:
         return {0: 0.05 * self.fraction, 1: 0.05 + 0.9 * self.fraction, 2: 0.95 + 0.05 * self.fraction}.get(self.stage, 0.0)
 
 
-def create_proxy(context, src, path_setting, uid, build_stats, remove_source=False):
+def create_proxy(context, src, path_setting, uid, build_stats, remove_source=False, materials=None):
     """Replace src with a streaming proxy that has the same transform, parent, collections and materials."""
     me = bpy.data.meshes.new(f"{src.data.name} VGEO")
-    for slot in src.material_slots:
-        me.materials.append(slot.material)
+    for m in (materials if materials is not None else [s.material for s in src.material_slots]):
+        me.materials.append(m)
     proxy = bpy.data.objects.new(f"{src.name} VGEO", me)
     for col in src.users_collection:
         col.objects.link(proxy)

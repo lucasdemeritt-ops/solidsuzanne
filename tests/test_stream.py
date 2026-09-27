@@ -383,6 +383,40 @@ def run():
     bpy.context.view_layer.objects.active = p2
     bpy.ops.vgeo.restore()
 
+    # geometry-nodes materials: the evaluated mesh's materials win over the object's slots
+    gn_obj = bpy.data.objects.new("GNGrid", bpy.data.meshes.new("GNGrid"))
+    bpy.context.scene.collection.objects.link(gn_obj)
+    gn_obj.data.materials.append(bpy.data.materials.new("SlotMat"))
+    ng = bpy.data.node_groups.new("gridmat", "GeometryNodeTree")
+    ng.interface.new_socket("Geometry", in_out="OUTPUT", socket_type="NodeSocketGeometry")
+    grid = ng.nodes.new("GeometryNodeMeshGrid")
+    grid.inputs["Vertices X"].default_value = 64
+    grid.inputs["Vertices Y"].default_value = 64
+    setm = ng.nodes.new("GeometryNodeSetMaterial")
+    gn_mat = bpy.data.materials.new("GNMat")
+    setm.inputs["Material"].default_value = gn_mat
+    outn = ng.nodes.new("NodeGroupOutput")
+    ng.links.new(grid.outputs["Mesh"], setm.inputs["Geometry"])
+    ng.links.new(setm.outputs["Geometry"], outn.inputs[0])
+    gn_obj.modifiers.new("gn", "NODES").node_group = ng
+    bpy.context.view_layer.objects.active = gn_obj
+    gn_obj.select_set(True)
+    rc = bpy.ops.vgeo.virtualize()
+    gp = bpy.context.active_object
+    slots = [m.name if m else None for m in gp.data.materials]
+    shown = set()
+    for ob in stream.fronts(gp):
+        me = ob.data
+        if len(me.polygons):
+            mi = np.zeros(len(me.polygons), np.int32)
+            if "material_index" in me.attributes:
+                me.attributes["material_index"].data.foreach_get("value", mi)
+            shown.update(slots[i] for i in np.unique(mi))
+    # Blender evaluates Set Material as slots [None, GNMat] with faces on slot 1; VGEO must match
+    check("GN Set Material carried to proxy", rc == {'FINISHED'} and shown == {"GNMat"}, f"{slots} -> {shown}")
+    bpy.context.view_layer.objects.active = gp
+    bpy.ops.vgeo.restore()
+
     # restore brings the source back
     proxy.vgeo.path = proxy.vgeo.path  # keep
     bpy.context.view_layer.objects.active = proxy
