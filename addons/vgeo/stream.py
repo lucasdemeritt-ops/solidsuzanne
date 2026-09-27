@@ -3,10 +3,17 @@
 A virtualized object is a normal mesh object (the proxy) whose Geometry
 Nodes modifier instances a hidden collection of chunk objects. Each chunk
 holds the part of the current DAG cut that falls in its region of space.
-When the view changes, the native runtime picks a new cut and only the
-chunks whose contents changed are rebuilt, all within one tick so the
-surface stays watertight. EEVEE, Cycles and Workbench render the chunks
-like any other mesh: full materials, lights, shadows, ray tracing.
+EEVEE, Cycles and Workbench render the chunks like any other mesh: full
+materials, lights, shadows, ray tracing.
+
+Every chunk is a pair of objects: the front (scale 1) shows the current
+cut, the back (scale 0) is where the next contents are built. When the view
+changes, the native runtime picks a new cut; the backs of the chunks that
+changed are refilled in place a few milliseconds per tick, and because they
+are drawn (at zero size) Blender prepares their GPU buffers along the way.
+When all are ready the pairs flip scale in one tick. The surface is never a
+mix of two cuts, no datablocks are created or deleted (which would force
+depsgraph relation rebuilds), and the flip itself costs a transform update.
 """
 
 import ctypes
@@ -22,10 +29,14 @@ from . import native
 
 NODE_GROUP = "VGEO Stream"
 TICK = 0.1           # seconds between view checks when idle
-TICK_BUDGET = 0.014  # seconds of mesh building per tick while an update is in flight
+TICK_BUDGET = 0.008  # seconds of mesh building per tick while an update is in flight
+WARM_CACHES = True
+CYCLES_SETTLE = 0.3  # seconds the view must be still before a Cycles viewport gets a new cut
+DIAG_SWAP = False    # benchmarks: time the depsgraph evaluation right after a swap
 
 _runtimes = {}       # uid -> Runtime
 _rendering = False
+swap_count = 0       # completed live swaps (diagnostics)
 
 LOD_PALETTE = np.array([
     (0.90, 0.30, 0.25, 1), (0.95, 0.60, 0.20, 1), (0.95, 0.85, 0.25, 1), (0.55, 0.85, 0.30, 1),
@@ -61,14 +72,18 @@ class Runtime:
         # incremental update in flight (see stream_step)
         self.target = None
         self.todo = []
-        self.pending = {}
+        self.pending = set()
+        self.strategy = None
+        self.to_clear = set()  # chunks whose (hidden) back still holds old geometry
+        self.spare = {}        # chunk -> unlinked mesh used by BATCH builds
+        self.spare_clear = set()
+        self.chunk_cache = None
 
     def invalidate(self):
         if self.asset:
             self.valid[:] = False
             self.key = None
-            # drop a half-built update; removal by name only touches unused "...next" meshes,
-            # so it is safe even after undo replaced the datablocks
+            self.chunk_cache = None
             _discard_pending(self)
 
     def close(self):
@@ -140,23 +155,67 @@ def modifier_socket_id(ng):
 
 
 def chunk_objects(obj, rt):
-    """Chunk objects by index, creating any that are missing (e.g. after a file was moved)."""
+    """(a, b) object pairs by chunk index, creating any that are missing.
+
+    The full check (collection membership) runs once per runtime; later calls
+    only confirm the cached objects still exist.
+    """
+    if rt.chunk_cache is not None:
+        try:
+            if all(a.name and b.name for a, b in rt.chunk_cache):  # ReferenceError if freed (undo)
+                return rt.chunk_cache
+        except ReferenceError:
+            pass
+        rt.chunk_cache = None
     col = obj.vgeo.collection
     if col is None:
         col = bpy.data.collections.new(f".vgeo {obj.vgeo.uid}")
         obj.vgeo.collection = col
         _attach_modifier(obj)
-    out = []
-    for i in range(rt.asset.chunk_count):
-        name = chunk_name(obj.vgeo.uid, i)
+    members = set(col.objects.keys())
+
+    def get(name, shown):
         ob = bpy.data.objects.get(name)
         if ob is None or ob.type != 'MESH':
-            me = bpy.data.meshes.new(name)
-            ob = bpy.data.objects.new(name, me)
-        if col not in ob.users_collection:
+            ob = bpy.data.objects.new(name, bpy.data.meshes.new(name))
+            _set_shown(ob, shown)
+        if ob.name not in members:
             col.objects.link(ob)
-        out.append(ob)
+        return ob
+
+    out = []
+    materials = tuple(obj.data.materials)
+    for i in range(rt.asset.chunk_count):
+        name = chunk_name(obj.vgeo.uid, i)
+        a, b = get(name, True), get(name + "~", False)
+        if (a.scale[0] >= 0.5) == (b.scale[0] >= 0.5):  # both shown or both hidden: repair
+            _set_shown(a, True)
+            _set_shown(b, False)
+        # materials up front: assigning them later, mid-stream, forces relation rebuilds
+        _sync_materials(a.data, materials)
+        _sync_materials(b.data, materials)
+        out.append((a, b))
+    rt.chunk_cache = out
+    rt.materials = materials
     return out
+
+
+def front_back(pair):
+    a, b = pair
+    return (a, b) if a.scale[0] >= 0.5 else (b, a)
+
+
+def _set_shown(ob, shown):
+    """Front: full size, casts shadows. Back: zero size, no shadows (a changing caster would
+    invalidate EEVEE's shadow maps every frame while it is being filled)."""
+    ob.scale = (1.0, 1.0, 1.0) if shown else (0.0, 0.0, 0.0)
+    ob.visible_shadow = shown
+
+
+def fronts(obj):
+    """The chunk objects currently shown (for inspection and tests)."""
+    col = obj.vgeo.collection
+    return [o for o in col.objects if o.scale[0] >= 0.5] if col else []
 
 
 def _attach_modifier(obj):
@@ -190,6 +249,29 @@ def viewport_views():
                 views.append((rv3d.view_matrix.copy(), rv3d.window_matrix.copy(), region.height,
                               rv3d.is_perspective, space.clip_start))
     return views
+
+
+def viewport_strategy():
+    """How the live loop should land updates, given what the 3D views show.
+
+    CYCLES: some view renders with Cycles (update once the view settles)
+    BATCH:  some view uses EEVEE (Material Preview, or Rendered with EEVEE)
+    STAGED: only Solid/Wireframe views
+    """
+    result = 'STAGED'
+    for win in bpy.context.window_manager.windows:
+        if win.screen is None:
+            continue
+        engine = win.scene.render.engine
+        for area in win.screen.areas:
+            if area.type != 'VIEW_3D':
+                continue
+            shading = area.spaces.active.shading.type
+            if shading == 'RENDERED' and engine == 'CYCLES':
+                return 'CYCLES'
+            if shading in ('MATERIAL', 'RENDERED'):
+                result = 'BATCH'
+    return result
 
 
 def camera_view(scene, depsgraph=None):
@@ -281,19 +363,44 @@ def _write_slow(me, d):
     me.polygons.foreach_set("loop_start", d["loop_starts"])
 
 
-def _verify(me, d):
-    def get(seq, prop, n, dtype):
-        out = np.empty(n, dtype)
-        seq.foreach_get(prop, out)
-        return out
-    nt = d["tri_count"]
-    ok = (np.array_equal(get(me.vertices, "co", d["vertex_count"] * 3, np.float32), d["positions"])
-          and np.array_equal(get(me.edges, "vertices", d["edge_count"] * 2, np.int32), d["edge_verts"])
-          and np.array_equal(get(me.loops, "vertex_index", nt * 3, np.int32), d["corner_verts"])
-          and np.array_equal(get(me.loops, "edge_index", nt * 3, np.int32), d["corner_edges"])
-          and np.array_equal(get(me.polygons, "loop_start", nt, np.int32), d["loop_starts"])
-          and np.array_equal(get(me.polygons, "loop_total", nt, np.int32), np.full(nt, 3, np.int32)))
-    return ok and not me.validate(verbose=False)
+def _fast_write_works():
+    """Write a known two-triangle quad through the direct path and read it back.
+
+    Uses fixed data on purpose: real chunks can legitimately contain things
+    validate() would "fix" (simplification leaves rare back-to-back fins),
+    which must not be mistaken for a broken memory layout.
+    """
+    d = {
+        "positions": np.array([0, 0, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0], np.float32),
+        "edge_verts": np.array([0, 1, 1, 2, 2, 0, 2, 3, 3, 0], np.int32),
+        "corner_verts": np.array([0, 1, 2, 0, 2, 3], np.int32),
+        "corner_edges": np.array([0, 1, 2, 2, 3, 4], np.int32),
+        "loop_starts": np.array([0, 3], np.int32),
+    }
+    me = bpy.data.meshes.new("vgeo.write-check")
+    try:
+        me.vertices.add(4)
+        me.edges.add(5)
+        me.loops.add(6)
+        me.polygons.add(2)
+        _write_fast(me, d)
+        me.update()
+
+        def get(seq, prop, n):
+            out = np.empty(n, np.float32 if prop == "co" else np.int32)
+            seq.foreach_get(prop, out)
+            return out
+        return (np.array_equal(get(me.vertices, "co", 12), d["positions"])
+                and np.array_equal(get(me.edges, "vertices", 10), d["edge_verts"])
+                and np.array_equal(get(me.loops, "vertex_index", 6), d["corner_verts"])
+                and np.array_equal(get(me.loops, "edge_index", 6), d["corner_edges"])
+                and np.array_equal(get(me.polygons, "loop_start", 2), d["loop_starts"])
+                and np.array_equal(get(me.polygons, "loop_total", 2), np.array([3, 3], np.int32))
+                and not me.validate(verbose=False))
+    except Exception:
+        return False
+    finally:
+        bpy.data.meshes.remove(me)
 
 
 def _set_attr(me, name, kind, domain, prop, arr):
@@ -313,25 +420,15 @@ def fill_mesh(me, data, materials, lod_colors):
         return
     nv, nt, ne = data["vertex_count"], data["tri_count"], data["edge_count"]
     data["loop_starts"] = np.arange(0, nt * 3, 3, dtype=np.int32)
+    if _fast_write is None:
+        _fast_write = _fast_write_works()
+        if not _fast_write:
+            print("VGEO: direct mesh writes unavailable, using foreach_set")
     me.vertices.add(nv)
     me.edges.add(ne)
     me.loops.add(nt * 3)
     me.polygons.add(nt)
-    if _fast_write is None:
-        try:
-            _write_fast(me, data)
-            _fast_write = _verify(me, data)
-        except Exception:
-            _fast_write = False
-        if not _fast_write:
-            print("VGEO: direct mesh writes unavailable, using foreach_set")
-            me.clear_geometry()
-            me.vertices.add(nv)
-            me.edges.add(ne)
-            me.loops.add(nt * 3)
-            me.polygons.add(nt)
-            _write_slow(me, data)
-    elif _fast_write:
+    if _fast_write:
         _write_fast(me, data)
     else:
         _write_slow(me, data)
@@ -358,32 +455,76 @@ def _sync_materials(me, materials):
 
 
 def _discard_pending(rt):
-    """Drop a half-built incremental update (its meshes were never shown)."""
-    for name in rt.pending.values():
-        me = bpy.data.meshes.get(name)
-        if me is not None and me.users == 0:
-            bpy.data.meshes.remove(me)
+    """Drop a half-built update; its geometry sits in hidden backs or spares, cleared later."""
+    (rt.spare_clear if rt.strategy == 'BATCH' else rt.to_clear).update(rt.pending)
     rt.pending.clear()
     rt.todo = []
     rt.target = None
 
 
-def stream_step(obj, views, pixel_error, mode="COARSEN", offscreen_scale=8.0, budget=0.012):
+def _spare_mesh(rt, c):
+    """An unlinked mesh for BATCH builds: filling it costs Blender nothing per frame."""
+    name = rt.spare.get(c)
+    me = bpy.data.meshes.get(name) if name else None
+    if me is None or me.users != 0:
+        me = bpy.data.meshes.new(chunk_name(rt.uid, c) + "^")
+        rt.spare[c] = me.name
+    return me
+
+
+def _clear_spares(rt, limit=None):
+    for c in list(rt.spare_clear)[:limit]:
+        rt.spare_clear.discard(c)
+        me = bpy.data.meshes.get(rt.spare.get(c, ""))
+        if me is not None and me.users == 0 and len(me.vertices):
+            me.clear_geometry()
+
+
+def clear_backs(obj, rt):
+    """Empty every hidden back and spare now (before renders and saves)."""
+    _discard_pending(rt)
+    for pair in chunk_objects(obj, rt):
+        _front, back = front_back(pair)
+        if len(back.data.vertices):
+            back.data.clear_geometry()
+    rt.to_clear.clear()
+    rt.spare_clear.update(rt.spare.keys())
+    _clear_spares(rt)
+
+
+def stream_step(obj, views, pixel_error, mode="COARSEN", offscreen_scale=8.0, budget=0.012,
+                strategy='STAGED'):
     """Incremental update for the live loop; returns True while work remains.
 
-    Replacement meshes for changed chunks are built a few at a time into new,
-    unlinked datablocks while the current (valid) cut stays on screen. Once
-    all are ready they are swapped in together, so the surface never shows a
-    mix of two cuts. The native selection is not touched until the swap, so
-    extraction keeps reading the target cut.
+    The current (valid) cut stays on screen while the changed chunks are
+    rebuilt a few per tick; when all are ready they land together, so the
+    surface never shows a mix of two cuts. The native selection is not touched
+    until then, so extraction keeps reading the target cut.
+
+    strategy STAGED (Solid/Workbench): build into the hidden backs, which are
+      drawn at zero size so Blender prepares them as they fill; landing is a
+      scale flip. Steady frames, no spike.
+    strategy BATCH (EEVEE): EEVEE pays heavily for every frame in which any
+      geometry changes, so build into unlinked spare meshes (free per frame)
+      and land them in one frame by reassigning the fronts' mesh data.
     """
     rt = runtime_for(obj)
     if rt.asset is None:
         return False
+    if rt.target is not None and rt.strategy != strategy:
+        _discard_pending(rt)  # the viewport changed mode mid-update: start over
+    if rt.spare_clear:
+        _clear_spares(rt, 64)  # unlinked meshes: clearing them is cheap
     if rt.target is None:
         key = _key(obj, views, pixel_error, mode, offscreen_scale)
         if key == rt.key and rt.valid.all():
-            return False
+            if rt.to_clear:  # idle: release old geometry from hidden backs, a few per tick
+                chunks = chunk_objects(obj, rt)
+                for _ in range(min(32, len(rt.to_clear))):
+                    _front, back = front_back(chunks[rt.to_clear.pop()])
+                    back.data.clear_geometry()
+                return bool(rt.to_clear)
+            return bool(rt.spare_clear)
         lv = local_views(obj, views, pixel_error, mode, offscreen_scale)
         if not lv:
             return False
@@ -404,36 +545,85 @@ def stream_step(obj, views, pixel_error, mode="COARSEN", offscreen_scale=8.0, bu
         rt.target = sigs.copy()
         rt.todo = [int(c) for c in changed[::-1]]  # pop() takes them in order
         rt.build_s = 0.0
+        rt.strategy = strategy
+        if strategy == 'BATCH' and len(rt.spare) < rt.asset.chunk_count:
+            # create every spare now, with its materials, in one tick: creating datablocks and
+            # assigning materials both force a depsgraph relations rebuild (and a full EEVEE
+            # re-sync), so neither may trickle through the build
+            materials = tuple(obj.data.materials)
+            for c in range(rt.asset.chunk_count):
+                _sync_materials(_spare_mesh(rt, c), materials)
 
-    t_start = time.perf_counter()
     materials = tuple(obj.data.materials)
-    while rt.todo and time.perf_counter() - t_start < budget:
+    if materials != getattr(rt, "materials", None):
+        # the proxy's materials changed: resync every chunk mesh and spare in one go
+        rt.chunk_cache = None
+        for name in rt.spare.values():
+            me = bpy.data.meshes.get(name)
+            if me is not None:
+                _sync_materials(me, materials)
+    chunks = chunk_objects(obj, rt)
+    # release old geometry from hidden backs even while building, so continuous motion never
+    # leaves a second copy of the cut being drawn (at zero size, but through every render pass)
+    if rt.to_clear:
+        todo = set(rt.todo)
+        for c in [c for c in rt.to_clear if c not in todo][:64]:
+            rt.to_clear.discard(c)
+            back = front_back(chunks[c])[1]
+            if len(back.data.vertices):
+                back.data.clear_geometry()
+    t_start = time.perf_counter()
+    built = 0
+    # at least one chunk per tick, so an update can never stall
+    while rt.todo and (built == 0 or time.perf_counter() - t_start < budget):
+        built += 1
         c = rt.todo.pop()
-        me = bpy.data.meshes.new(chunk_name(rt.uid, c) + ".next")
+        me = _spare_mesh(rt, c) if strategy == 'BATCH' else front_back(chunks[c])[1].data
         _sync_materials(me, materials)
         fill_mesh(me, rt.asset.extract(c), materials, rt.lod_colors)
-        rt.pending[c] = me.name
+        if WARM_CACHES and len(me.polygons):
+            # compute triangulation + normals now (spread over ticks); the evaluated copy
+            # shares these caches, so the flip frame does not have to
+            me.loop_triangles[0]
+            me.corner_normals[0]
+        rt.pending.add(c)
+        if strategy == 'BATCH':
+            rt.spare_clear.discard(c)
+        else:
+            rt.to_clear.discard(c)
     rt.build_s += time.perf_counter() - t_start
     if rt.todo:
         return True
 
-    # everything is built: swap all changed chunks in one go
-    chunks = chunk_objects(obj, rt)
-    for c, name in rt.pending.items():
-        new = bpy.data.meshes.get(name)
-        if new is None:  # lost to undo: start over next tick
-            _discard_pending(rt)
-            rt.invalidate()
-            return True
-        ob = chunks[c]
-        old = ob.data
-        ob.data = new
-        if old is not None and old.users == 0:
-            bpy.data.meshes.remove(old)
-        new.name = chunk_name(rt.uid, c)
+    # everything is built: land all changed chunks in one go
+    global swap_count
+    swap_count += 1
+    rt.swap_tris = 0
+    for c in rt.pending:
+        front, back = front_back(chunks[c])
+        if strategy == 'BATCH':
+            spare = bpy.data.meshes.get(rt.spare.get(c, ""))
+            if spare is None:  # lost to undo: start over
+                _discard_pending(rt)
+                rt.invalidate()
+                return True
+            old = front.data
+            front.data = spare
+            rt.spare[c] = old.name  # the replaced mesh becomes this chunk's next spare
+            rt.spare_clear.add(c)
+            rt.swap_tris += len(spare.polygons)
+        else:
+            _set_shown(back, True)
+            _set_shown(front, False)
+            rt.to_clear.add(c)  # the old front is now a hidden back
+            rt.swap_tris += len(back.data.polygons)
         rt.applied[c] = rt.target[c]
         rt.valid[c] = True
     rt.last_rebuilt = len(rt.pending)
+    if DIAG_SWAP:
+        t_dg = time.perf_counter()
+        bpy.context.view_layer.update()
+        rt.swap_dg_ms = (time.perf_counter() - t_dg) * 1000.0
     rt.pending.clear()
     rt.target = None
     rt.key = rt.target_key
@@ -441,7 +631,7 @@ def stream_step(obj, views, pixel_error, mode="COARSEN", offscreen_scale=8.0, bu
     rt.last_ms = rt.build_s * 1000.0
     rt.latency_ms = (time.perf_counter() - rt.target_t0) * 1000.0
     rt.updates += 1
-    return False
+    return bool(rt.to_clear or rt.spare_clear)  # old geometry is released on following ticks
 
 
 def apply_cut(obj, views, pixel_error, mode="FULL", offscreen_scale=8.0, force=False):
@@ -468,16 +658,17 @@ def apply_cut(obj, views, pixel_error, mode="FULL", offscreen_scale=8.0, force=F
         rt.lod_colors = lod_colors
     changed = np.nonzero(~rt.valid | (sigs != rt.applied))[0]
     materials = tuple(obj.data.materials)
-    chunks = chunk_objects(obj, rt) if len(changed) or not rt.valid.all() else None
-    for c in changed:
-        me = chunks[c].data
+    chunks = chunk_objects(obj, rt)
+    for c in changed:  # fronts are rewritten in place: atomic within this call
+        me = front_back(chunks[c])[0].data
         _sync_materials(me, materials)
         fill_mesh(me, rt.asset.extract(int(c)), materials, lod_colors)
         rt.applied[c] = sigs[c]
         rt.valid[c] = True
-    if chunks is not None and len(changed) == 0:
-        for ob in chunks:
-            _sync_materials(ob.data, materials)
+    if len(changed) == 0:
+        for pair in chunks:
+            _sync_materials(front_back(pair)[0].data, materials)
+    clear_backs(obj, rt)  # renders must not carry hidden geometry
     rt.key = key
     rt.triangles = int(rt.asset.last.triangles)
     rt.clusters = int(rt.asset.last.clusters)
@@ -497,9 +688,11 @@ def apply_level(obj, depth):
     chunks = chunk_objects(obj, rt)
     materials = tuple(obj.data.materials)
     for c in range(rt.asset.chunk_count):
-        _sync_materials(chunks[c].data, materials)
-        fill_mesh(chunks[c].data, rt.asset.extract(c), materials, bool(obj.vgeo.lod_colors))
+        me = front_back(chunks[c])[0].data
+        _sync_materials(me, materials)
+        fill_mesh(me, rt.asset.extract(c), materials, bool(obj.vgeo.lod_colors))
         rt.applied[c] = sigs[c]
+    clear_backs(obj, rt)
     rt.valid[:] = True
     rt.key = None
     rt.triangles = int(rt.asset.last.triangles)
@@ -539,11 +732,27 @@ def _tick():
                     visible.append(obj)
             except RuntimeError:
                 continue
+        strategy = viewport_strategy()
+        if strategy == 'CYCLES':
+            # Cycles rebuilds its BVH on every geometry change and restarts sampling anyway:
+            # update once the view has been still for a moment, in one step
+            now = time.perf_counter()
+            for obj in visible:
+                v = obj.vgeo
+                rt = runtime_for(obj)
+                if rt.asset is None:
+                    continue
+                key = _key(obj, views, v.pixel_error, v.offscreen, v.offscreen_scale)
+                if key != getattr(rt, "settle_key", None):
+                    rt.settle_key, rt.settle_t = key, now
+                elif now - rt.settle_t >= CYCLES_SETTLE and (key != rt.key or not rt.valid.all()):
+                    apply_cut(obj, views, v.pixel_error, v.offscreen, v.offscreen_scale)
+            return TICK
         busy = False
         budget = TICK_BUDGET / max(1, len(visible))
         for obj in visible:
             v = obj.vgeo
-            busy |= stream_step(obj, views, v.pixel_error, v.offscreen, v.offscreen_scale, budget)
+            busy |= stream_step(obj, views, v.pixel_error, v.offscreen, v.offscreen_scale, budget, strategy)
         # keep cranking (UI events still run between ticks) until the swap lands
         return 0.0 if busy else TICK
     except Exception as e:  # never let the timer die
@@ -574,6 +783,18 @@ def _on_load(_a=None, _b=None):
 
 
 @persistent
+def _on_save(_a=None, _b=None):
+    # hidden backs would double the saved geometry; only the shown cut goes into the file
+    for obj in proxies():
+        rt = _runtimes.get(obj.vgeo.uid)
+        if rt is not None and rt.asset is not None:
+            try:
+                clear_backs(obj, rt)
+            except Exception as e:
+                print("VGEO save:", e)
+
+
+@persistent
 def _on_undo(_a=None, _b=None):
     invalidate_all()
 
@@ -585,7 +806,7 @@ def new_uid():
 def register():
     h = bpy.app.handlers
     for lst, fn in ((h.render_pre, _on_render_pre), (h.render_complete, _on_render_done),
-                    (h.render_cancel, _on_render_done), (h.load_post, _on_load),
+                    (h.render_cancel, _on_render_done), (h.load_post, _on_load), (h.save_pre, _on_save),
                     (h.undo_post, _on_undo), (h.redo_post, _on_undo)):
         if fn not in lst:
             lst.append(fn)
@@ -596,7 +817,7 @@ def register():
 def unregister():
     h = bpy.app.handlers
     for lst, fn in ((h.render_pre, _on_render_pre), (h.render_complete, _on_render_done),
-                    (h.render_cancel, _on_render_done), (h.load_post, _on_load),
+                    (h.render_cancel, _on_render_done), (h.load_post, _on_load), (h.save_pre, _on_save),
                     (h.undo_post, _on_undo), (h.redo_post, _on_undo)):
         while fn in lst:
             lst.remove(fn)

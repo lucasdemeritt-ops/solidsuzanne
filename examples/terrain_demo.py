@@ -28,6 +28,7 @@ def arg(name, default):
 
 RES = arg("--res", 2048)
 OUT = arg("--out", os.path.join(REPO, "build-demo"))
+CHUNKS = arg("--chunks", 0)
 RAW = "--raw" in argv
 PREVIEW = "--preview" in argv
 SIZE = 4000.0
@@ -367,7 +368,7 @@ def main():
     bpy.context.view_layer.update()
     place_camera(scene, obj)
     log(f"terrain evaluated in {time.perf_counter() - t0:.1f}s")
-    bpy.ops.wm.save_as_mainfile(filepath=os.path.join(OUT, f"terrain_{RES}.blend"))
+    bpy.ops.wm.save_as_mainfile(filepath=os.path.join(OUT, f"terrain_{RES}" + (f"_c{CHUNKS}" if CHUNKS else "") + ".blend"))
 
     if RAW:
         render(scene, "CYCLES", f"raw_{RES}.png")
@@ -375,7 +376,7 @@ def main():
     bpy.context.view_layer.objects.active = obj
     obj.select_set(True)
     t0 = time.perf_counter()
-    bpy.ops.vgeo.virtualize()
+    bpy.ops.vgeo.virtualize(target_chunks=CHUNKS)
     proxy = bpy.context.active_object
     rt = stream.runtime_for(proxy)
     info = rt.asset.info

@@ -67,6 +67,9 @@ class VGEO_OT_virtualize(bpy.types.Operator):
                                             "(otherwise it is hidden and kept)")
     max_triangles: IntProperty(name="Cluster Size", default=128, min=32, max=256,
                                description="Triangles per cluster")
+    target_chunks: IntProperty(name="Chunks", default=0, min=0, max=8192,
+                               description="Streaming regions (0 = automatic). More chunks means smaller "
+                                           "updates but more objects")
 
     _job = None
     _timer = None
@@ -93,7 +96,7 @@ class VGEO_OT_virtualize(bpy.types.Operator):
         self._uid = stream.new_uid()
         self._full, self._setting = build.default_path(src, self._uid)
         names = [s.material.name if s.material else "" for s in src.material_slots]
-        return build.Job(arrays, self._full, names, self.max_triangles)
+        return build.Job(arrays, self._full, names, self.max_triangles, self.target_chunks)
 
     def _finish(self, context, job):
         src = bpy.data.objects.get(self._src_name)
@@ -173,11 +176,11 @@ class VGEO_OT_restore(bpy.types.Operator):
             rt.close()
         if col:
             for ob in list(col.objects):
-                me = ob.data
                 bpy.data.objects.remove(ob)
-                if me and me.users == 0:
-                    bpy.data.meshes.remove(me)
             bpy.data.collections.remove(col)
+        prefix = f"vgeo.{uid}."
+        for me in [m for m in bpy.data.meshes if m.name.startswith(prefix) and m.users == 0]:
+            bpy.data.meshes.remove(me)
         pm = proxy.data
         bpy.data.objects.remove(proxy)
         if pm.users == 0:

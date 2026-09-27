@@ -78,11 +78,12 @@ def default_path(obj, uid):
 class Job:
     """Runs native.build on a worker thread; the GIL is released inside the DLL."""
 
-    def __init__(self, arrays, path, material_names, max_triangles):
+    def __init__(self, arrays, path, material_names, max_triangles, target_chunks=0):
         self.arrays = arrays
         self.path = path
         self.material_names = material_names
         self.max_triangles = max_triangles
+        self.target_chunks = target_chunks
         self.stage = 0
         self.fraction = 0.0
         self.cancel = False
@@ -99,7 +100,8 @@ class Job:
             a = self.arrays
             self.result = native.build(self.path, a["positions"], a["normals"], a["uvs"], a["materials"],
                                        self.material_names, max_triangles=self.max_triangles,
-                                       progress=self._progress, indices=a["indices"])
+                                       target_chunks=self.target_chunks, progress=self._progress,
+                                       indices=a["indices"])
         except BaseException as e:
             self.error = e
         finally:

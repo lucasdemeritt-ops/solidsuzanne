@@ -62,7 +62,7 @@ def dense_rock(subdiv=8):
 def cut_geometry(proxy):
     """All chunk geometry of a proxy as (positions, triangles)."""
     pos_all, tri_all, base = [], [], 0
-    for ob in proxy.vgeo.collection.objects:
+    for ob in stream.fronts(proxy):
         me = ob.data
         nv, nl = len(me.vertices), len(me.loops)
         if nl == 0:
@@ -142,7 +142,7 @@ def run():
     # evaluated proxy shows the chunks through geometry nodes
     dg = bpy.context.evaluated_depsgraph_get()
     inst = sum(1 for i in dg.object_instances if i.is_instance and i.parent and i.parent.original == proxy)
-    check("proxy instances chunk objects", inst == rt.asset.chunk_count, f"{inst} instances")
+    check("proxy instances chunk pairs", inst == 2 * rt.asset.chunk_count, f"{inst} instances")
     check("direct mesh writes verified", stream._fast_write is True)
 
     # cuts from the render camera at increasing distance
@@ -161,7 +161,7 @@ def run():
     lods = set()
     proxy.vgeo.lod_colors = True
     stream.apply_cut(proxy, [stream.camera_view(scene)], 1.0, force=True)
-    for ob in proxy.vgeo.collection.objects:
+    for ob in stream.fronts(proxy):
         a = ob.data.color_attributes.get("vgeo_lod")
         if a is not None and len(a.data):
             c = np.empty(len(a.data) * 4, np.float32)
@@ -213,36 +213,83 @@ def run():
     # incremental (live loop) path: nothing changes on screen until the swap, then it matches a direct cut
     camera((0, -1.8, 0.3))
     view = stream.camera_view(scene)
-    before = {o.name: o.data.name for o in proxy.vgeo.collection.objects}
-    tris_before = sum(len(o.data.polygons) for o in proxy.vgeo.collection.objects)
-    steps = 0
+    before = {o.name: o.data.name for o in stream.fronts(proxy)}
+    tris_before = sum(len(o.data.polygons) for o in stream.fronts(proxy))
+    steps, updates0, unchanged = 0, rt.updates, True
+    while rt.updates == updates0:  # until the flip
+        stream.stream_step(proxy, [view], 1.0, "FULL", 8.0, budget=0.0005)
+        steps += 1
+        if rt.updates == updates0:
+            unchanged &= sum(len(o.data.polygons) for o in stream.fronts(proxy)) == tris_before
+    check("incremental keeps old cut until swap", unchanged, f"{steps} steps")
     while stream.stream_step(proxy, [view], 1.0, "FULL", 8.0, budget=0.0005):
         steps += 1
-        shown = sum(len(o.data.polygons) for o in proxy.vgeo.collection.objects)
-        if shown != tris_before:
-            break
-    check("incremental keeps old cut until swap", shown == tris_before if steps else True, f"{steps} steps")
-    while stream.stream_step(proxy, [view], 1.0, "FULL", 8.0, budget=0.0005):
-        steps += 1
-    inc = sum(len(o.data.polygons) for o in proxy.vgeo.collection.objects)
+    inc = sum(len(o.data.polygons) for o in stream.fronts(proxy))
     check("incremental ran in several steps", steps >= 2, f"{steps} steps, {rt.last_rebuilt} chunks")
     check("incremental result matches stats", inc == rt.triangles, f"{inc} vs {rt.triangles}")
     stream.apply_cut(proxy, [view], 1.0, "FULL", force=True)
     check("incremental equals direct cut", inc == rt.triangles)
     pos, tris = cut_geometry(proxy)
     check("incremental cut watertight", open_edges(pos, tris) == 0)
-    check("no orphan chunk meshes", not [m for m in bpy.data.meshes if m.name.endswith(".next") or
-                                         (m.name.startswith("vgeo.") and m.users == 0)])
+    def backs():
+        return [o for o in proxy.vgeo.collection.objects if o.scale[0] < 0.5]
+    check("direct cut empties hidden backs", all(len(o.data.vertices) == 0 for o in backs()))
+    check("one back per chunk", len(backs()) == rt.asset.chunk_count, str(len(backs())))
+    # streaming never creates or deletes datablocks
+    n_meshes, n_objects = len(bpy.data.meshes), len(bpy.data.objects)
+    for d in (2.4, 1.8, 2.4):
+        camera((0, -d, 0.3))
+        while stream.stream_step(proxy, [stream.camera_view(scene)], 1.0, "FULL", 8.0, budget=0.002):
+            pass
+    check("streaming creates no datablocks", (len(bpy.data.meshes), len(bpy.data.objects)) == (n_meshes, n_objects),
+          f"{n_meshes}/{n_objects} -> {len(bpy.data.meshes)}/{len(bpy.data.objects)}")
+    check("idle loop empties hidden backs", all(len(o.data.vertices) == 0 for o in backs()))
+    pos, tris = cut_geometry(proxy)
+    check("flipped cut watertight", open_edges(pos, tris) == 0, f"{len(tris)} tris")
+    # BATCH strategy (EEVEE viewports): unlinked spares, landed in one step
+    def run_batch(d):
+        camera((0, -d, 0.3))
+        v = stream.camera_view(scene)
+        u0, shown0, same = rt.updates, sum(len(o.data.polygons) for o in stream.fronts(proxy)), True
+        while rt.updates == u0:
+            stream.stream_step(proxy, [v], 1.0, "FULL", 8.0, budget=0.0005, strategy='BATCH')
+            if rt.updates == u0:
+                same &= sum(len(o.data.polygons) for o in stream.fronts(proxy)) == shown0
+        while stream.stream_step(proxy, [v], 1.0, "FULL", 8.0, budget=0.0005, strategy='BATCH'):
+            pass
+        return same
+    same = run_batch(2.1)
+    check("batch keeps old cut until it lands", same)
+    pos, tris = cut_geometry(proxy)
+    check("batch cut watertight", open_edges(pos, tris) == 0, f"{len(tris)} tris")
+    check("batch cut matches stats", len(tris) == rt.triangles)
+    run_batch(2.6)
+    run_batch(2.1)
+    counts = (len(bpy.data.meshes), len(bpy.data.objects))
+    run_batch(2.6)
+    run_batch(2.1)
+    check("batch reuses its spares", (len(bpy.data.meshes), len(bpy.data.objects)) == counts,
+          f"{counts} -> {(len(bpy.data.meshes), len(bpy.data.objects))}")
+    spares = [m for m in bpy.data.meshes if m.name.startswith("vgeo.") and m.users == 0]
+    check("at most one spare per chunk", len(spares) <= 2 * rt.asset.chunk_count, str(len(spares)))
+    check("spares are empty when idle", all(len(m.vertices) == 0 for m in spares), f"{len(spares)} spares")
+
     # an interrupted update is discarded cleanly
     camera((0, -6, 0.3))
+    shown = sum(len(o.data.polygons) for o in stream.fronts(proxy))
     stream.stream_step(proxy, [stream.camera_view(scene)], 1.0, "FULL", 8.0, budget=0.0)
     rt.invalidate()
-    check("interrupted update cleaned up", not rt.pending and
-          not [m for m in bpy.data.meshes if m.name.endswith(".next")])
+    check("interrupted update leaves the shown cut alone",
+          not rt.pending and sum(len(o.data.polygons) for o in stream.fronts(proxy)) == shown)
+    # saving drops hidden geometry
+    for o in backs()[:3]:
+        stream.fill_mesh(o.data, rt.asset.extract(0), (), False) if rt.asset.extract(0) else None
+    bpy.ops.wm.save_mainfile()
+    check("save empties hidden backs", all(len(o.data.vertices) == 0 for o in backs()))
 
     # material border survives simplification
     mats = set()
-    for ob in proxy.vgeo.collection.objects:
+    for ob in stream.fronts(proxy):
         me = ob.data
         if "material_index" in me.attributes and len(me.polygons):
             m = np.empty(len(me.polygons), np.int32)
@@ -285,10 +332,10 @@ def run():
 
     # save / reload: chunk meshes persist, runtime reopens
     bpy.ops.wm.save_mainfile()
-    tris_saved = sum(len(o.data.polygons) for o in proxy.vgeo.collection.objects)
+    tris_saved = sum(len(o.data.polygons) for o in stream.fronts(proxy))
     bpy.ops.wm.open_mainfile(filepath=os.path.join(OUT, "stream_test.blend"))
     proxy = next(o for o in bpy.data.objects if o.vgeo.uid)
-    check("chunks survive save/load", sum(len(o.data.polygons) for o in proxy.vgeo.collection.objects) == tris_saved)
+    check("chunks survive save/load", sum(len(o.data.polygons) for o in stream.fronts(proxy)) == tris_saved)
     check("runtimes reset on load", not stream._runtimes)
     camera((0, -8, 0.2))
     rt = stream.apply_cut(proxy, [stream.camera_view(bpy.context.scene)], 1.0)
@@ -326,7 +373,7 @@ def run():
     pos, tris = cut_geometry(p2)
     check("indexed cut watertight", open_edges(pos, tris) == 0, f"{len(tris)} tris")
     mats = set()
-    for ob in p2.vgeo.collection.objects:
+    for ob in stream.fronts(p2):
         me = ob.data
         if "material_index" in me.attributes and len(me.polygons):
             m = np.empty(len(me.polygons), np.int32)
