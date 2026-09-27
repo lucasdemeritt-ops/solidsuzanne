@@ -153,10 +153,19 @@ def run():
     check("source triangle count", src_tris == 327680, str(src_tris))
     check("DAG has many levels", rt.asset.info["lod_levels"] >= 8, str(rt.asset.info["lod_levels"]))
 
-    # evaluated proxy shows the chunks through geometry nodes
+    # chunks are scene objects parented to the proxy (no Geometry Nodes instancing: EEVEE would
+    # treat the whole surface as changed whenever one chunk changed)
+    col = proxy.vgeo.collection
+    chunks = list(col.objects)
+    check("chunk pairs are parented to the proxy", len(chunks) == 2 * rt.asset.chunk_count
+          and all(o.parent == proxy for o in chunks), f"{len(chunks)} chunk objects")
+    check("chunk collection linked next to the proxy",
+          all(col.name in c.children for c in proxy.users_collection))
+    check("proxy has no instancing modifier", not any(m.type == 'NODES' for m in proxy.modifiers))
+    check("proxy mesh is only its bounds", len(proxy.data.vertices) == 8 and len(proxy.data.polygons) == 0)
     dg = bpy.context.evaluated_depsgraph_get()
-    inst = sum(1 for i in dg.object_instances if i.is_instance and i.parent and i.parent.original == proxy)
-    check("proxy instances chunk pairs", inst == 2 * rt.asset.chunk_count, f"{inst} instances")
+    drawn = sum(1 for i in dg.object_instances if i.object.original in set(chunks))
+    check("chunks are drawn as objects", drawn == 2 * rt.asset.chunk_count, str(drawn))
     check("direct mesh writes verified", stream._fast_write is True)
 
     # cuts from the render camera at increasing distance
@@ -300,6 +309,48 @@ def run():
         stream.fill_mesh(o.data, rt.asset.extract(0), (), False) if rt.asset.extract(0) else None
     bpy.ops.wm.save_mainfile()
     check("save empties hidden backs", all(len(o.data.vertices) == 0 for o in backs()))
+
+    # chunks follow the proxy: visibility, render visibility, selection, collections
+    vl = bpy.context.view_layer
+    lc = stream._layer_collection(vl.layer_collection, proxy.vgeo.collection)
+    proxy.hide_set(True)
+    stream.sync_visibility(proxy, vl)
+    hidden = lc.hide_viewport and not any(o.visible_get() for o in stream.fronts(proxy))
+    proxy.hide_set(False)
+    stream.sync_visibility(proxy, vl)
+    check("hiding the proxy hides its chunks", hidden and all(o.visible_get() for o in stream.fronts(proxy)))
+    proxy.hide_render = True
+    stream.update_for_render(scene)
+    check("proxy hide_render reaches the chunks", proxy.vgeo.collection.hide_render)
+    proxy.hide_render = False
+    stream.sync_visibility(proxy, vl)
+    for o in vl.objects:
+        o.select_set(False)
+    front0 = stream.fronts(proxy)[0]
+    front0.select_set(True)
+    vl.objects.active = front0
+    stream.redirect_selection(vl)
+    check("clicking a chunk selects the proxy", proxy.select_get() and not front0.select_get()
+          and vl.objects.active == proxy)
+    moved = bpy.data.collections.new("Moved")
+    scene.collection.children.link(moved)
+    moved.objects.link(proxy)
+    scene.collection.objects.unlink(proxy)
+    stream.link_chunks(proxy)
+    check("chunk collection follows the proxy to another collection",
+          proxy.vgeo.collection.name in moved.children
+          and proxy.vgeo.collection.name not in scene.collection.children)
+    scene.collection.objects.link(proxy)
+    moved.objects.unlink(proxy)
+    stream.link_chunks(proxy)
+    bpy.data.collections.remove(moved)
+    # files from before: chunks instanced by a Geometry Nodes modifier, collection not linked
+    scene.collection.children.unlink(proxy.vgeo.collection)
+    mod = proxy.modifiers.new("VGEO Stream", 'NODES')
+    mod.node_group = bpy.data.node_groups.new(stream.NODE_GROUP, "GeometryNodeTree")
+    stream.link_chunks(proxy)
+    check("old instancing files are switched over", not proxy.modifiers
+          and proxy.vgeo.collection.name in scene.collection.children)
 
     # material border survives simplification
     mats = set()
@@ -504,8 +555,13 @@ def run():
             shown.update(slots[i] for i in np.unique(mi))
     # Blender evaluates Set Material as slots [None, GNMat] with faces on slot 1; VGEO must match
     check("GN Set Material carried to proxy", rc == {'FINISHED'} and shown == {"GNMat"}, f"{slots} -> {shown}")
-    bpy.context.view_layer.objects.active = gp
-    bpy.ops.vgeo.restore()
+    # deleting a proxy (not Restore) leaves its chunk collection behind: it must be unlinked
+    gcol = gp.vgeo.collection
+    bpy.data.objects.remove(gp)
+    stream.unlink_orphans()
+    linked = [c.name for c in bpy.data.collections if gcol.name in c.children]
+    linked += [sc.name for sc in bpy.data.scenes if gcol.name in sc.collection.children]
+    check("deleted proxy's chunks are unlinked", not linked, str(linked))
 
     # restore brings the source back
     proxy_uid = proxy.vgeo.uid

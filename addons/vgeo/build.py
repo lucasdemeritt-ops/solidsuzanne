@@ -177,7 +177,7 @@ def create_proxy(context, src, path_setting, uid, build_stats, remove_source=Fal
     v.source_triangles = int(build_stats.get("source_triangles", 0))
     v.file_bytes = int(build_stats.get("file_bytes", 0))
     v.collection = bpy.data.collections.new(f".vgeo {uid}")
-    stream._attach_modifier(proxy)
+    stream.link_chunks(proxy)
 
     # a first cut so there is something to see before the live loop runs
     rt = stream.runtime_for(proxy)

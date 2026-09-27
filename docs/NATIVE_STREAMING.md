@@ -30,7 +30,7 @@ vgeo_stream.dll: vgeo_select / vgeo_extract          (ctypes, no Python ABI)
     │  extract changed chunks as indexed meshes with edges
     ▼
 addons/vgeo/stream.py
-    │  proxy object → Geometry Nodes → Collection Info → chunk objects
+    │  proxy object + chunk objects (parented to it, in a collection linked next to it)
     │  live loop in the viewport, render_pre handler for final renders
     ▼
 EEVEE / Cycles / Workbench
@@ -56,9 +56,30 @@ Every chunk is a pair of objects. How an update lands depends on the views:
 
 | Views | Strategy | Why |
 |---|---|---|
-| Solid / Workbench | **staged**: fill the hidden back (scale 0, no shadows) a few ms per tick, then flip scales | Blender prepares the back's GPU buffers as it fills; the flip is a transform change |
-| EEVEE (Material Preview, Rendered) | **batch**: fill unlinked spare meshes, land them all in one frame | EEVEE pays heavily for every frame in which geometry changes |
+| Solid, Workbench, EEVEE | **staged**: fill the hidden back (scale 0, no shadows) a few ms per tick, then flip scales | Blender prepares the back's GPU buffers as it fills; the flip is a transform change |
 | Cycles Rendered | **settle**: update once the view is still for 0.3 s | Cycles rebuilds its BVH and restarts sampling anyway |
+
+The chunks are ordinary objects parented to the proxy, linked through a
+collection next to it. Until September 2026 they were instanced by a
+Geometry Nodes modifier on the proxy (Collection Info). That made every chunk
+change re-evaluate the proxy, and EEVEE then treated the whole instanced
+surface as changed: refilling one hidden back cost ~120 ms per frame, so
+EEVEE views landed updates in one batch (unlinked spare meshes swapped in),
+which cost 100-300 ms in the landing frame (tests/eevee_land_bench.py):
+
+| EEVEE, 70 chunks / 3.1M triangles, 5.1.2 | Geometry Nodes instancing | Separate objects |
+|---|---|---|
+| Idle frame | 9.7 ms | 9.6 ms |
+| Frames while one hidden back is refilled per tick | 119 ms | 25 ms |
+| Landing by swapping mesh data | 119 ms | 192 ms |
+| Landing prefilled backs by a scale flip | 43 ms | 28 ms |
+
+The proxy keeps its materials and eight loose points at the asset's bounds
+(Frame Selected works; nothing is drawn or rendered). Selection, hiding and
+render visibility follow the proxy: clicking the surface selects the proxy,
+and hiding the proxy hides the chunk collection. Files made with the old
+modifier are switched over when opened; a deleted proxy's chunk collection is
+unlinked. The BATCH strategy remains in `stream_step` for scripts.
 
 Lessons measured along the way (tests/viewport_bench.py, tests/swap_bench.py):
 
@@ -84,8 +105,8 @@ Terrain demo: 33.5M triangles from Geometry Nodes (`examples/terrain_demo.py`).
 | Cut from the hero camera, 1080p, 1 px, off-screen coarsened | 2.5M triangles (7.4 %) |
 | Full rebuild of a 7.7M-triangle cut | 1.3 s |
 | Viewport idle, Solid / EEVEE | ~75 / ~55 fps |
-| Viewport while continuously streaming, Solid | ~28 fps, worst frame ~50 ms |
-| Viewport while continuously streaming, EEVEE | ~29 fps, one ~0.4 s frame when a large update lands |
+| Viewport while continuously streaming, Solid | ~29 fps, worst frame ~45-48 ms |
+| Viewport while continuously streaming, EEVEE | ~26 fps, worst frame ~56 ms (was 0.3-0.4 s with Geometry Nodes instancing) |
 | Cycles, 1080p, 64 samples, same material: raw 33.5M mesh | 93-118 s |
 | Cycles, same frame from the VGEO cut (9.8M triangles, 0.5 px) | 49-51 s |
 | Difference between the two images | mean 0.02/255, 99th percentile 1/255 |

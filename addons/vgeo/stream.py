@@ -1,10 +1,11 @@
 """Streams a view-dependent cut of a .vgeo asset into real Blender meshes.
 
-A virtualized object is a normal mesh object (the proxy) whose Geometry
-Nodes modifier instances a hidden collection of chunk objects. Each chunk
-holds the part of the current DAG cut that falls in its region of space.
-EEVEE, Cycles and Workbench render the chunks like any other mesh: full
-materials, lights, shadows, ray tracing.
+A virtualized object is a normal mesh object (the proxy, whose own mesh only
+holds its materials and eight loose corner points for framing). Its chunk
+objects live in a collection linked next to it and are parented to it, so
+they follow its transform. Each chunk holds the part of the current DAG cut
+that falls in its region of space. EEVEE, Cycles and Workbench render the
+chunks like any other mesh: full materials, lights, shadows, ray tracing.
 
 Every chunk is a pair of objects: the front (scale 1) shows the current
 cut, the back (scale 0) is where the next contents are built. When the view
@@ -14,6 +15,13 @@ are drawn (at zero size) Blender prepares their GPU buffers along the way.
 When all are ready the pairs flip scale in one tick. The surface is never a
 mix of two cuts, no datablocks are created or deleted (which would force
 depsgraph relation rebuilds), and the flip itself costs a transform update.
+
+The chunks used to be instanced by a Geometry Nodes modifier on the proxy.
+Any chunk change then re-evaluated the proxy, and EEVEE treated the whole
+instanced surface as changed (about 120 ms per frame on the terrain demo, so
+EEVEE views had to land updates in one expensive frame). As separate objects
+only the chunk that changed is updated. Files made with the modifier are
+switched over when they are opened.
 """
 
 import ctypes
@@ -171,7 +179,7 @@ def chunk_objects(obj, rt):
     if col is None:
         col = bpy.data.collections.new(f".vgeo {obj.vgeo.uid}")
         obj.vgeo.collection = col
-        _attach_modifier(obj)
+    link_chunks(obj)
     members = set(col.objects.keys())
 
     def get(name, shown):
@@ -181,6 +189,9 @@ def chunk_objects(obj, rt):
             _set_shown(ob, shown)
         if ob.name not in members:
             col.objects.link(ob)
+        if ob.parent != obj:
+            ob.parent = obj
+            ob.matrix_parent_inverse.identity()
         return ob
 
     out = []
@@ -218,13 +229,109 @@ def fronts(obj):
     return [o for o in col.objects if o.scale[0] >= 0.5] if col else []
 
 
-def _attach_modifier(obj):
-    ng = ensure_node_group()
-    mod = next((m for m in obj.modifiers if m.type == 'NODES' and m.node_group == ng), None)
-    if mod is None:
-        mod = obj.modifiers.new("VGEO Stream", 'NODES')
-        mod.node_group = ng
-    mod[modifier_socket_id(ng)] = obj.vgeo.collection
+def link_chunks(obj):
+    """Link the chunk collection next to the proxy (in every collection that holds it), drop the
+    old Geometry Nodes instancing if the file still has it, and give the proxy corner points."""
+    col = obj.vgeo.collection
+    if col is None:
+        return
+    if obj.library is None:
+        for m in [m for m in obj.modifiers if m.type == 'NODES' and m.node_group
+                  and m.node_group.name.startswith(NODE_GROUP)]:
+            obj.modifiers.remove(m)
+    holders = [c for c in obj.users_collection if c.library is None and c != col]
+    for c in holders:
+        if col.name not in c.children:
+            c.children.link(col)
+    # the proxy was moved to other collections: follow it
+    for parent in [c for c in bpy.data.collections if col.name in c.children and c not in holders]:
+        parent.children.unlink(col)
+    for scene in bpy.data.scenes:
+        master = scene.collection
+        if col.name in master.children and master not in holders:
+            master.children.unlink(col)
+    _proxy_bounds(obj)
+
+
+def _proxy_bounds(obj):
+    """Eight loose points at the asset's bounds: nothing is drawn or rendered, but Frame Selected
+    and bounding boxes see the whole asset."""
+    me = obj.data
+    if me is None or me.library is not None or len(me.vertices) >= 8:
+        return
+    rt = _runtimes.get(obj.vgeo.uid)
+    if rt is None or rt.asset is None:
+        return
+    lo, hi = rt.asset.info["aabb_min"], rt.asset.info["aabb_max"]
+    co = [(x, y, z) for x in (lo[0], hi[0]) for y in (lo[1], hi[1]) for z in (lo[2], hi[2])]
+    me.clear_geometry()
+    me.vertices.add(8)
+    me.vertices.foreach_set("co", [c for p in co for c in p])
+    me.update()
+
+
+def _layer_collection(lc, col):
+    if lc.collection == col:
+        return lc
+    for child in lc.children:
+        found = _layer_collection(child, col)
+        if found is not None:
+            return found
+    return None
+
+
+def sync_visibility(obj, view_layer=None):
+    """Chunks show and render only when the proxy does (the eye, the monitor and the camera)."""
+    col = obj.vgeo.collection
+    if col is None or col.library is not None:
+        return
+    if col.hide_render != obj.hide_render:
+        col.hide_render = obj.hide_render
+    if col.hide_viewport != obj.hide_viewport:
+        col.hide_viewport = obj.hide_viewport
+    vl = view_layer or bpy.context.view_layer
+    if vl is None:
+        return
+    lc = _layer_collection(vl.layer_collection, col)
+    if lc is not None:
+        try:
+            hidden = obj.hide_get(view_layer=vl)
+        except RuntimeError:  # proxy not in this view layer
+            return
+        if lc.hide_viewport != hidden:
+            lc.hide_viewport = hidden
+
+
+def redirect_selection(view_layer=None):
+    """Clicking the surface picks a chunk object: select its proxy instead."""
+    vl = view_layer or bpy.context.view_layer
+    if vl is None:
+        return
+    active = vl.objects.active
+    for ob in list(vl.objects.selected):
+        p = ob.parent
+        if p is not None and p.vgeo.uid and ob.name.startswith(f"vgeo.{p.vgeo.uid}."):
+            ob.select_set(False)
+            try:
+                p.select_set(True)
+            except RuntimeError:
+                continue
+            if active == ob:
+                vl.objects.active = p
+
+
+def unlink_orphans():
+    """Chunk collections whose proxy was deleted would stay visible: unlink them."""
+    owned = {o.vgeo.collection.name for o in bpy.data.objects
+             if o.vgeo.uid and o.vgeo.collection is not None and o.users}
+    for col in bpy.data.collections:
+        if not col.name.startswith(".vgeo ") or col.name in owned or col.library is not None:
+            continue
+        for parent in [c for c in bpy.data.collections if col.name in c.children]:
+            parent.children.unlink(col)
+        for scene in bpy.data.scenes:
+            if col.name in scene.collection.children:
+                scene.collection.children.unlink(col)
 
 
 # ---------------------------------------------------------------- views
@@ -255,10 +362,9 @@ def viewport_strategy():
     """How the live loop should land updates, given what the 3D views show.
 
     CYCLES: some view renders with Cycles (update once the view settles)
-    BATCH:  some view uses EEVEE (Material Preview, or Rendered with EEVEE)
-    STAGED: only Solid/Wireframe views
+    STAGED: everything else. EEVEE used to need BATCH (see the module notes);
+            with chunks as separate objects, staging is about 4x cheaper there.
     """
-    result = 'STAGED'
     for win in bpy.context.window_manager.windows:
         if win.screen is None:
             continue
@@ -266,12 +372,9 @@ def viewport_strategy():
         for area in win.screen.areas:
             if area.type != 'VIEW_3D':
                 continue
-            shading = area.spaces.active.shading.type
-            if shading == 'RENDERED' and engine == 'CYCLES':
+            if area.spaces.active.shading.type == 'RENDERED' and engine == 'CYCLES':
                 return 'CYCLES'
-            if shading in ('MATERIAL', 'RENDERED'):
-                result = 'BATCH'
-    return result
+    return 'STAGED'
 
 
 def camera_view(scene, depsgraph=None):
@@ -504,9 +607,10 @@ def stream_step(obj, views, pixel_error, mode="COARSEN", offscreen_scale=8.0, bu
     strategy STAGED (Solid/Workbench): build into the hidden backs, which are
       drawn at zero size so Blender prepares them as they fill; landing is a
       scale flip. Steady frames, no spike.
-    strategy BATCH (EEVEE): EEVEE pays heavily for every frame in which any
-      geometry changes, so build into unlinked spare meshes (free per frame)
-      and land them in one frame by reassigning the fronts' mesh data.
+    strategy BATCH: build into unlinked spare meshes and land them in one frame
+      by reassigning the fronts' mesh data. EEVEE needed it while chunks were
+      instanced through Geometry Nodes; now it only serves callers that want
+      the fewest geometry-changing frames (its landing frame is the dearest).
     """
     rt = runtime_for(obj)
     if rt.asset is None:
@@ -705,6 +809,8 @@ def update_for_render(scene, depsgraph=None):
     if view is None:
         return
     for obj in proxies(scene):
+        if obj.vgeo.collection is not None:
+            sync_visibility(obj)
         if obj.hide_render:
             continue
         # final renders never cull: off-screen geometry still casts shadows and shows in reflections
@@ -718,6 +824,34 @@ def update_for_render(scene, depsgraph=None):
 
 # ---------------------------------------------------------------- live loop
 
+_last_orphan_check = 0.0
+
+
+def _orphan_check():
+    """At most once a second: returns True when the check ran."""
+    global _last_orphan_check
+    now = time.perf_counter()
+    if now - _last_orphan_check < 1.0:
+        return False
+    _last_orphan_check = now
+    unlink_orphans()
+    return True
+
+
+def _housekeeping(objs, vl):
+    """Selection, visibility and collection links of the chunks follow the proxy."""
+    redirect_selection(vl)
+    for obj in proxies():
+        if obj.vgeo.collection is not None:
+            sync_visibility(obj, vl)
+    if _orphan_check():
+        for obj in objs:
+            col = obj.vgeo.collection
+            if col is not None and obj.library is None and any(
+                    col.name not in c.children for c in obj.users_collection):
+                link_chunks(obj)
+
+
 def _tick():
     if _rendering:
         return 0.25
@@ -726,11 +860,13 @@ def _tick():
         objs = [o for o in proxies() if not o.vgeo.freeze]
         insts = [o for o in instances.instancers() if not o.vgeo_inst.freeze]
         if not objs and not insts:
+            _orphan_check()  # a deleted proxy's chunks must not linger
             return 0.5
+        vl = bpy.context.view_layer
+        _housekeeping(objs, vl)
         views = viewport_views()
         if not views:
             return 0.25
-        vl = bpy.context.view_layer
         for inst in insts:   # per-placement level choice: cheap, no geometry is rebuilt
             try:
                 if vl is None or inst.visible_get(view_layer=vl):
