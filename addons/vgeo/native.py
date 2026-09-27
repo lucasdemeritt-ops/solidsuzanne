@@ -153,6 +153,9 @@ def lib():
         L.vgeo_memory.restype = c.c_int
         L.vgeo_corrupt.argtypes = [c.c_void_p]
         L.vgeo_corrupt.restype = c.c_int
+        L.vgeo_export_web_paged.argtypes = [c.c_void_p, c.c_char_p, c.c_uint32, c.POINTER(c.c_uint64),
+                                            c.c_char_p, c.c_int]
+        L.vgeo_export_web_paged.restype = c.c_int
     _lib = L
     return L
 
@@ -344,11 +347,20 @@ class Asset:
         res["tri_count"] = len(res["face_materials"])
         return res
 
-    def export_web(self, path):
-        """Write the compact web variant (.vgeow); returns its size in bytes."""
+    def export_web(self, path, paged=False, page_vertices=0):
+        """Write the compact web variant (.vgeow); returns its size in bytes.
+
+        paged: version 2, split into pages ordered coarse to fine, which the viewer loads with
+        HTTP range requests as the view needs them (the viewer from this version reads both)."""
+        L = lib()
         size = ctypes.c_uint64(0)
         err = ctypes.create_string_buffer(MAX_ERR)
-        if lib().vgeo_export_web(self._h, path.encode("utf-8"), ctypes.byref(size), err, MAX_ERR) != 0:
+        if paged and hasattr(L, "vgeo_export_web_paged"):
+            rc = L.vgeo_export_web_paged(self._h, path.encode("utf-8"), int(page_vertices), ctypes.byref(size),
+                                         err, MAX_ERR)
+        else:
+            rc = L.vgeo_export_web(self._h, path.encode("utf-8"), ctypes.byref(size), err, MAX_ERR)
+        if rc != 0:
             raise RuntimeError(err.value.decode("utf-8", "replace") or "vgeo_export_web failed")
         return size.value
 

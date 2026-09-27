@@ -410,6 +410,11 @@ def run():
           and res["files"][-1].endswith(".html") and res["files"][-1] != "index.html", res["files"][-1])
     check("web asset smaller than .vgeo", res["bytes"] < os.path.getsize(stream.asset_path(proxy)),
           f"{res['bytes'] / 2**20:.1f} MB")
+    head = open(os.path.join(web_dir, res["asset"]), "rb").read(160)
+    import struct as _st
+    version, pages, roots = _st.unpack_from("<I", head, 8)[0], _st.unpack_from("<I", head, 100)[0],         _st.unpack_from("<I", head, 124)[0]
+    check("web export is paged (range-request streaming)", version == 2 and pages > 1 and 1 <= roots <= pages,
+          f"{pages} pages, {roots} root")
     with open(os.path.join(web_dir, "last_web.txt"), "w") as f:
         f.write(res["files"][-1])
 

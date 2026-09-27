@@ -135,7 +135,7 @@ Terrain asset (1.2 GB, 33.5M triangles), two handles, plain Python
 | Process private memory after opening two handles | +2.7 GB | +15 MB |
 | Extract a close-up cut (6.4M tris), warm cache | 1.15 s | 0.98 s |
 | Extract full detail (33.5M tris), warm cache | 4.9 s | 3.3 s |
-| Same, first run after boot-level cold cache | | 1.5 s / 6.1 s |
+| Same, first mapped run (pages not yet in memory) | | 1.5 s / 6.1 s |
 
 On Windows the file stays open (shared for reading and deleting) while a
 handle is open; Reload or Restore closes it.
@@ -184,7 +184,11 @@ Solid and EEVEE).
 applies the same cut rule per cluster and one indirect draw renders the
 result; its cut matches the native runtime to the triangle. **Export for Web**
 writes a compact `.vgeow` (meshopt-compressed, positions on a global 21-bit
-grid so cuts stay watertight) with the viewer and a page. See `web/README.md`.
+grid so cuts stay watertight) with the viewer and a page. The file is paged
+(`vgeo_export_web_paged`): the viewer loads the head and the root pages with
+range requests, shows the coarse levels at once and fetches finer pages as the
+view needs them; an instanced scene's nearest copies stream their own cut.
+See `web/README.md`.
 
 ## Using it
 

@@ -173,6 +173,13 @@ VGEO_API int vgeo_corrupt(void* handle);
 // viewer reads directly. Returns 0 on success.
 VGEO_API int vgeo_export_web(void* handle, const char* path_utf8, uint64_t* out_bytes, char* err, int err_len);
 
+// The same, as .vgeow version 2: split into pages of whole groups (about
+// page_vertices vertices each, 0 = 4096), ordered coarse to fine, so a viewer
+// can load the head, show the coarse levels and fetch finer pages with HTTP
+// range requests as the view needs them. Returns 0 on success.
+VGEO_API int vgeo_export_web_paged(void* handle, const char* path_utf8, uint32_t page_vertices,
+                                   uint64_t* out_bytes, char* err, int err_len);
+
 VGEO_API int vgeo_version(void);
 
 #ifdef __cplusplus

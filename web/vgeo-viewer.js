@@ -13,6 +13,13 @@
 // indirect instanced draw then renders every visible cluster, pulling vertices
 // straight from storage buffers. The CPU never touches the geometry after
 // upload, so the cost per frame does not depend on how much the view changed.
+//
+// Paged .vgeow files (version 2) stream too: the viewer fetches the head and the
+// root pages with HTTP range requests, draws the coarse levels at once, and
+// fetches finer pages as the view needs them. A group whose page (or a parent's
+// page) is missing counts as fine enough, so its coarser stand-ins are drawn and
+// the cut stays crack-free while pages arrive. Servers that ignore range
+// requests simply send the whole file.
 
 // GPU layout, shared by both file formats:
 //   clusters  12 u32: vertex offset, triangle offset, group, refined, vcount | tcount << 16, depth,
@@ -22,6 +29,7 @@
 //   triangles  1 u32: i0 | i1 << 8 | i2 << 16 | material << 24 (cluster-local indices)
 const CLUSTER_U32 = 12;
 const GROUP_U32 = 8;
+const PAGE_U32 = 12;
 const GRID_MAX = (1 << 21) - 1;
 
 function readMaterials(buffer, dv, p, h) {
@@ -68,9 +76,9 @@ export function parseVGEO(buffer) {
     let maxTris = 0;
     for (let i = 0; i < h.clusterCount; i++) maxTris = Math.max(maxTris, cl[i * 10 + 1]);
     h.maxClusterTris = maxTris;
-  } else if (magic === "VGEOW") {
+  } else if (magic === "VGEOW" && u32(8) === 1) {
     h = {
-      format: "vgeow", version: u32(8),
+      format: "vgeow", version: 1,
       clusterCount: u32(16), groupCount: u32(20), vertexCount: u32(24), triangleCount: u32(28),
       materialCount: u32(32), lodLevels: u32(36), sourceTriangles: u32(40), maxClusterTris: u32(44),
       aabbMin: [f32(48), f32(52), f32(56)], aabbMax: [f32(60), f32(64), f32(68)],
@@ -79,11 +87,32 @@ export function parseVGEO(buffer) {
       offMaterials: u32(104), fileSize: u32(108), vertexBytes: u32(112), triangleBytes: u32(116),
       flags: u32(120),
     };
-    if (h.version !== 1) throw new Error("unsupported VGEOW version " + h.version);
+  } else if (magic === "VGEOW" && u32(8) === 2) {
+    // paged: the buffer may hold only the head (everything before the first page)
+    h = {
+      format: "vgeow", version: 2, paged: true,
+      clusterCount: u32(16), groupCount: u32(20), vertexCount: u32(24), triangleCount: u32(28),
+      materialCount: u32(32), lodLevels: u32(36), sourceTriangles: u32(40), maxClusterTris: u32(44),
+      aabbMin: [f32(48), f32(52), f32(56)], aabbMax: [f32(60), f32(64), f32(68)],
+      gridOrigin: [f32(72), f32(76), f32(80)], gridStep: f32(84),
+      offClusters: u32(88), offGroups: u32(92), offPages: u32(96), pageCount: u32(100),
+      offMaterials: u32(104), headBytes: u32(108), fileSize: u64(112), flags: u32(120), rootPages: u32(124),
+    };
+    if (buffer.byteLength < h.headBytes) throw new Error("truncated VGEO head");
+    const t = new Uint32Array(buffer, h.offPages, h.pageCount * PAGE_U32);
+    h.pages = [];
+    for (let p = 0; p < h.pageCount; p++) {
+      const e = p * PAGE_U32;
+      h.pages.push({ g0: t[e], gn: t[e + 1], c0: t[e + 2], cn: t[e + 3], v0: t[e + 4], vn: t[e + 5],
+        t0: t[e + 6], tn: t[e + 7], offset: t[e + 8] + t[e + 9] * 2 ** 32, vbytes: t[e + 10], tbytes: t[e + 11] });
+    }
+    h.partial = buffer.byteLength < h.fileSize;
+  } else if (magic === "VGEOW") {
+    throw new Error("unsupported VGEOW version " + u32(8));
   } else {
     throw new Error("not a VGEO file");
   }
-  if (h.fileSize > buffer.byteLength) throw new Error("truncated VGEO file");
+  if (!h.paged && h.fileSize > buffer.byteLength) throw new Error("truncated VGEO file");
   readMaterials(buffer, dv, h.offMaterials, h);
   return h;
 }
@@ -106,9 +135,104 @@ function octEncode(x, y, z) {
   return (q(x) | (q(y) << 16)) >>> 0;
 }
 
-/** Decode either format into the shared GPU layout. */
-export async function toGPULayout(buffer, h = parseVGEO(buffer),
-                                  decoderUrl = new URL("./meshopt_decoder.mjs", import.meta.url)) {
+const DECODER_URL = new URL("./meshopt_decoder.mjs", import.meta.url);
+
+/** Decode one page of a paged .vgeow; `base` is the file offset of buffer[0]. */
+export async function decodePage(buffer, page, h, decoderUrl = DECODER_URL, base = 0) {
+  const vertices = new Uint32Array(page.vn * 4), triangles = new Uint32Array(page.tn);
+  const o = page.offset - base;
+  if (h.flags & 1) {
+    const { MeshoptDecoder } = await import(decoderUrl.href);
+    await MeshoptDecoder.ready;
+    if (page.vn) MeshoptDecoder.decodeVertexBuffer(new Uint8Array(vertices.buffer), page.vn, 16, new Uint8Array(buffer, o, page.vbytes));
+    if (page.tn) MeshoptDecoder.decodeVertexBuffer(new Uint8Array(triangles.buffer), page.tn, 4, new Uint8Array(buffer, o + page.vbytes, page.tbytes));
+  } else {
+    vertices.set(new Uint32Array(buffer.slice(o, o + page.vn * 16)));
+    triangles.set(new Uint32Array(buffer.slice(o + page.vbytes, o + page.vbytes + page.tn * 4)));
+  }
+  return { vertices, triangles };
+}
+
+/**
+ * Which groups of a paged asset the cut may refine into. A group is resident once its page
+ * and every parent group (the groups made by simplifying it) are resident: then a missing
+ * group always has a drawable coarser stand-in, whatever order pages arrive in.
+ */
+export class Residency {
+  constructor(layout, pages) {
+    const n = layout.groups.length / GROUP_U32;
+    this.groupCount = n;
+    this.pages = pages;
+    this.pageOfGroup = new Uint32Array(n);
+    pages.forEach((p, i) => this.pageOfGroup.fill(i, p.g0, p.g0 + p.gn));
+    // parents[g] = groups of the clusters simplified from g; children = the inverse
+    const c = layout.clusters, seen = new Set(), pairs = [];
+    for (let i = 0; i < c.length / CLUSTER_U32; i++) {
+      const r = c[i * CLUSTER_U32 + 3] | 0, g = c[i * CLUSTER_U32 + 2];
+      if (r < 0) continue;
+      const k = r * n + g;
+      if (!seen.has(k)) { seen.add(k); pairs.push(r, g); }
+    }
+    const csr = (from, to) => {
+      const off = new Uint32Array(n + 1);
+      for (let i = 0; i < pairs.length; i += 2) off[pairs[i + from] + 1]++;
+      for (let i = 0; i < n; i++) off[i + 1] += off[i];
+      const list = new Uint32Array(pairs.length / 2), fill = off.slice(0, n);
+      for (let i = 0; i < pairs.length; i += 2) list[fill[pairs[i + from]]++] = pairs[i + to];
+      return { off, list };
+    };
+    this.parents = csr(0, 1);
+    this.children = csr(1, 0);
+    this.loaded = new Uint8Array(pages.length);
+    this.resident = new Uint32Array(n);   // what the GPU cut reads (u32 per group)
+    this.residentCount = 0;
+  }
+  /** Mark pages loaded; returns true if any group became resident. */
+  markLoaded(pageIds) {
+    const stack = [];
+    for (const p of pageIds) {
+      this.loaded[p] = 1;
+      const pg = this.pages[p];
+      for (let g = pg.g0; g < pg.g0 + pg.gn; g++) stack.push(g);
+    }
+    const before = this.residentCount;
+    while (stack.length) {
+      const g = stack.pop();
+      if (this.resident[g] || !this.loaded[this.pageOfGroup[g]] || !this.parentsResident(g)) continue;
+      this.resident[g] = 1;
+      this.residentCount++;
+      const { off, list } = this.children;
+      for (let k = off[g]; k < off[g + 1]; k++) stack.push(list[k]);
+    }
+    return this.residentCount !== before;
+  }
+  parentsResident(g) {
+    const { off, list } = this.parents;
+    for (let k = off[g]; k < off[g + 1]; k++) if (!this.resident[list[k]]) return false;
+    return true;
+  }
+}
+
+/** Decode either format into the shared GPU layout. Paged files that are only partly in
+ * `buffer` come back without vertices/triangles (the viewer fills them page by page). */
+export async function toGPULayout(buffer, h = parseVGEO(buffer), decoderUrl = DECODER_URL) {
+  if (h.paged) {
+    const layout = {
+      clusters: new Uint32Array(buffer.slice(h.offClusters, h.offClusters + h.clusterCount * CLUSTER_U32 * 4)),
+      groups: new Uint32Array(buffer.slice(h.offGroups, h.offGroups + h.groupCount * GROUP_U32 * 4)),
+      vertices: null, triangles: null, gridOrigin: h.gridOrigin, gridStep: h.gridStep, pages: h.pages,
+    };
+    if (!h.partial) {
+      layout.vertices = new Uint32Array(h.vertexCount * 4);
+      layout.triangles = new Uint32Array(h.triangleCount);
+      for (const p of h.pages) {
+        const d = await decodePage(buffer, p, h, decoderUrl);
+        layout.vertices.set(d.vertices, p.v0 * 4);
+        layout.triangles.set(d.triangles, p.t0);
+      }
+    }
+    return layout;
+  }
   if (h.format === "vgeow") {
     const clusters = new Uint32Array(buffer.slice(h.offClusters, h.offClusters + h.clusterCount * CLUSTER_U32 * 4));
     const groups = new Uint32Array(buffer.slice(h.offGroups, h.offGroups + h.groupCount * GROUP_U32 * 4));
@@ -203,6 +327,7 @@ const SELECT_WGSL = ITEM_WGSL + /* wgsl */`
 @group(0) @binding(2) var<storage, read> groups : array<u32>;
 @group(0) @binding(3) var<storage, read_write> visible : array<u32>;
 @group(0) @binding(4) var<storage, read_write> args : array<atomic<u32>>;
+@group(0) @binding(5) var<storage, read> resident : array<u32>;   // per group (paged files)
 
 fn inFrustum(c : vec3f, r : f32) -> bool {
   for (var i = 0; i < 6; i++) {
@@ -212,6 +337,8 @@ fn inFrustum(c : vec3f, r : f32) -> bool {
 }
 
 fn groupPasses(g : u32) -> bool {
+  // not loaded yet: stop refining here, the coarser clusters made from it stand in
+  if (resident[g] == 0u) { return true; }
   let b = g * ${GROUP_U32}u;
   let e = bitcast<f32>(groups[b + 4u]);
   if (e > 1e37) { return false; }   // terminal group: never simplified further
@@ -508,6 +635,20 @@ async function fetchWithProgress(url, onProgress) {
   return out.buffer;
 }
 
+/** bytes [start, end) of a URL. partial: false when the server ignored the range (whole file). */
+async function fetchRange(url, start, end) {
+  const res = await fetch(url, { headers: { Range: `bytes=${start}-${end - 1}` } });
+  if (!res.ok) throw new Error(`${url}: HTTP ${res.status}`);
+  return { buffer: await res.arrayBuffer(), partial: res.status === 206 };
+}
+
+function concat(a, b) {
+  const out = new Uint8Array(a.byteLength + b.byteLength);
+  out.set(new Uint8Array(a), 0);
+  out.set(new Uint8Array(b), a.byteLength);
+  return out.buffer;
+}
+
 /** Whole-asset levels (what one instanced copy can show): error, clusters and triangles per level. */
 export function levelTables(layout) {
   const c = layout.clusters, g = new Float32Array(layout.groups.buffer, layout.groups.byteOffset, layout.groups.length);
@@ -544,16 +685,24 @@ export function levelTables(layout) {
 
 // ---------------------------------------------------------------- viewer
 
+// a copy seen up close wants level 0 (the whole asset at full detail); from this size on it gets
+// a streamed cut of its own instead (fine where you look, coarse elsewhere)
+const STREAM_MIN_TRIS = 20000;
+
 /**
  * Create a viewer on a canvas.
  * source: URL or ArrayBuffer of a .vgeow/.vgeo asset, or a scene: URL of a .json file or an object
  *   { objects: [{ src, matrix?: [16 column-major], instances?: url-of-float32-bin | [[16], ...] }] }
- *   (one placement streams its own cut; several placements pick a whole-asset level each).
+ *   (one placement streams its own cut; several placements pick a whole-asset level each, and the
+ *   nearest copies that want full detail get a streamed cut of their own).
  * options: pixelError (1), offscreenScale (8), materials ([{color:[r,g,b], roughness}] or by name),
  *          mode ('shaded' | 'lod' | 'clusters' | 'normals'), onProgress(fraction), onStats(stats),
  *          sun [x,y,z], exposure, fog density, background [r,g,b], interactive (true),
  *          camera start: target [x,y,z], distance, yaw, pitch, fov (vertical degrees) or fovX
- *          (horizontal degrees, vertical follows the canvas aspect), decoderUrl
+ *          (horizontal degrees, vertical follows the canvas aspect), decoderUrl,
+ *          streamedCopies (4: instanced copies that may stream their own cut),
+ *          streaming (true: fetch paged .vgeow files by range as the view needs them),
+ *          maxRequests (4: page requests in flight)
  */
 export async function createViewer(canvas, source, options = {}) {
   if (!navigator.gpu) throw new Error("WebGPU is not available in this browser");
@@ -573,19 +722,64 @@ export async function createViewer(canvas, source, options = {}) {
     scene = { objects: [{ src: source }] };
   }
   if (!scene.objects?.length) throw new Error("scene has no objects");
-  const decoderUrl = options.decoderUrl ? new URL(options.decoderUrl, location.href) : undefined;
+  const decoderUrl = options.decoderUrl ? new URL(options.decoderUrl, location.href) : DECODER_URL;
   const resolve = (u) => (typeof u === "string" ? new URL(u, base).href : u);
 
   // ---- load assets (each once) and placements
   const loaded = new Map();
   const nObj = scene.objects.length;
   let doneObj = 0;
+  const netStats = { bytes: 0 };
+  // Paged .vgeow over HTTP: the head, then the root pages (every group nothing coarser can stand
+  // in for); finer pages come later. Anything else (or a server without ranges): the whole file.
+  const whole = async (buffer) => {
+    const h = parseVGEO(buffer);
+    return { h, layout: await toGPULayout(buffer, h, decoderUrl) };
+  };
+  const loadPaged = async (url) => {
+    const first = await fetchRange(url, 0, 65536);
+    netStats.bytes += first.buffer.byteLength;
+    if (!first.partial) return whole(first.buffer);   // no range support: that was the whole file
+    const dv = new DataView(first.buffer);
+    const magic = String.fromCharCode(...new Uint8Array(first.buffer, 0, 5));
+    if (first.buffer.byteLength < 128 || magic !== "VGEOW" || dv.getUint32(8, true) !== 2) return null;
+    if (first.buffer.byteLength >= Number(dv.getBigUint64(112, true))) return whole(first.buffer);   // small file
+    let head = first.buffer;
+    const headBytes = dv.getUint32(108, true);
+    if (head.byteLength < headBytes) {
+      const rest = await fetchRange(url, head.byteLength, headBytes);
+      netStats.bytes += rest.buffer.byteLength;
+      head = concat(head, rest.buffer);
+    }
+    const h = parseVGEO(head.byteLength > headBytes ? head.slice(0, headBytes) : head);
+    const layout = await toGPULayout(head, h, decoderUrl);
+    const root = Math.max(1, h.rootPages);
+    const pg = h.pages.slice(0, root);
+    const end = pg.length ? pg[pg.length - 1].offset + pg[pg.length - 1].vbytes + pg[pg.length - 1].tbytes : headBytes;
+    let rootBuf = head.byteLength > headBytes ? head.slice(headBytes) : new ArrayBuffer(0);
+    const have = headBytes + rootBuf.byteLength;
+    if (end > have) {
+      const r = await fetchRange(url, have, end);
+      netStats.bytes += r.buffer.byteLength;
+      rootBuf = concat(rootBuf, r.buffer);
+    }
+    return { h, layout, paged: { url, rootPages: pg.map((_, i) => i), rootBuf, rootBase: headBytes } };
+  };
   const loadAsset = async (src) => {
     const key = typeof src === "string" ? resolve(src) : src;
     if (!loaded.has(key)) {
       loaded.set(key, (async () => {
+        if (typeof key === "string" && options.streaming !== false) {
+          try {
+            const p = await loadPaged(key);
+            if (p) return p;
+          } catch (e) {
+            if (!/HTTP/.test(e.message)) throw e;   // e.g. 416 on a tiny file: fall back to a plain fetch
+          }
+        }
         const buffer = typeof key === "string"
           ? await fetchWithProgress(key, (f) => options.onProgress?.((doneObj + f) / nObj)) : key;
+        if (typeof key === "string") netStats.bytes += buffer.byteLength;
         const h = parseVGEO(buffer);
         const layout = await toGPULayout(buffer, h, decoderUrl);
         return { h, layout };
@@ -613,8 +807,10 @@ export async function createViewer(canvas, source, options = {}) {
   }
 
   let need = 256;
-  for (const { layout } of await Promise.all(loaded.values())) {
-    need = Math.max(need, layout.vertices.byteLength, layout.triangles.byteLength, layout.clusters.byteLength);
+  for (const { h, layout } of await Promise.all(loaded.values())) {
+    const vb = layout.vertices ? layout.vertices.byteLength : h.vertexCount * 16;
+    const tb = layout.triangles ? layout.triangles.byteLength : h.triangleCount * 4;
+    need = Math.max(need, vb, tb, layout.clusters.byteLength);
   }
   if (need > adapter.limits.maxStorageBufferBindingSize) {
     throw new Error(`asset needs ${(need / 2 ** 20).toFixed(0)} MB buffers; this GPU allows ` +
@@ -641,7 +837,11 @@ export async function createViewer(canvas, source, options = {}) {
     owned.push(b);
     return b;
   };
-  const buffer = (size, usage) => { const b = device.createBuffer({ size: Math.max(16, size), usage }); owned.push(b); return b; };
+  const buffer = (size, usage) => {
+    const b = device.createBuffer({ size: Math.max(16, Math.ceil(size / 4) * 4), usage });
+    owned.push(b);
+    return b;
+  };
 
   const selectPipeline = device.createComputePipeline({
     layout: "auto", compute: { module: device.createShaderModule({ code: SELECT_WGSL }), entryPoint: "main" },
@@ -670,13 +870,25 @@ export async function createViewer(canvas, source, options = {}) {
   const assetGPU = (a) => {
     if (gpuAssets.has(a)) return gpuAssets.get(a);
     const { h, layout } = a;
+    const groupCount = layout.groups.length / GROUP_U32;
     const g = {
       h, layout,
       clusters: upload(layout.clusters), groups: upload(layout.groups),
-      vertices: upload(layout.vertices), triangles: upload(layout.triangles),
+      vertices: layout.vertices ? upload(layout.vertices) : buffer(h.vertexCount * 16, S.STORAGE | S.COPY_DST),
+      triangles: layout.triangles ? upload(layout.triangles) : buffer(h.triangleCount * 4, S.STORAGE | S.COPY_DST),
       look: buffer(16 + 64 * 16, S.UNIFORM | S.COPY_DST),
       lo: h.aabbMin, hi: h.aabbMax,
+      groupData: new Float32Array(layout.groups.buffer, layout.groups.byteOffset, layout.groups.length),
     };
+    if (a.paged) {
+      const res = new Residency(layout, h.pages);
+      g.paged = { url: a.paged.url, res, pages: h.pages, requested: new Uint8Array(h.pages.length),
+        inflight: 0, dirty: false, levelsDirty: true, finest: 0 };
+      g.resident = buffer(groupCount * 4, S.STORAGE | S.COPY_DST);
+      g.pendingPages = { buf: a.paged.rootBuf, base: a.paged.rootBase, ids: a.paged.rootPages };
+    } else {
+      g.resident = upload(new Uint32Array(groupCount).fill(1));
+    }
     g.center = [0, 1, 2].map((k) => (g.lo[k] + g.hi[k]) / 2);
     g.radius = Math.hypot(g.hi[0] - g.lo[0], g.hi[1] - g.lo[1], g.hi[2] - g.lo[2]) / 2 || 1;
     gpuAssets.set(a, g);
@@ -695,6 +907,39 @@ export async function createViewer(canvas, source, options = {}) {
     }
     device.queue.writeBuffer(g.look, 0, d);
   };
+  // pages that arrived: decode, write into the full-size streams, then publish residency
+  const installPages = async (g, buf, base, ids) => {
+    for (const id of ids) {
+      const p = g.paged.pages[id];
+      const d = await decodePage(buf, p, g.h, decoderUrl, base);
+      if (p.vn) device.queue.writeBuffer(g.vertices, p.v0 * 16, d.vertices);
+      if (p.tn) device.queue.writeBuffer(g.triangles, p.t0 * 4, d.triangles);
+    }
+    if (g.paged.res.markLoaded(ids)) {
+      device.queue.writeBuffer(g.resident, 0, g.paged.res.resident);
+      g.paged.levelsDirty = true;
+    }
+  };
+
+  // a streamed placement: its own cut, selected on the GPU every frame
+  const makeStreamer = (g) => {
+    const st = { kind: "streamed", g };
+    st.uniform = buffer(256, S.UNIFORM | S.COPY_DST);
+    st.visible = buffer(g.h.clusterCount * 4, S.STORAGE);
+    st.args = buffer(32, S.STORAGE | S.INDIRECT | S.COPY_DST | S.COPY_SRC);
+    st.data = new Float32Array(64);
+    st.selectBind = bind(selectPipeline, [st.uniform, g.clusters, g.groups, st.visible, st.args, g.resident]);
+    st.renderBind = bind(streamedPipeline, [globalBuf, st.uniform, g.clusters, g.triangles, g.vertices, st.visible, g.look]);
+    st.setModel = (m) => {
+      st.model = m;
+      st.normal = normalMatrix(m);
+      st.scale = maxScale(m);
+      st.inv = invert4(m);
+      st.data.set(m, 0);
+      st.data.set(st.normal, 16);
+    };
+    return st;
+  };
 
   // ---- draw items
   const items = [];
@@ -712,18 +957,9 @@ export async function createViewer(canvas, source, options = {}) {
       }
     }
     if (spec.matrices.length === 1) {
-      const it = { kind: "streamed", g, model: spec.matrices[0] };
-      it.normal = normalMatrix(it.model);
-      it.scale = maxScale(it.model);
-      it.inv = invert4(it.model);
-      it.uniform = buffer(256, S.UNIFORM | S.COPY_DST);
-      it.visible = buffer(g.h.clusterCount * 4, S.STORAGE);
-      it.args = buffer(32, S.STORAGE | S.INDIRECT | S.COPY_DST | S.COPY_SRC);
-      it.data = new Float32Array(64);
-      it.data.set(it.model, 0);
-      it.data.set(it.normal, 16);
-      it.selectBind = bind(selectPipeline, [it.uniform, g.clusters, g.groups, it.visible, it.args]);
-      it.renderBind = bind(streamedPipeline, [globalBuf, it.uniform, g.clusters, g.triangles, g.vertices, it.visible, g.look]);
+      const it = makeStreamer(g);
+      it.setModel(spec.matrices[0]);
+      it.active = true;
       items.push(it);
     } else {
       if (!g.levels) {
@@ -731,7 +967,7 @@ export async function createViewer(canvas, source, options = {}) {
         g.levelClusters = upload(g.levels.clusters);
       }
       const n = spec.matrices.length;
-      const it = { kind: "instanced", g, n };
+      const it = { kind: "instanced", g, n, models: spec.matrices };
       const mats = new Float32Array(n * 32);
       it.center = new Float32Array(n * 3);
       it.scale = new Float32Array(n);
@@ -745,6 +981,7 @@ export async function createViewer(canvas, source, options = {}) {
       it.instList = buffer(n * 4, S.STORAGE | S.COPY_DST);
       it.list = new Uint32Array(n);
       it.level = new Int32Array(n);
+      it.budget = new Float64Array(n);
       it.draws = [];
       const L = g.levels.errors.length;
       for (let l = 0; l < L; l++) {
@@ -752,11 +989,21 @@ export async function createViewer(canvas, source, options = {}) {
         it.draws.push({ u, bind: bind(instancedPipeline,
           [globalBuf, u, g.clusters, g.triangles, g.vertices, g.levelClusters, g.look, it.matrices, it.instList]) });
       }
+      const k = g.levels.tris[0] >= STREAM_MIN_TRIS ? Math.max(0, options.streamedCopies ?? 4) : 0;
+      it.slots = Array.from({ length: Math.min(k, n) }, () => makeStreamer(g));
       items.push(it);
     }
   }
   assets.forEach(writeAssetLook);
-  const readback = buffer(32 * Math.max(1, items.length), S.MAP_READ | S.COPY_DST);
+  for (const g of assets) {
+    if (g.pendingPages) {
+      await installPages(g, g.pendingPages.buf, g.pendingPages.base, g.pendingPages.ids);
+      for (const id of g.pendingPages.ids) g.paged.requested[id] = 1;
+      delete g.pendingPages;
+    }
+  }
+  const streamerCount = items.reduce((n, it) => n + (it.kind === "streamed" ? 1 : it.slots.length), 0);
+  const readback = buffer(32 * Math.max(1, streamerCount), S.MAP_READ | S.COPY_DST);
 
   // ---- camera: orbit, Z up (Blender convention)
   const center = [0, 1, 2].map((k) => (wlo[k] + whi[k]) / 2);
@@ -768,12 +1015,14 @@ export async function createViewer(canvas, source, options = {}) {
     fovy: (options.fov ?? 45) * Math.PI / 180,
   };
   let fovX = options.fovX || 0;
+  const pageTotal = assets.reduce((n, g) => n + (g.paged ? g.paged.pages.length : 0), 0);
   const state = {
     pixelError: options.pixelError ?? 1.0,
     offscreenScale: options.offscreenScale ?? 8.0,
     mode: options.mode ?? "shaded",
     frozen: false, running: true,
-    stats: { clusters: 0, triangles: 0, fps: 0, sourceTriangles, instances: 0 },
+    stats: { clusters: 0, triangles: 0, fps: 0, sourceTriangles, instances: 0, streamedCopies: 0,
+      bytesLoaded: 0, pagesLoaded: 0, pagesTotal: pageTotal },
   };
   const modes = { shaded: 0, lod: 1, clusters: 2, normals: 3 };
   const globalData = new Float32Array(48);
@@ -823,9 +1072,38 @@ export async function createViewer(canvas, source, options = {}) {
     }
   }
 
+  // the view as a streamed placement sees it (asset space), for the GPU cut and page requests
+  function updateStreamer(st, eye, worldPlanes, near, proj, threshold) {
+    const local = transformPoint(st.inv, eye);
+    st.data.set([...local, near / st.scale], 32);
+    st.data.set([proj, threshold, state.offscreenScale, st.g.h.clusterCount], 36);
+    const pl = options.cull === false ? worldPlanes : planesToLocal(worldPlanes, st.model);
+    for (let i = 0; i < 6; i++) st.data.set(pl[i], 40 + i * 4);
+    device.queue.writeBuffer(st.uniform, 0, st.data);
+  }
+
+  // finest whole-asset level whose clusters are all resident (paged assets)
+  function finestResident(g) {
+    const pg = g.paged;
+    if (!pg.levelsDirty) return pg.finest;
+    pg.levelsDirty = false;
+    const { offsets, counts, clusters } = g.levels, res = pg.res.resident, c = g.layout.clusters;
+    let finest = counts.length - 1;
+    for (let L = counts.length - 1; L >= 0; L--) {
+      let ok = true;
+      for (let k = offsets[L]; k < offsets[L] + counts[L] && ok; k++) ok = res[c[clusters[k] * CLUSTER_U32 + 2]] === 1;
+      if (!ok) break;
+      finest = L;
+    }
+    pg.finest = finest;
+    return finest;
+  }
+
   function chooseLevels(it, eye, planes, near, proj, threshold) {
     const g = it.g, errors = g.levels.errors, L = errors.length;
+    const floor = g.paged ? finestResident(g) : 0;
     const counts = new Uint32Array(L);
+    const want0 = [];
     let visibleN = 0;
     for (let i = 0; i < it.n; i++) {
       const cx = it.center[i * 3], cy = it.center[i * 3 + 1], cz = it.center[i * 3 + 2];
@@ -837,10 +1115,22 @@ export async function createViewer(canvas, source, options = {}) {
       const budget = threshold * d / (proj * 0.5) / it.scale[i];
       let l = 0;
       while (l + 1 < L && errors[l + 1] <= budget) l++;
-      it.level[i] = l;
-      counts[l]++;
-      visibleN++;
+      if (l < floor) g.paged.wantFiner = true;
+      if (l === 0 && it.slots.length) want0.push(i);
+      it.budget[i] = budget;
+      it.level[i] = Math.max(l, floor);
     }
+    // the nearest copies that want full detail stream a cut of their own
+    want0.sort((a, b) => it.budget[a] - it.budget[b]);
+    it.slots.forEach((st, k) => {
+      const i = want0[k];
+      st.active = i !== undefined;
+      if (!st.active) return;
+      if (st.placement !== i) { st.placement = i; st.setModel(it.models[i]); }
+      it.level[i] = -1;
+      updateStreamer(st, eye, planes, near, proj, threshold);
+    });
+    for (let i = 0; i < it.n; i++) if (it.level[i] >= 0) { counts[it.level[i]]++; visibleN++; }
     const offs = new Uint32Array(L);
     for (let l = 1; l < L; l++) offs[l] = offs[l - 1] + counts[l - 1];
     const fill = offs.slice();
@@ -853,7 +1143,73 @@ export async function createViewer(canvas, source, options = {}) {
       it.active.push({ l, count: counts[l] });
       instTris += g.levels.tris[l] * counts[l];
     }
-    instCount += visibleN;
+    instCount += visibleN + it.slots.filter((s) => s.active).length;
+  }
+
+  // ---- page streaming: which missing groups the current views refine into, most urgent first
+  function wantedPages(g, streamers) {
+    const pg = g.paged, res = pg.res, gd = g.groupData, want = new Map();
+    if (res.residentCount === res.groupCount) return [];
+    for (const st of streamers) {
+      const d = st.data, ex = d[32], ey = d[33], ez = d[34], zn = d[35], proj = d[36], t0 = d[37], off = d[38];
+      for (let k = 0; k < res.groupCount; k++) {
+        if (res.resident[k] || pg.requested[res.pageOfGroup[k]] || !res.parentsResident(k)) continue;
+        const b = k * GROUP_U32, e = gd[b + 4];
+        if (e > 1e37) continue;
+        const cx = gd[b], cy = gd[b + 1], cz = gd[b + 2], r = gd[b + 3];
+        let t = t0;
+        for (let p = 0; p < 6; p++) {
+          if (d[40 + p * 4] * cx + d[41 + p * 4] * cy + d[42 + p * 4] * cz + d[43 + p * 4] < -r) { t *= off; break; }
+        }
+        const err = e / Math.max(Math.hypot(cx - ex, cy - ey, cz - ez) - r, zn) * proj * 0.5;
+        if (err <= t) continue;   // fine enough: its members are not needed
+        const p = res.pageOfGroup[k], u = err / t;
+        if ((want.get(p) ?? 0) < u) want.set(p, u);
+      }
+    }
+    if (pg.wantFiner) {   // instanced copies: next pages in coarse-to-fine order
+      let n = 0;
+      for (let p = 0; p < pg.pages.length && n < 8; p++) if (!pg.requested[p]) { if (!want.has(p)) want.set(p, 0.5); n++; }
+    }
+    return [...want.entries()].sort((a, b) => b[1] - a[1]).map(([p]) => p);
+  }
+
+  function schedulePages(streamersByAsset) {
+    const maxReq = Math.max(1, options.maxRequests ?? 4);
+    for (const g of assets) {
+      const pg = g.paged;
+      if (!pg || pg.inflight >= maxReq) continue;
+      const order = wantedPages(g, streamersByAsset.get(g) || []);
+      pg.wantFiner = false;
+      const taken = new Set();
+      for (const p0 of order) {
+        if (pg.inflight >= maxReq) break;
+        if (taken.has(p0) || pg.requested[p0]) continue;
+        // extend to neighbouring wanted pages: one range, up to 512 KB
+        const wantSet = new Set(order);
+        let a = p0, b = p0;
+        const size = (x, y) => pg.pages[y].offset + pg.pages[y].vbytes + pg.pages[y].tbytes - pg.pages[x].offset;
+        while (b + 1 < pg.pages.length && wantSet.has(b + 1) && !pg.requested[b + 1] && size(a, b + 1) < 524288) b++;
+        while (a > 0 && wantSet.has(a - 1) && !pg.requested[a - 1] && size(a - 1, b) < 524288) a--;
+        const ids = [];
+        for (let p = a; p <= b; p++) { ids.push(p); pg.requested[p] = 1; taken.add(p); }
+        pg.inflight++;
+        const start = pg.pages[a].offset, end = start + size(a, b);
+        fetchRange(pg.url, start, end).then(async ({ buffer: buf, partial }) => {
+          netStats.bytes += buf.byteLength;
+          if (!partial) {   // the server sent the whole file: take every page from it
+            const all = pg.pages.map((_, i) => i).filter((i) => !pg.res.loaded[i]);
+            all.forEach((i) => { pg.requested[i] = 1; });
+            await installPages(g, buf, 0, all);
+          } else {
+            await installPages(g, buf, start, ids);
+          }
+        }).catch((e) => {
+          ids.forEach((p) => { pg.requested[p] = 0; });   // retry later
+          console.warn("VGEO page fetch failed:", e.message || e);
+        }).finally(() => { pg.inflight--; });
+      }
+    }
   }
 
   function render() {
@@ -885,29 +1241,34 @@ export async function createViewer(canvas, source, options = {}) {
       state.view = { eye, near, proj, threshold, height: canvas.height };
       instTris = 0; instCount = 0;
       for (const it of items) {
-        if (it.kind === "streamed") {
-          const local = transformPoint(it.inv, eye);
-          it.data.set([...local, near / it.scale], 32);
-          it.data.set([proj, threshold, state.offscreenScale, it.g.h.clusterCount], 36);
-          const pl = options.cull === false ? worldPlanes : planesToLocal(worldPlanes, it.model);
-          for (let i = 0; i < 6; i++) it.data.set(pl[i], 40 + i * 4);
-          device.queue.writeBuffer(it.uniform, 0, it.data);
-        } else {
-          chooseLevels(it, eye, worldPlanes, near, proj, threshold);
-        }
+        if (it.kind === "streamed") updateStreamer(it, eye, worldPlanes, near, proj, threshold);
+        else chooseLevels(it, eye, worldPlanes, near, proj, threshold);
       }
     }
+    // everything that runs the GPU cut this frame: streamed items and active streamed copies
+    const streamers = [];
+    for (const it of items) {
+      if (it.kind === "streamed") streamers.push(it);
+      else for (const st of it.slots) if (st.active) streamers.push(st);
+    }
+    if (!state.frozen && pageTotal && frame % 3 === 0) {
+      const byAsset = new Map();
+      for (const st of streamers) {
+        if (!byAsset.has(st.g)) byAsset.set(st.g, []);
+        byAsset.get(st.g).push(st);
+      }
+      schedulePages(byAsset);
+    }
     const args0 = new Uint32Array([maxTris * 3, 0, 0, 0, 0, 0, 0, 0]);
-    for (const it of items) if (it.kind === "streamed" && !state.frozen) device.queue.writeBuffer(it.args, 0, args0);
+    if (!state.frozen) for (const st of streamers) device.queue.writeBuffer(st.args, 0, args0);
 
     const enc = device.createCommandEncoder();
-    if (!state.frozen) {
+    if (!state.frozen && streamers.length) {
       const cpass = enc.beginComputePass();
       cpass.setPipeline(selectPipeline);
-      for (const it of items) {
-        if (it.kind !== "streamed") continue;
-        cpass.setBindGroup(0, it.selectBind);
-        const groups = Math.ceil(it.g.h.clusterCount / 64);
+      for (const st of streamers) {
+        cpass.setBindGroup(0, st.selectBind);
+        const groups = Math.ceil(st.g.h.clusterCount / 64);
         const gx = Math.min(groups, 65535);
         cpass.dispatchWorkgroups(gx, Math.ceil(groups / gx));
       }
@@ -919,35 +1280,38 @@ export async function createViewer(canvas, source, options = {}) {
         clearValue: { r: bg[0], g: bg[1], b: bg[2], a: 1 } }],
       depthStencilAttachment: { view: depth.createView(), depthClearValue: 0, depthLoadOp: "clear", depthStoreOp: "store" },
     });
+    for (const st of streamers) {
+      rpass.setPipeline(streamedPipeline);
+      rpass.setBindGroup(0, st.renderBind);
+      rpass.drawIndirect(st.args, 0);
+    }
     for (const it of items) {
-      if (it.kind === "streamed") {
-        rpass.setPipeline(streamedPipeline);
-        rpass.setBindGroup(0, it.renderBind);
-        rpass.drawIndirect(it.args, 0);
-      } else if (it.active) {
-        rpass.setPipeline(instancedPipeline);
-        for (const { l, count } of it.active) {
-          rpass.setBindGroup(0, it.draws[l].bind);
-          rpass.draw(maxTris * 3, it.g.levels.counts[l] * count);
-        }
+      if (it.kind !== "instanced" || !it.active) continue;
+      rpass.setPipeline(instancedPipeline);
+      for (const { l, count } of it.active) {
+        rpass.setBindGroup(0, it.draws[l].bind);
+        rpass.draw(maxTris * 3, it.g.levels.counts[l] * count);
       }
     }
     rpass.end();
-    const streamedItems = items.filter((it) => it.kind === "streamed");
     const readNow = !reading && frame % 10 === 0;
-    if (readNow) streamedItems.forEach((it, k) => enc.copyBufferToBuffer(it.args, 0, readback, k * 32, 32));
+    if (readNow) streamers.forEach((st, k) => enc.copyBufferToBuffer(st.args, 0, readback, k * 32, 32));
     device.queue.submit([enc.finish()]);
     if (readNow) {
       reading = true;
-      const it2 = instTris, ic2 = instCount;
+      const it2 = instTris, ic2 = instCount, n = streamers.length;
+      const copies = streamers.filter((st) => items.indexOf(st) < 0).length;
       readback.mapAsync(GPUMapMode.READ).then(() => {
         const a = new Uint32Array(readback.getMappedRange().slice(0));
         readback.unmap();
         let cl = 0, tr = 0;
-        streamedItems.forEach((_, k) => { cl += a[k * 8 + 1]; tr += a[k * 8 + 4]; });
+        for (let k = 0; k < n; k++) { cl += a[k * 8 + 1]; tr += a[k * 8 + 4]; }
         state.stats.clusters = cl;
         state.stats.triangles = tr + it2;
         state.stats.instances = ic2;
+        state.stats.streamedCopies = copies;
+        state.stats.bytesLoaded = netStats.bytes;
+        state.stats.pagesLoaded = assets.reduce((s, g) => s + (g.paged ? g.paged.res.loaded.reduce((x, y) => x + y, 0) : 0), 0);
         reading = false;
         options.onStats?.(state.stats);
       }).catch(() => { reading = false; });
@@ -965,7 +1329,11 @@ export async function createViewer(canvas, source, options = {}) {
     assets: assets.map((g) => g.h),
     device,
     camera: cam,
-    get stats() { return state.stats; },
+    get stats() {
+      state.stats.bytesLoaded = netStats.bytes;
+      state.stats.pagesLoaded = assets.reduce((s, g) => s + (g.paged ? g.paged.res.loaded.reduce((x, y) => x + y, 0) : 0), 0);
+      return state.stats;
+    },
     get view() { return state.view; },
     setPixelError(px) { state.pixelError = px; },
     setMode(m) { state.mode = m; },

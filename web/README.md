@@ -38,23 +38,66 @@ by material name).
 
 ## Formats
 
-| | `.vgeo` (v2) | `.vgeow` (web) |
-|---|---|---|
-| Written by | Virtualize | Export for Web |
-| Vertices | shared, float32 | per cluster, 21-bit global grid, oct normals |
-| Streams | raw | meshopt-compressed |
-| 2.1M-triangle terrain | 75 MB (32 MB gzipped) | 33 MB |
+| | `.vgeo` (v2) | `.vgeow` v1 | `.vgeow` v2 (paged) |
+|---|---|---|---|
+| Written by | Virtualize | `build_web_asset()` (default) | Export for Web, `export_web(paged=True)` |
+| Vertices | shared, float32 | per cluster, 21-bit global grid, oct normals | same as v1 |
+| Streams | raw | one meshopt stream each | meshopt per page |
+| Loading | whole file | whole file | head + root pages, then pages on demand |
+| 2.1M-triangle terrain | 75 MB (32 MB gzipped) | 33 MB | 33 MB |
 
-Both decode to the same GPU layout. Positions sit on one global grid, so a
+All decode to the same GPU layout. Positions sit on one global grid, so a
 vertex shared by two clusters quantizes identically in both and cuts stay
 watertight (`tests/test_web_layout.mjs` welds decoded cuts and counts open
 edges). The in-browser conversion of `.vgeo` is bit-identical to the native
 exporter.
 
+## Streaming pages (HTTP range requests)
+
+A paged `.vgeow` holds a *head* (header, cluster and group tables, page
+table, materials) and then pages. Each page holds whole groups (a group's
+clusters load together), groups are ordered parents first (terminal groups,
+then deepest to finest, along a Morton curve within a level), and the
+leading *root pages* hold every terminal group.
+
+The viewer fetches the head and the root pages with range requests and draws
+at once: that is already a complete coarse model. Every few frames it
+compares the views with the group errors and requests the pages of groups
+the cut wants to refine into, most visible first, merging neighbouring pages
+into one request (4 in flight, `maxRequests`). The GPU cut treats a group
+whose page is missing as fine enough, so the coarser clusters made from it
+are drawn instead. A group only counts as resident once its page and all its
+parents' pages are, so any arrival order gives a valid, crack-free cut
+(`tests/test_web_paged.mjs` loads pages in random orders and welds every
+cut). Once the pages a view needs have arrived, the cut is exactly the v1
+file's.
+
+Terrain (2.1M triangles, 33 MB), 960x600 canvas (`tests/web/paged_check.mjs`):
+
+| | |
+|---|---|
+| Before the first frame | 1.8 MB (head 1.65 MB + root page), ~0.3 s locally |
+| Wide view, settled | 84 of 586 pages |
+| Close-up, settled | 193 pages, 12.4 MB of 33 MB (56 range requests) |
+| Settled cuts vs the v1 file | identical triangle and cluster counts |
+
+Servers without range support (e.g. `python -m http.server`) answer with the
+whole file, and the viewer simply uses it. `tests/web/range_server.mjs` is a
+small static server with ranges for local testing. `stats` reports
+`bytesLoaded`, `pagesLoaded` and `pagesTotal`.
+
+**Streamed copies.** In a scene with many placements of one asset, each copy
+draws a whole-asset level; the copies close enough to want level 0 (up to
+`streamedCopies`, default 4, for assets whose level 0 has 20k triangles or
+more) run the per-cluster GPU cut instead, like a single placement, in the
+same frame. Seen from 2.2 radii, the nearest of 400 boulders draws 682k
+triangles for the scene instead of 921k.
+
 ## Limits today
 
-- The whole file is downloaded and uploaded to the GPU; fine for assets up to a
-  few million triangles. Streaming clusters by page (HTTP range requests) is
-  the next step, and the per-cluster layout was chosen for it.
 - Needs WebGPU (current Chrome, Edge, Safari 26+, Firefox 141+ on Windows).
+- The head is not compressed: the cluster table is 48 bytes per cluster
+  (about 5% of a paged file).
+- GPU buffers are allocated at full size up front; paging saves download,
+  not GPU memory.
 - Simple sun + sky lighting; no textures yet.

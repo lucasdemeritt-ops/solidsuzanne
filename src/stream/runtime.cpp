@@ -676,3 +676,278 @@ extern "C" VGEO_API int vgeo_export_web(void* handle, const char* path_utf8, uin
     if (out_bytes) *out_bytes = out.size();
     return 0;
 }
+
+// ---------------------------------------------------------------- paged web export
+//
+// .vgeow version 2: the same clusters and streams, split into pages that a viewer
+// can fetch with HTTP range requests. Every page holds whole groups (a group's
+// members are either all loaded or not), pages are ordered coarse to fine, and
+// groups are renumbered in page order so a page covers one contiguous group range.
+//
+//   header (160 bytes) | clusters | groups | page table | materials  <- the "head",
+//   fetched first in one request | page 0 | page 1 | ...
+//
+// A viewer treats a group whose page is missing as fine enough, so it draws the
+// coarser clusters made from it instead: the cut stays valid (and crack-free)
+// while pages arrive, provided the coarsest groups are loaded first.
+
+namespace {
+
+struct WebHeaderV2 {
+    char magic[8];            // "VGEOW\0\0\0"
+    uint32_t version;         // 2
+    uint32_t header_size;     // 160
+    uint32_t cluster_count;
+    uint32_t group_count;
+    uint32_t vertex_count;
+    uint32_t tri_count;
+    uint32_t material_count;
+    uint32_t lod_levels;
+    uint32_t source_triangles;
+    uint32_t max_cluster_tris;
+    float aabb_min[3];
+    float aabb_max[3];
+    float grid_origin[3];
+    float grid_step;
+    uint32_t off_clusters;    // 12 u32 per cluster, in page order
+    uint32_t off_groups;      // 8 u32 per group, renumbered in page order
+    uint32_t off_pages;       // 12 u32 per page (below)
+    uint32_t page_count;
+    uint32_t off_materials;
+    uint32_t head_bytes;      // everything before the first page
+    uint64_t file_size;
+    uint32_t flags;           // bit 0: page streams are meshopt-encoded
+    uint32_t root_pages;      // leading pages that hold every terminal group (load with the head)
+    uint32_t reserved[8];
+};
+static_assert(sizeof(WebHeaderV2) == 160, "WebHeaderV2 layout");
+
+// page table entry: group first, group count, cluster first, cluster count,
+// vertex first, vertex count, triangle first, triangle count,
+// data offset (low, high), vertex bytes, triangle bytes
+constexpr uint32_t kPageU32 = 12;
+
+inline uint32_t part1by2(uint32_t x) {
+    x &= 0x3FF;
+    x = (x | (x << 16)) & 0x030000FF;
+    x = (x | (x << 8)) & 0x0300F00F;
+    x = (x | (x << 4)) & 0x030C30C3;
+    x = (x | (x << 2)) & 0x09249249;
+    return x;
+}
+
+}  // namespace
+
+extern "C" VGEO_API int vgeo_export_web_paged(void* handle, const char* path_utf8, uint32_t page_vertices,
+                                              uint64_t* out_bytes, char* err, int err_len) {
+    Asset* a = static_cast<Asset*>(handle);
+    if (!a || !path_utf8) { set_err(err, err_len, "no asset or path"); return 1; }
+    const vgeo2::Header& h = a->h;
+    if (a->materials.size() > 256) { set_err(err, err_len, "web format supports at most 256 materials"); return 1; }
+    if (page_vertices == 0) page_vertices = 4096;
+
+    const float kMax = float((1u << 21) - 1);
+    float extent = 0.f;
+    for (int k = 0; k < 3; ++k) extent = std::max(extent, h.aabb_max[k] - h.aabb_min[k]);
+    const float step = extent > 0.f ? extent / kMax : 1.f;
+
+    // members of each group, and the group order: coarse (deep) first, then along a Morton curve
+    std::vector<std::vector<uint32_t>> members(h.group_count);
+    for (uint32_t i = 0; i < h.cluster_count; ++i) {
+        if (!cluster_ok(*a, i)) { set_err(err, err_len, "corrupt file (bad index)"); return 1; }
+        if (a->clusters[i].tri_count > 256) { set_err(err, err_len, "cluster larger than 256 triangles"); return 1; }
+        members[uint32_t(a->clusters[i].group)].push_back(i);
+    }
+    std::vector<uint32_t> order;
+    std::vector<uint64_t> key(h.group_count);
+    for (uint32_t g = 0; g < h.group_count; ++g) {
+        if (members[g].empty()) continue;
+        const vgeo2::Group& gr = a->groups[g];
+        uint32_t q[3];
+        for (int k = 0; k < 3; ++k) {
+            float t = extent > 0.f ? (gr.center[k] - h.aabb_min[k]) / extent : 0.f;
+            q[k] = uint32_t(std::max(0.f, std::min(1023.f, t * 1023.f)));
+        }
+        uint32_t morton = part1by2(q[0]) | (part1by2(q[1]) << 1) | (part1by2(q[2]) << 2);
+        // terminal groups (never simplified further) first: nothing coarser can stand in for them,
+        // so they must load with the head. Then deepest first: a parents-before-children order.
+        const uint64_t nonterminal = gr.error < FLT_MAX ? 1 : 0;
+        const uint64_t depth = uint64_t(std::min<int32_t>(std::max<int32_t>(gr.depth, 0), 0x3FFFFFFF));
+        key[g] = (nonterminal << 62) | ((0x3FFFFFFFull - depth) << 30) | morton;
+        order.push_back(g);
+    }
+    uint32_t terminal_groups = 0;
+    for (uint32_t g : order) terminal_groups += a->groups[g].error < FLT_MAX ? 0 : 1;
+    std::sort(order.begin(), order.end(), [&](uint32_t x, uint32_t y) { return key[x] < key[y]; });
+    std::vector<int32_t> new_group(h.group_count, -1);
+    for (uint32_t i = 0; i < order.size(); ++i) new_group[order[i]] = int32_t(i);
+
+    // pages: whole groups, closed once they reach page_vertices (cluster-local vertices)
+    struct Page { uint32_t g0, gn, c0, cn, v0, vn, t0, tn; std::vector<uint8_t> venc, tenc; };
+    std::vector<Page> pages;
+    std::vector<uint32_t> clusters;                 // 12 u32 each, new order
+    std::vector<uint32_t> verts, tris;              // current page's raw streams
+    std::vector<int32_t> local(h.vertex_count, -1);
+    std::vector<uint32_t> touched;
+    uint32_t vtotal = 0, ttotal = 0, max_tris = 0;
+    auto encode = [](const std::vector<uint32_t>& data, size_t stride_bytes) {
+        const size_t count = data.size() * 4 / stride_bytes;
+        std::vector<uint8_t> enc(meshopt_encodeVertexBufferBound(count, stride_bytes));
+        enc.resize(meshopt_encodeVertexBufferLevel(enc.data(), enc.size(), data.data(), count, stride_bytes, 3, 1));
+        return enc;
+    };
+    Page cur = {};
+    auto close_page = [&]() {
+        cur.vn = vtotal - cur.v0;
+        cur.tn = ttotal - cur.t0;
+        cur.cn = uint32_t(clusters.size() / 12) - cur.c0;
+        cur.venc = encode(verts, 16);
+        cur.tenc = encode(tris, 4);
+        const uint32_t g_next = cur.g0 + cur.gn;
+        pages.push_back(std::move(cur));
+        cur = {};
+        cur.g0 = g_next;
+        cur.c0 = uint32_t(clusters.size() / 12);
+        cur.v0 = vtotal;
+        cur.t0 = ttotal;
+        verts.clear();
+        tris.clear();
+    };
+    for (uint32_t gi = 0; gi < order.size(); ++gi) {
+        for (uint32_t id : members[order[gi]]) {
+            const vgeo2::Cluster& c = a->clusters[id];
+            const uint32_t vtx_off = vtotal, tri_off = ttotal;
+            touched.clear();
+            const uint32_t* idx = a->indices + c.index_offset;
+            for (uint32_t t = 0; t < c.tri_count; ++t) {
+                uint32_t lv[3];
+                for (int j = 0; j < 3; ++j) {
+                    uint32_t v = idx[t * 3 + j];
+                    if (local[v] < 0) {
+                        local[v] = int32_t(touched.size());
+                        touched.push_back(v);
+                        const float* p = a->positions + size_t(v) * 3;
+                        for (int k = 0; k < 3; ++k) {
+                            float f = (p[k] - h.aabb_min[k]) / step;
+                            verts.push_back(uint32_t(std::lround(std::max(0.f, std::min(kMax, f)))));
+                        }
+                        const float* n = a->normals + size_t(v) * 3;
+                        verts.push_back(oct_encode(n[0], n[1], n[2]));
+                        ++vtotal;
+                    }
+                    lv[j] = uint32_t(local[v]);
+                }
+                if (touched.size() > 256) {
+                    for (uint32_t v : touched) local[v] = -1;
+                    set_err(err, err_len, "cluster with more than 256 vertices");
+                    return 1;
+                }
+                uint32_t mat = a->vmat[idx[t * 3]];
+                tris.push_back(lv[0] | (lv[1] << 8) | (lv[2] << 16) | (std::min(mat, 255u) << 24));
+                ++ttotal;
+            }
+            for (uint32_t v : touched) local[v] = -1;
+            uint32_t o[12] = {};
+            o[0] = vtx_off;
+            o[1] = tri_off;
+            o[2] = uint32_t(new_group[uint32_t(c.group)]);
+            o[3] = c.refined < 0 ? 0xFFFFFFFFu : uint32_t(new_group[uint32_t(c.refined)]);
+            o[4] = uint32_t(touched.size()) | (c.tri_count << 16);
+            o[5] = c.depth;
+            std::memcpy(&o[6], c.center, 12);
+            std::memcpy(&o[9], &c.radius, 4);
+            clusters.insert(clusters.end(), o, o + 12);
+            max_tris = std::max(max_tris, c.tri_count);
+        }
+        cur.gn += 1;
+        if (vtotal - cur.v0 >= page_vertices) close_page();
+    }
+    if (cur.gn) close_page();
+
+    std::vector<uint32_t> groups(size_t(order.size()) * 8);
+    for (uint32_t i = 0; i < order.size(); ++i) std::memcpy(&groups[size_t(i) * 8], &a->groups[order[i]], 32);
+
+    const uint8_t* mat_begin = a->base + h.off_materials;
+    const uint8_t* mat_end = a->base + std::min<uint64_t>(h.file_size, a->size);
+    std::vector<uint8_t> mat_section(mat_begin, mat_end);
+    while (!mat_section.empty() && mat_section.back() == 0) mat_section.pop_back();
+
+    WebHeaderV2 w = {};
+    std::memcpy(w.magic, "VGEOW\0\0\0", 8);
+    w.version = 2;
+    w.header_size = sizeof(WebHeaderV2);
+    w.cluster_count = uint32_t(clusters.size() / 12);
+    w.group_count = uint32_t(order.size());
+    w.vertex_count = vtotal;
+    w.tri_count = ttotal;
+    w.material_count = uint32_t(a->materials.size());
+    w.lod_levels = h.lod_levels;
+    w.source_triangles = h.source_triangles;
+    w.max_cluster_tris = max_tris;
+    std::memcpy(w.aabb_min, h.aabb_min, 12);
+    std::memcpy(w.aabb_max, h.aabb_max, 12);
+    std::memcpy(w.grid_origin, h.aabb_min, 12);
+    w.grid_step = step;
+    w.page_count = uint32_t(pages.size());
+    w.flags = 1;
+    // root pages: the leading pages that hold every terminal group (load them with the head)
+    uint32_t root_pages = 0;
+    while (root_pages < pages.size() && pages[root_pages].g0 < terminal_groups) ++root_pages;
+    w.root_pages = root_pages;
+
+    uint64_t off = sizeof(WebHeaderV2);
+    auto place = [&](uint64_t bytes) { uint64_t o = off; off = vgeo2::align16(off + bytes); return o; };
+    w.off_clusters = uint32_t(place(clusters.size() * 4));
+    w.off_groups = uint32_t(place(groups.size() * 4));
+    w.off_pages = uint32_t(place(uint64_t(pages.size()) * kPageU32 * 4));
+    w.off_materials = uint32_t(place(mat_section.size()));
+    if (off > 0xFFFFFFF0ull) { set_err(err, err_len, "head too large for the web format"); return 1; }
+    w.head_bytes = uint32_t(off);
+    std::vector<uint32_t> table(size_t(pages.size()) * kPageU32, 0);
+    for (size_t p = 0; p < pages.size(); ++p) {
+        const Page& pg = pages[p];
+        uint64_t data = off;
+        off = vgeo2::align16(off + pg.venc.size() + pg.tenc.size());
+        uint32_t* e = &table[p * kPageU32];
+        e[0] = pg.g0; e[1] = pg.gn; e[2] = pg.c0; e[3] = pg.cn;
+        e[4] = pg.v0; e[5] = pg.vn; e[6] = pg.t0; e[7] = pg.tn;
+        e[8] = uint32_t(data & 0xFFFFFFFFu); e[9] = uint32_t(data >> 32);
+        e[10] = uint32_t(pg.venc.size()); e[11] = uint32_t(pg.tenc.size());
+    }
+    w.file_size = off;
+
+    std::string tmp = std::string(path_utf8) + ".part";
+    FILE* f = vgeo_io::open_utf8(tmp.c_str(), "wb");
+    if (!f) { set_err(err, err_len, "cannot open for writing: " + tmp); return 1; }
+    bool ok = true;
+    uint64_t pos = 0;
+    auto put = [&](uint64_t at, const void* src, size_t n) {
+        static const uint8_t zeros[16] = {};
+        while (ok && pos < at) {
+            size_t pad = size_t(std::min<uint64_t>(16, at - pos));
+            ok = std::fwrite(zeros, 1, pad, f) == pad;
+            pos += pad;
+        }
+        if (ok && n) ok = std::fwrite(src, 1, n, f) == n;
+        pos += n;
+    };
+    put(0, &w, sizeof(w));
+    put(w.off_clusters, clusters.data(), clusters.size() * 4);
+    put(w.off_groups, groups.data(), groups.size() * 4);
+    put(w.off_pages, table.data(), table.size() * 4);
+    put(w.off_materials, mat_section.data(), mat_section.size());
+    for (size_t p = 0; p < pages.size(); ++p) {
+        uint64_t at = uint64_t(table[p * kPageU32 + 8]) | (uint64_t(table[p * kPageU32 + 9]) << 32);
+        put(at, pages[p].venc.data(), pages[p].venc.size());
+        put(at + pages[p].venc.size(), pages[p].tenc.data(), pages[p].tenc.size());
+    }
+    put(w.file_size, nullptr, 0);
+    ok = (std::fclose(f) == 0) && ok;
+    if (!ok || !vgeo_io::replace_utf8(tmp.c_str(), path_utf8)) {
+        vgeo_io::remove_utf8(tmp.c_str());
+        set_err(err, err_len, "write failed");
+        return 1;
+    }
+    if (out_bytes) *out_bytes = w.file_size;
+    return 0;
+}

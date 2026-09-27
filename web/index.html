@@ -30,6 +30,7 @@
   <div class="row"><span>Clusters</span><span id="cl">–</span></div>
   <div class="row"><span>LOD levels</span><span id="lv">–</span></div>
   <div class="row"><span>Frame rate</span><span id="fps">–</span></div>
+  <div class="row" id="netrow" hidden><span>Downloaded</span><span id="net">–</span></div>
   <label class="row"><span>Pixel error</span><span id="pxv">1.0 px</span></label>
   <input id="px" type="range" min="0.25" max="8" step="0.25" value="1">
   <div class="modes" role="group" aria-label="View">
@@ -61,6 +62,10 @@ async function open(source, label) {
         $("tri").textContent = `${fmt(s.triangles)} (${(100 * s.triangles / s.sourceTriangles).toFixed(1)}%)`;
         $("cl").textContent = fmt(s.clusters);
         $("fps").textContent = s.fps ? s.fps.toFixed(0) + " fps" : "–";
+        if (s.pagesTotal) {   // paged file: how much the views have needed so far
+          $("netrow").hidden = false;
+          $("net").textContent = `${(s.bytesLoaded / 2 ** 20).toFixed(1)} MB · ${s.pagesLoaded}/${s.pagesTotal} pages`;
+        }
         document.title = `VGEO Viewer · ${fmt(s.triangles)} tris`;
       },
     });

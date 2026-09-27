@@ -65,12 +65,15 @@ try {{
 """
 
 
-def build_web_asset(obj, path, depsgraph=None, max_triangles=128):
+def build_web_asset(obj, path, depsgraph=None, max_triangles=128, paged=False):
     """Write a .vgeow for any mesh object; returns {"bytes", "source_triangles", "aabb_min", "aabb_max"}.
 
     Public entry point for other add-ons (WebBlend's Streamed 3D target).
     A virtualized proxy exports from its existing .vgeo; a plain mesh is
     virtualized into a temporary .vgeo first (modifiers applied).
+    paged=True writes .vgeow version 2 (range-request streaming); it needs the
+    viewer from the same version, so callers that vendor an older viewer keep
+    the default.
     """
     import tempfile
     from . import build
@@ -89,7 +92,7 @@ def build_web_asset(obj, path, depsgraph=None, max_triangles=128):
                      indices=arrays["indices"], material_params=build.material_params(mats))
         asset = native.Asset(src)
     try:
-        size = asset.export_web(path)
+        size = asset.export_web(path, paged=paged)
         info = asset.info
         return {"bytes": size, "source_triangles": info["source_triangles"],
                 "aabb_min": list(info["aabb_min"]), "aabb_max": list(info["aabb_max"])}
@@ -159,7 +162,9 @@ def export(obj, directory, with_page=True):
     os.makedirs(directory, exist_ok=True)
     name = bpy.path.clean_name(obj.name) or "asset"
     asset = name + ".vgeow"
-    size = rt.asset.export_web(os.path.join(directory, asset))
+    # paged (.vgeow v2): the viewer copied next to it shows the coarse levels at once and fetches
+    # finer pages with range requests as the view needs them
+    size = rt.asset.export_web(os.path.join(directory, asset), paged=True)
     written = [asset]
     if with_page:
         src = viewer_dir()

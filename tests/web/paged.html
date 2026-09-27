@@ -1,0 +1,18 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>VGEO streaming check</title>
+<style>html,body{margin:0;height:100%} canvas{width:960px;height:600px;display:block}</style>
+<canvas id="c"></canvas>
+<script type="module">
+// Opens ?src= (an asset or scene .json) with ?opts= (JSON viewer options) and exposes the
+// viewer as window.viewer for tests/web/paged_check.mjs. window.loadMs: time to the viewer.
+import { createViewer } from "../../web/vgeo-viewer.js";
+const p = new URLSearchParams(location.search);
+const t0 = performance.now();
+try {
+  window.viewer = await createViewer(document.getElementById("c"), p.get("src"), JSON.parse(p.get("opts") || "{}"));
+  window.loadMs = performance.now() - t0;
+} catch (e) {
+  window.viewerError = String(e.message || e);
+}
+</script>
