@@ -143,6 +143,7 @@ def run():
     dg = bpy.context.evaluated_depsgraph_get()
     inst = sum(1 for i in dg.object_instances if i.is_instance and i.parent and i.parent.original == proxy)
     check("proxy instances chunk objects", inst == rt.asset.chunk_count, f"{inst} instances")
+    check("direct mesh writes verified", stream._fast_write is True)
 
     # cuts from the render camera at increasing distance
     counts = []
@@ -171,6 +172,20 @@ def run():
     pos, tris = cut_geometry(proxy)
     oe = open_edges(pos, tris)
     check("mixed cut is watertight", oe == 0, f"{oe} open edges, {len(tris)} tris")
+    # off-screen handling at cliff scale
+    view = stream.camera_view(scene)
+    stream.apply_cut(proxy, [view], 1.0, "FULL")
+    full = rt.triangles
+    stream.apply_cut(proxy, [view], 1.0, "COARSEN", 8.0)
+    coarse = rt.triangles
+    pos, tris = cut_geometry(proxy)
+    oe = open_edges(pos, tris)
+    check("coarsened off-screen is watertight", oe == 0, f"{oe} open edges")
+    check("coarsening saves triangles", coarse < full, f"{full:,} -> {coarse:,}")
+    stream.apply_cut(proxy, [view], 1.0, "CULL")
+    check("culling saves more", rt.triangles < coarse, f"{rt.triangles:,}")
+    stream.apply_cut(proxy, [view], 1.0, "FULL")
+
     scene.render.engine = "BLENDER_WORKBENCH"
     scene.display.shading.color_type = 'VERTEX'
     scene.render.filepath = os.path.join(OUT, "lod_cliff.png")
@@ -194,6 +209,36 @@ def run():
           f"{rt.last_rebuilt}/{rt.asset.chunk_count}")
     stream.apply_cut(proxy, [stream.camera_view(scene)], 1.0)
     check("unchanged view is a no-op", rt.last_rebuilt == 0 or rt.key is not None)
+
+    # incremental (live loop) path: nothing changes on screen until the swap, then it matches a direct cut
+    camera((0, -1.8, 0.3))
+    view = stream.camera_view(scene)
+    before = {o.name: o.data.name for o in proxy.vgeo.collection.objects}
+    tris_before = sum(len(o.data.polygons) for o in proxy.vgeo.collection.objects)
+    steps = 0
+    while stream.stream_step(proxy, [view], 1.0, "FULL", 8.0, budget=0.0005):
+        steps += 1
+        shown = sum(len(o.data.polygons) for o in proxy.vgeo.collection.objects)
+        if shown != tris_before:
+            break
+    check("incremental keeps old cut until swap", shown == tris_before if steps else True, f"{steps} steps")
+    while stream.stream_step(proxy, [view], 1.0, "FULL", 8.0, budget=0.0005):
+        steps += 1
+    inc = sum(len(o.data.polygons) for o in proxy.vgeo.collection.objects)
+    check("incremental ran in several steps", steps >= 2, f"{steps} steps, {rt.last_rebuilt} chunks")
+    check("incremental result matches stats", inc == rt.triangles, f"{inc} vs {rt.triangles}")
+    stream.apply_cut(proxy, [view], 1.0, "FULL", force=True)
+    check("incremental equals direct cut", inc == rt.triangles)
+    pos, tris = cut_geometry(proxy)
+    check("incremental cut watertight", open_edges(pos, tris) == 0)
+    check("no orphan chunk meshes", not [m for m in bpy.data.meshes if m.name.endswith(".next") or
+                                         (m.name.startswith("vgeo.") and m.users == 0)])
+    # an interrupted update is discarded cleanly
+    camera((0, -6, 0.3))
+    stream.stream_step(proxy, [stream.camera_view(scene)], 1.0, "FULL", 8.0, budget=0.0)
+    rt.invalidate()
+    check("interrupted update cleaned up", not rt.pending and
+          not [m for m in bpy.data.meshes if m.name.endswith(".next")])
 
     # material border survives simplification
     mats = set()
@@ -261,6 +306,35 @@ def run():
         check("corrupt file rejected", False)
     except RuntimeError as e:
         check("corrupt file rejected", True, str(e))
+
+    # indexed build path: smooth, no UVs, material border split automatically
+    from vgeo import build as vbuild
+    rock2 = dense_rock(7)
+    rock2.name = "Smooth"
+    while rock2.data.uv_layers:
+        rock2.data.uv_layers.remove(rock2.data.uv_layers[0])
+    arrays = vbuild.mesh_arrays(rock2, bpy.context.evaluated_depsgraph_get())
+    check("smooth mesh uses indexed layout", arrays["indices"] is not None,
+          f"{len(arrays['positions'])} verts")
+    bpy.context.view_layer.objects.active = rock2
+    rock2.select_set(True)
+    rc = bpy.ops.vgeo.virtualize()
+    p2 = bpy.context.active_object
+    check("indexed virtualize", rc == {'FINISHED'} and p2.vgeo.uid)
+    camera((0, -2.2, 0.4))
+    rt2 = stream.apply_cut(p2, [stream.camera_view(bpy.context.scene)], 2.0)
+    pos, tris = cut_geometry(p2)
+    check("indexed cut watertight", open_edges(pos, tris) == 0, f"{len(tris)} tris")
+    mats = set()
+    for ob in p2.vgeo.collection.objects:
+        me = ob.data
+        if "material_index" in me.attributes and len(me.polygons):
+            m = np.empty(len(me.polygons), np.int32)
+            me.attributes["material_index"].data.foreach_get("value", m)
+            mats.update(np.unique(m).tolist())
+    check("indexed keeps both materials", mats == {0, 1}, str(mats))
+    bpy.context.view_layer.objects.active = p2
+    bpy.ops.vgeo.restore()
 
     # restore brings the source back
     proxy.vgeo.path = proxy.vgeo.path  # keep

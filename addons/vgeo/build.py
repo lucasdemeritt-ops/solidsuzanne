@@ -10,7 +10,12 @@ from . import native, stream
 
 
 def mesh_arrays(obj, depsgraph):
-    """Per-corner triangle arrays of the evaluated mesh (modifiers applied), in object space."""
+    """Triangle arrays of the evaluated mesh (modifiers applied), in object space.
+
+    Returns a dict for native.build. Smooth meshes without UV seams use the
+    indexed layout (one row per vertex); anything with hard edges, split
+    normals or UV seams falls back to one row per triangle corner.
+    """
     ev = obj.evaluated_get(depsgraph)
     me = ev.to_mesh()
     try:
@@ -18,29 +23,43 @@ def mesh_arrays(obj, depsgraph):
         T = len(me.loop_triangles)
         if T == 0:
             raise ValueError(f"'{obj.name}' has no faces")
+        V, C = len(me.vertices), len(me.loops)
         tl = np.empty(T * 3, np.int32)
         me.loop_triangles.foreach_get("loops", tl)
         tp = np.empty(T, np.int32)
         me.loop_triangles.foreach_get("polygon_index", tp)
-        cv = np.empty(len(me.loops), np.int32)
+        cv = np.empty(C, np.int32)
         me.loops.foreach_get("vertex_index", cv)
-        co = np.empty(len(me.vertices) * 3, np.float32)
+        co = np.empty(V * 3, np.float32)
         me.vertices.foreach_get("co", co)
-        cn = np.empty(len(me.loops) * 3, np.float32)
+        co = co.reshape(-1, 3)
+        cn = np.empty(C * 3, np.float32)
         me.corner_normals.foreach_get("vector", cn)
-        positions = co.reshape(-1, 3)[cv[tl]]
-        normals = cn.reshape(-1, 3)[tl]
-        uvs = None
+        cn = cn.reshape(-1, 3)
+        uv = None
         layer = me.uv_layers.active
         if layer is not None:
-            uv = np.empty(len(me.loops) * 2, np.float32)
+            uv = np.empty(C * 2, np.float32)
             layer.data.foreach_get("uv", uv)
-            uvs = uv.reshape(-1, 2)[tl]
+            uv = uv.reshape(-1, 2)
         pm = np.empty(len(me.polygons), np.int32)
         me.polygons.foreach_get("material_index", pm)
         slots = max(1, len(obj.material_slots))
         materials = np.clip(pm[tp], 0, slots - 1).astype(np.uint16)
-        return positions, normals, uvs, materials
+
+        # per-vertex attributes taken from any corner of each vertex
+        first = np.full(V, -1, np.int64)
+        first[cv[::-1]] = np.arange(C - 1, -1, -1)
+        used = first >= 0
+        first = np.where(used, first, 0)
+        vn = cn[first]
+        smooth = np.allclose(cn, vn[cv], atol=1e-5)
+        seamless = uv is None or np.allclose(uv, uv[first][cv], atol=1e-6)
+        if smooth and seamless:
+            return {"positions": co, "normals": vn, "uvs": None if uv is None else uv[first],
+                    "materials": materials, "indices": cv[tl].astype(np.uint32)}
+        return {"positions": co[cv[tl]], "normals": cn[tl], "uvs": None if uv is None else uv[tl],
+                "materials": materials, "indices": None}
     finally:
         ev.to_mesh_clear()
 
@@ -77,9 +96,10 @@ class Job:
 
     def _run(self):
         try:
-            pos, nrm, uvs, mats = self.arrays
-            self.result = native.build(self.path, pos, nrm, uvs, mats, self.material_names,
-                                       max_triangles=self.max_triangles, progress=self._progress)
+            a = self.arrays
+            self.result = native.build(self.path, a["positions"], a["normals"], a["uvs"], a["materials"],
+                                       self.material_names, max_triangles=self.max_triangles,
+                                       progress=self._progress, indices=a["indices"])
         except BaseException as e:
             self.error = e
         finally:
@@ -117,7 +137,7 @@ def create_proxy(context, src, path_setting, uid, build_stats, remove_source=Fal
     if rt.asset is not None:
         views = stream.viewport_views() if context.window_manager.windows else []
         if views:
-            stream.apply_cut(proxy, views, v.pixel_error, frustum=v.frustum_cull)
+            stream.apply_cut(proxy, views, v.pixel_error, v.offscreen, v.offscreen_scale)
         else:
             stream.apply_level(proxy, -1)
 

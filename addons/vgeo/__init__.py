@@ -16,7 +16,7 @@ bl_info = {
 }
 
 import bpy
-from bpy.props import BoolProperty, FloatProperty, IntProperty, PointerProperty, StringProperty
+from bpy.props import BoolProperty, EnumProperty, FloatProperty, IntProperty, PointerProperty, StringProperty
 
 from . import build, native, stream
 
@@ -40,9 +40,15 @@ class VGEOObjectSettings(bpy.types.PropertyGroup):
     render_pixel_error: FloatProperty(name="Render Error", default=0.5, min=0.05, soft_max=4.0,
                                       subtype='PIXEL',
                                       description="Largest allowed geometric error in the final render, in pixels")
-    frustum_cull: BoolProperty(name="Cull Off-screen", default=False, update=_invalidate,
-                               description="Drop clusters outside the view (faster, but shadows and reflections "
-                                           "from off-screen geometry disappear in the viewport)")
+    offscreen: EnumProperty(
+        name="Off-screen", default='COARSEN', update=_invalidate,
+        items=[('COARSEN', "Coarsen", "Keep geometry outside the view at reduced detail, so it still casts "
+                                      "shadows and shows in reflections"),
+               ('CULL', "Cull", "Drop geometry outside the viewport (fastest; final renders coarsen instead)"),
+               ('FULL', "Full", "Treat off-screen geometry like on-screen geometry")])
+    offscreen_scale: FloatProperty(name="Off-screen Error", default=8.0, min=1.0, soft_max=64.0,
+                                   update=_invalidate,
+                                   description="Error multiplier for geometry outside the view")
     freeze: BoolProperty(name="Freeze", default=False,
                          description="Stop updating the cut as the view moves")
     lod_colors: BoolProperty(name="LOD Colors", default=False, update=_invalidate,
@@ -237,9 +243,12 @@ class VGEO_PT_panel(bpy.types.Panel):
         col.prop(v, "pixel_error")
         col.prop(v, "render_pixel_error")
         row = layout.row(align=True)
+        row.prop(v, "offscreen", expand=True)
+        if v.offscreen == 'COARSEN':
+            layout.prop(v, "offscreen_scale")
+        row = layout.row(align=True)
         row.prop(v, "freeze", toggle=True, icon='FREEZE')
-        row.prop(v, "frustum_cull", toggle=True)
-        layout.prop(v, "lod_colors")
+        row.prop(v, "lod_colors", toggle=True, icon='COLOR')
         layout.prop(v, "path")
         row = layout.row(align=True)
         row.operator(VGEO_OT_refresh.bl_idname, icon='FILE_REFRESH')

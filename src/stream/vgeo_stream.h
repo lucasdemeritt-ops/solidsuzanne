@@ -25,12 +25,21 @@ extern "C" {
 
 // ---------------------------------------------------------------- build
 
+// Two input layouts:
+//  - corner soup (indices == NULL): positions/normals/uvs hold one entry per
+//    triangle corner (tri_count*3); identical corners are welded.
+//  - indexed (indices != NULL): positions/normals/uvs hold vertex_count
+//    entries and indices holds tri_count*3 vertex indices. Much lighter for
+//    smooth meshes without UV seams (scans, terrain). Vertices on material
+//    borders are split automatically.
 typedef struct vgeo_build_input {
     uint32_t tri_count;
-    const float* positions;       // tri_count*3 corners * 3 floats
-    const float* normals;         // tri_count*3 corners * 3 floats, or NULL
-    const float* uvs;             // tri_count*3 corners * 2 floats, or NULL
+    const float* positions;       // 3 floats per corner (soup) or per vertex (indexed)
+    const float* normals;         // 3 floats per corner/vertex, or NULL
+    const float* uvs;             // 2 floats per corner/vertex, or NULL
     const uint16_t* materials;    // tri_count, or NULL
+    uint32_t vertex_count;        // indexed layout only
+    const uint32_t* indices;      // tri_count*3, or NULL for corner soup
     uint32_t material_count;
     const char* const* material_names;  // material_count UTF-8 strings, or NULL
     uint32_t max_triangles;       // triangles per cluster, 0 = 128
@@ -77,6 +86,14 @@ typedef struct vgeo_info {
 // perspective: proj = cot(fov_y / 2); ortho: ortho_height = visible height.
 // threshold is the allowed error as a fraction of the view height
 // (pixels / viewport height in pixels).
+//
+// frustum_mode (needs planes):
+//   0 = ignore the frustum
+//   1 = coarsen: groups entirely outside use threshold * offscreen_scale.
+//       Off-screen geometry stays (shadows, reflections) but at low detail.
+//       Still a valid cut: a group outside the frustum has all its finer
+//       groups outside too, so pass/fail stays monotonic.
+//   2 = cull: clusters outside are dropped
 typedef struct vgeo_view {
     float camera[3];
     float proj;
@@ -84,7 +101,8 @@ typedef struct vgeo_view {
     float threshold;
     int32_t ortho;
     float ortho_height;
-    int32_t use_frustum;
+    int32_t frustum_mode;
+    float offscreen_scale;
     float planes[6][4];           // inward-facing: dot(n, p) + d >= 0 inside
 } vgeo_view;
 
@@ -104,6 +122,11 @@ typedef struct vgeo_chunk_data {
     const int32_t* corner_verts;  // tri_count * 3
     const int32_t* face_materials;// tri_count
     const int32_t* face_lod;      // tri_count, DAG depth (for debug views)
+    // Blender-style edges: unique vertex pairs, and per corner the edge from
+    // that corner to the next corner of its triangle
+    uint32_t edge_count;
+    const int32_t* edge_verts;    // edge_count * 2
+    const int32_t* corner_edges;  // tri_count * 3
 } vgeo_chunk_data;
 
 VGEO_API void* vgeo_open(const char* path_utf8, char* err, int err_len);

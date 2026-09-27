@@ -39,7 +39,40 @@ struct Asset {
     uint32_t stamp_id = 0;
     std::vector<float> out_pos, out_nrm, out_uv;
     std::vector<int32_t> out_corner, out_mat, out_lod;
+    std::vector<int32_t> out_edges, out_corner_edge;
+    std::vector<uint64_t> edge_keys;
+    std::vector<int32_t> edge_ids;
 };
+
+// Unique edges of an indexed triangle list, Blender style.
+void build_edges(Asset& a, uint32_t vertex_count) {
+    const size_t corners = a.out_corner.size();
+    size_t cap = 16;
+    while (cap < corners * 2) cap <<= 1;  // ~1.5 edges per triangle, keep load < 50%
+    a.edge_keys.assign(cap, ~0ull);
+    a.edge_ids.resize(cap);
+    a.out_edges.clear();
+    a.out_corner_edge.resize(corners);
+    const uint64_t mask = cap - 1;
+    (void)vertex_count;
+    for (size_t t = 0; t < corners; t += 3) {
+        for (int j = 0; j < 3; ++j) {
+            uint32_t v0 = uint32_t(a.out_corner[t + j]);
+            uint32_t v1 = uint32_t(a.out_corner[t + (j + 1) % 3]);
+            uint64_t key = v0 < v1 ? (uint64_t(v0) << 32 | v1) : (uint64_t(v1) << 32 | v0);
+            uint64_t h = (key * 0x9E3779B97F4A7C15ull) >> 20;
+            size_t slot = size_t(h & mask);
+            while (a.edge_keys[slot] != ~0ull && a.edge_keys[slot] != key) slot = (slot + 1) & mask;
+            if (a.edge_keys[slot] == ~0ull) {
+                a.edge_keys[slot] = key;
+                a.edge_ids[slot] = int32_t(a.out_edges.size() / 2);
+                a.out_edges.push_back(int32_t(key >> 32));
+                a.out_edges.push_back(int32_t(key & 0xFFFFFFFFu));
+            }
+            a.out_corner_edge[t + j] = a.edge_ids[slot];
+        }
+    }
+}
 
 void set_err(char* err, int err_len, const std::string& msg) {
     if (err && err_len > 0) std::snprintf(err, size_t(err_len), "%s", msg.c_str());
@@ -47,6 +80,13 @@ void set_err(char* err, int err_len, const std::string& msg) {
 
 bool section_ok(const Asset& a, uint64_t off, uint64_t bytes) {
     return off >= sizeof(vgeo2::Header) && off <= a.blob.size() && bytes <= a.blob.size() - off;
+}
+
+inline bool in_frustum(const vgeo_view& v, const float* c, float r) {
+    for (int p = 0; p < 6; ++p)
+        if (v.planes[p][0] * c[0] + v.planes[p][1] * c[1] + v.planes[p][2] * c[2] + v.planes[p][3] < -r)
+            return false;
+    return true;
 }
 
 // projected error as a fraction of view height; FLT_MAX error never passes
@@ -62,23 +102,20 @@ inline bool group_passes(const vgeo2::Group& g, const vgeo_view* views, int view
             float d = std::sqrt(dx * dx + dy * dy + dz * dz) - g.radius;
             e = g.error / std::max(d, v.znear) * (v.proj * 0.5f);
         }
-        if (e > v.threshold) return false;
+        float t = v.threshold;
+        if (v.frustum_mode == 1 && v.offscreen_scale > 1.f && !in_frustum(v, g.center, g.radius))
+            t *= v.offscreen_scale;
+        if (e > t) return false;
     }
     return true;
 }
 
 inline bool sphere_visible(const float* c, float r, const vgeo_view* views, int view_count) {
-    bool any_frustum = false;
     for (int i = 0; i < view_count; ++i) {
         const vgeo_view& v = views[i];
-        if (!v.use_frustum) return true;  // a view without culling keeps everything
-        any_frustum = true;
-        bool inside = true;
-        for (int p = 0; p < 6 && inside; ++p)
-            inside = v.planes[p][0] * c[0] + v.planes[p][1] * c[1] + v.planes[p][2] * c[2] + v.planes[p][3] >= -r;
-        if (inside) return true;
+        if (v.frustum_mode != 2 || in_frustum(v, c, r)) return true;  // kept by at least one view
     }
-    return !any_frustum;
+    return false;
 }
 
 inline uint64_t mix(uint64_t x) {
@@ -290,6 +327,10 @@ extern "C" VGEO_API int vgeo_extract(void* handle, uint32_t chunk, vgeo_chunk_da
             a->out_lod.push_back(int32_t(c.depth));
         }
     }
+    build_edges(*a, uint32_t(next));
+    out->edge_count = uint32_t(a->out_edges.size() / 2);
+    out->edge_verts = a->out_edges.data();
+    out->corner_edges = a->out_corner_edge.data();
     out->vertex_count = uint32_t(next);
     out->tri_count = uint32_t(a->out_mat.size());
     out->positions = a->out_pos.data();

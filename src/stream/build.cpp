@@ -118,47 +118,111 @@ extern "C" VGEO_API int vgeo_build(const vgeo_build_input* in, const char* path_
     }
     auto report = [&](int stage, float p) -> bool { return progress && progress(user, stage, p) != 0; };
 
-    // ---- weld identical corners into shared vertices
+    std::vector<Vertex> vertices;
+    std::vector<unsigned int> indices;
     const size_t corner_count = size_t(in->tri_count) * 3;
-    std::vector<Vertex> corners(corner_count);
-    for (size_t i = 0; i < corner_count; ++i) {
-        Vertex& v = corners[i];
-        v.px = in->positions[i * 3 + 0];
-        v.py = in->positions[i * 3 + 1];
-        v.pz = in->positions[i * 3 + 2];
-        if (in->normals) {
-            v.nx = in->normals[i * 3 + 0];
-            v.ny = in->normals[i * 3 + 1];
-            v.nz = in->normals[i * 3 + 2];
-        } else {
-            v.nx = v.ny = v.nz = 0.f;
-        }
-        v.u = in->uvs ? in->uvs[i * 2 + 0] : 0.f;
-        v.v = in->uvs ? in->uvs[i * 2 + 1] : 0.f;
-        v.mat = in->materials ? float(in->materials[i / 3]) : 0.f;
-    }
-    if (!in->normals) {
-        // flat normals so the file is always complete
-        for (size_t t = 0; t < in->tri_count; ++t) {
-            Vertex* c = &corners[t * 3];
-            float e1[3] = {c[1].px - c[0].px, c[1].py - c[0].py, c[1].pz - c[0].pz};
-            float e2[3] = {c[2].px - c[0].px, c[2].py - c[0].py, c[2].pz - c[0].pz};
-            float n[3] = {e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]};
-            float l = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
-            if (l > 0.f) { n[0] /= l; n[1] /= l; n[2] /= l; }
-            for (int k = 0; k < 3; ++k) { c[k].nx = n[0]; c[k].ny = n[1]; c[k].nz = n[2]; }
-        }
-    }
     if (report(0, 0.f)) { set_err(err, err_len, "cancelled"); return 2; }
 
-    std::vector<unsigned int> remap(corner_count);
-    size_t vertex_count = meshopt_generateVertexRemap(remap.data(), nullptr, corner_count,
-                                                      corners.data(), corner_count, sizeof(Vertex));
-    std::vector<Vertex> vertices(vertex_count);
-    meshopt_remapVertexBuffer(vertices.data(), corners.data(), corner_count, sizeof(Vertex), remap.data());
-    std::vector<unsigned int> indices(remap);  // identity index buffer remapped == remap itself
-    corners.clear();
-    corners.shrink_to_fit();
+    if (in->indices) {
+        // ---- indexed input: vertices as given, split only where materials meet
+        const size_t vc = in->vertex_count;
+        if (vc == 0) { set_err(err, err_len, "indexed input without vertices"); return 1; }
+        for (size_t i = 0; i < corner_count; ++i)
+            if (in->indices[i] >= vc) { set_err(err, err_len, "index out of range"); return 1; }
+        vertices.resize(vc);
+        for (size_t i = 0; i < vc; ++i) {
+            Vertex& v = vertices[i];
+            v.px = in->positions[i * 3 + 0];
+            v.py = in->positions[i * 3 + 1];
+            v.pz = in->positions[i * 3 + 2];
+            v.nx = in->normals ? in->normals[i * 3 + 0] : 0.f;
+            v.ny = in->normals ? in->normals[i * 3 + 1] : 0.f;
+            v.nz = in->normals ? in->normals[i * 3 + 2] : 1.f;
+            v.u = in->uvs ? in->uvs[i * 2 + 0] : 0.f;
+            v.v = in->uvs ? in->uvs[i * 2 + 1] : 0.f;
+            v.mat = -1.f;  // unassigned
+        }
+        indices.assign(in->indices, in->indices + corner_count);
+        std::vector<std::pair<uint64_t, unsigned>> splits;  // (vertex<<16 | mat) -> new vertex
+        for (size_t i = 0; i < corner_count; ++i) {
+            unsigned v = indices[i];
+            float m = in->materials ? float(in->materials[i / 3]) : 0.f;
+            if (vertices[v].mat < 0.f) {
+                vertices[v].mat = m;
+            } else if (vertices[v].mat != m) {
+                splits.push_back({(uint64_t(v) << 16) | uint64_t(m), unsigned(i)});
+            }
+        }
+        if (!splits.empty()) {
+            std::sort(splits.begin(), splits.end());
+            uint64_t last = ~0ull;
+            unsigned nv = 0;
+            for (auto& s : splits) {
+                if (s.first != last) {
+                    last = s.first;
+                    Vertex copy = vertices[size_t(s.first >> 16)];
+                    copy.mat = float(s.first & 0xFFFF);
+                    nv = unsigned(vertices.size());
+                    vertices.push_back(copy);
+                }
+                indices[s.second] = nv;
+            }
+        }
+        for (Vertex& v : vertices)
+            if (v.mat < 0.f) v.mat = 0.f;  // unreferenced vertex
+        if (!in->normals) {
+            // area-weighted smooth normals
+            for (Vertex& v : vertices) v.nx = v.ny = v.nz = 0.f;
+            for (size_t t = 0; t < corner_count; t += 3) {
+                Vertex* c[3] = {&vertices[indices[t]], &vertices[indices[t + 1]], &vertices[indices[t + 2]]};
+                float e1[3] = {c[1]->px - c[0]->px, c[1]->py - c[0]->py, c[1]->pz - c[0]->pz};
+                float e2[3] = {c[2]->px - c[0]->px, c[2]->py - c[0]->py, c[2]->pz - c[0]->pz};
+                float n[3] = {e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]};
+                for (int k = 0; k < 3; ++k) { c[k]->nx += n[0]; c[k]->ny += n[1]; c[k]->nz += n[2]; }
+            }
+            for (Vertex& v : vertices) {
+                float l = std::sqrt(v.nx * v.nx + v.ny * v.ny + v.nz * v.nz);
+                if (l > 0.f) { v.nx /= l; v.ny /= l; v.nz /= l; } else { v.nz = 1.f; }
+            }
+        }
+    } else {
+        // ---- corner soup: weld identical corners into shared vertices
+        std::vector<Vertex> corners(corner_count);
+        for (size_t i = 0; i < corner_count; ++i) {
+            Vertex& v = corners[i];
+            v.px = in->positions[i * 3 + 0];
+            v.py = in->positions[i * 3 + 1];
+            v.pz = in->positions[i * 3 + 2];
+            if (in->normals) {
+                v.nx = in->normals[i * 3 + 0];
+                v.ny = in->normals[i * 3 + 1];
+                v.nz = in->normals[i * 3 + 2];
+            } else {
+                v.nx = v.ny = v.nz = 0.f;
+            }
+            v.u = in->uvs ? in->uvs[i * 2 + 0] : 0.f;
+            v.v = in->uvs ? in->uvs[i * 2 + 1] : 0.f;
+            v.mat = in->materials ? float(in->materials[i / 3]) : 0.f;
+        }
+        if (!in->normals) {
+            // flat normals so the file is always complete
+            for (size_t t = 0; t < in->tri_count; ++t) {
+                Vertex* c = &corners[t * 3];
+                float e1[3] = {c[1].px - c[0].px, c[1].py - c[0].py, c[1].pz - c[0].pz};
+                float e2[3] = {c[2].px - c[0].px, c[2].py - c[0].py, c[2].pz - c[0].pz};
+                float n[3] = {e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]};
+                float l = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+                if (l > 0.f) { n[0] /= l; n[1] /= l; n[2] /= l; }
+                for (int k = 0; k < 3; ++k) { c[k].nx = n[0]; c[k].ny = n[1]; c[k].nz = n[2]; }
+            }
+        }
+        std::vector<unsigned int> remap(corner_count);
+        size_t vertex_count = meshopt_generateVertexRemap(remap.data(), nullptr, corner_count,
+                                                          corners.data(), corner_count, sizeof(Vertex));
+        vertices.resize(vertex_count);
+        meshopt_remapVertexBuffer(vertices.data(), corners.data(), corner_count, sizeof(Vertex), remap.data());
+        indices.swap(remap);  // identity index buffer remapped == remap itself
+    }
 
     // drop degenerate triangles (same welded vertex twice) - they break nothing but waste clusters
     {

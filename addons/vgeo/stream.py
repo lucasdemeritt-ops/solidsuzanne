@@ -9,19 +9,20 @@ surface stays watertight. EEVEE, Cycles and Workbench render the chunks
 like any other mesh: full materials, lights, shadows, ray tracing.
 """
 
-import math
+import ctypes
 import time
 import uuid
 
 import bpy
 import numpy as np
 from bpy.app.handlers import persistent
-from mathutils import Matrix, Vector
+from mathutils import Vector
 
 from . import native
 
 NODE_GROUP = "VGEO Stream"
-TICK = 0.1
+TICK = 0.1           # seconds between view checks when idle
+TICK_BUDGET = 0.014  # seconds of mesh building per tick while an update is in flight
 
 _runtimes = {}       # uid -> Runtime
 _rendering = False
@@ -54,13 +55,21 @@ class Runtime:
         self.triangles = 0
         self.clusters = 0
         self.last_ms = 0.0
+        self.latency_ms = 0.0
         self.last_rebuilt = 0
         self.updates = 0
+        # incremental update in flight (see stream_step)
+        self.target = None
+        self.todo = []
+        self.pending = {}
 
     def invalidate(self):
         if self.asset:
             self.valid[:] = False
             self.key = None
+            # drop a half-built update; removal by name only touches unused "...next" meshes,
+            # so it is safe even after undo replaced the datablocks
+            _discard_pending(self)
 
     def close(self):
         if self.asset:
@@ -210,7 +219,7 @@ def _frustum_planes(clip):
     return planes
 
 
-def local_views(obj, views, pixel_error, frustum):
+def local_views(obj, views, pixel_error, mode="FULL", offscreen_scale=8.0):
     mw = obj.matrix_world
     try:
         inv = mw.inverted()
@@ -222,19 +231,20 @@ def local_views(obj, views, pixel_error, frustum):
         cam_world = view.inverted().translation
         cam_local = inv @ cam_world
         threshold = pixel_error / max(1, height)
-        planes = _frustum_planes(window @ view @ mw) if frustum else None
+        planes = _frustum_planes(window @ view @ mw) if mode != "FULL" else None
         if persp:
             out.append(native.make_view(cam_local, window[1][1], max(clip_start / scale, 1e-6),
-                                        threshold, planes=planes))
+                                        threshold, planes=planes, mode=mode, offscreen_scale=offscreen_scale))
         else:
             ortho_h = 2.0 / window[1][1] if window[1][1] else 1.0
             out.append(native.make_view(cam_local, 1.0, 1e-6, threshold, ortho=True,
-                                        ortho_height=ortho_h / scale, planes=planes))
+                                        ortho_height=ortho_h / scale, planes=planes, mode=mode,
+                                        offscreen_scale=offscreen_scale))
     return out
 
 
-def _key(obj, views, pixel_error, frustum):
-    parts = [round(pixel_error, 4), bool(frustum), bool(obj.vgeo.lod_colors)]
+def _key(obj, views, pixel_error, mode, offscreen_scale):
+    parts = [round(pixel_error, 4), mode, round(offscreen_scale, 3), bool(obj.vgeo.lod_colors)]
     for m in [obj.matrix_world] + [v[0] for v in views] + [v[1] for v in views]:
         parts.extend(round(x, 5) for row in m for x in row)
     parts.extend(v[2] for v in views)
@@ -243,31 +253,99 @@ def _key(obj, views, pixel_error, frustum):
 
 # ---------------------------------------------------------------- mesh writing
 
+# Direct copies into Blender's attribute arrays are 5-10x faster than
+# foreach_set, which takes a per-item path for topology arrays. The layout is
+# verified once per session against foreach_get; any mismatch switches back
+# to foreach_set for good.
+_fast_write = None   # None = not verified yet
+
+
+def _copy_into(attr_data, arr):
+    ctypes.memmove(attr_data[0].as_pointer(), arr.ctypes.data, arr.nbytes)
+
+
+def _write_fast(me, d):
+    A = me.attributes
+    _copy_into(A["position"].data, d["positions"])
+    _copy_into(A[".edge_verts"].data, d["edge_verts"])
+    _copy_into(A[".corner_vert"].data, d["corner_verts"])
+    _copy_into(A[".corner_edge"].data, d["corner_edges"])
+    ctypes.memmove(me.polygons[0].as_pointer(), d["loop_starts"].ctypes.data, d["loop_starts"].nbytes)
+
+
+def _write_slow(me, d):
+    me.vertices.foreach_set("co", d["positions"])
+    me.edges.foreach_set("vertices", d["edge_verts"])
+    me.loops.foreach_set("vertex_index", d["corner_verts"])
+    me.loops.foreach_set("edge_index", d["corner_edges"])
+    me.polygons.foreach_set("loop_start", d["loop_starts"])
+
+
+def _verify(me, d):
+    def get(seq, prop, n, dtype):
+        out = np.empty(n, dtype)
+        seq.foreach_get(prop, out)
+        return out
+    nt = d["tri_count"]
+    ok = (np.array_equal(get(me.vertices, "co", d["vertex_count"] * 3, np.float32), d["positions"])
+          and np.array_equal(get(me.edges, "vertices", d["edge_count"] * 2, np.int32), d["edge_verts"])
+          and np.array_equal(get(me.loops, "vertex_index", nt * 3, np.int32), d["corner_verts"])
+          and np.array_equal(get(me.loops, "edge_index", nt * 3, np.int32), d["corner_edges"])
+          and np.array_equal(get(me.polygons, "loop_start", nt, np.int32), d["loop_starts"])
+          and np.array_equal(get(me.polygons, "loop_total", nt, np.int32), np.full(nt, 3, np.int32)))
+    return ok and not me.validate(verbose=False)
+
+
+def _set_attr(me, name, kind, domain, prop, arr):
+    a = me.attributes.new(name, kind, domain)
+    if _fast_write:
+        _copy_into(a.data, arr)
+    else:
+        a.data.foreach_set(prop, arr)
+    return a
+
+
 def fill_mesh(me, data, materials, lod_colors):
     """Replace a mesh's geometry with an extracted chunk."""
+    global _fast_write
     me.clear_geometry()
     if data is None:
         return
-    nv, nt = data["vertex_count"], data["tri_count"]
+    nv, nt, ne = data["vertex_count"], data["tri_count"], data["edge_count"]
+    data["loop_starts"] = np.arange(0, nt * 3, 3, dtype=np.int32)
     me.vertices.add(nv)
-    me.vertices.foreach_set("co", data["positions"])
+    me.edges.add(ne)
     me.loops.add(nt * 3)
-    me.loops.foreach_set("vertex_index", data["corner_verts"])
     me.polygons.add(nt)
-    me.polygons.foreach_set("loop_start", np.arange(0, nt * 3, 3, dtype=np.int32))
+    if _fast_write is None:
+        try:
+            _write_fast(me, data)
+            _fast_write = _verify(me, data)
+        except Exception:
+            _fast_write = False
+        if not _fast_write:
+            print("VGEO: direct mesh writes unavailable, using foreach_set")
+            me.clear_geometry()
+            me.vertices.add(nv)
+            me.edges.add(ne)
+            me.loops.add(nt * 3)
+            me.polygons.add(nt)
+            _write_slow(me, data)
+    elif _fast_write:
+        _write_fast(me, data)
+    else:
+        _write_slow(me, data)
 
-    nrm = me.attributes.new("custom_normal", 'FLOAT_VECTOR', 'POINT')
-    nrm.data.foreach_set("vector", data["normals"])
+    _set_attr(me, "custom_normal", 'FLOAT_VECTOR', 'POINT', "vector", data["normals"])
     if data["uvs"] is not None:
-        uv = me.attributes.new("UVMap", 'FLOAT2', 'CORNER')
-        uv.data.foreach_set("vector", data["uvs"].reshape(-1, 2)[data["corner_verts"]].ravel())
+        corner_uv = np.ascontiguousarray(data["uvs"].reshape(-1, 2)[data["corner_verts"]]).ravel()
+        _set_attr(me, "UVMap", 'FLOAT2', 'CORNER', "vector", corner_uv)
     if len(materials) > 1:
-        mi = me.attributes.new("material_index", 'INT', 'FACE')
-        mi.data.foreach_set("value", data["face_materials"])
+        _set_attr(me, "material_index", 'INT', 'FACE', "value", data["face_materials"])
     if lod_colors:
-        col = me.attributes.new("vgeo_lod", 'FLOAT_COLOR', 'CORNER')
         lod = np.repeat(data["face_lod"] % len(LOD_PALETTE), 3)
-        col.data.foreach_set("color", LOD_PALETTE[lod].ravel())
+        col = _set_attr(me, "vgeo_lod", 'FLOAT_COLOR', 'CORNER', "color",
+                        np.ascontiguousarray(LOD_PALETTE[lod]).ravel())
         me.color_attributes.active_color = col
     me.update()
 
@@ -279,19 +357,108 @@ def _sync_materials(me, materials):
             me.materials.append(m)
 
 
-def apply_cut(obj, views, pixel_error, frustum=False, force=False):
-    """Select a cut for these (world-space) views and write changed chunks.
+def _discard_pending(rt):
+    """Drop a half-built incremental update (its meshes were never shown)."""
+    for name in rt.pending.values():
+        me = bpy.data.meshes.get(name)
+        if me is not None and me.users == 0:
+            bpy.data.meshes.remove(me)
+    rt.pending.clear()
+    rt.todo = []
+    rt.target = None
 
-    Returns the Runtime (with stats), or None if the object can't stream.
+
+def stream_step(obj, views, pixel_error, mode="COARSEN", offscreen_scale=8.0, budget=0.012):
+    """Incremental update for the live loop; returns True while work remains.
+
+    Replacement meshes for changed chunks are built a few at a time into new,
+    unlinked datablocks while the current (valid) cut stays on screen. Once
+    all are ready they are swapped in together, so the surface never shows a
+    mix of two cuts. The native selection is not touched until the swap, so
+    extraction keeps reading the target cut.
+    """
+    rt = runtime_for(obj)
+    if rt.asset is None:
+        return False
+    if rt.target is None:
+        key = _key(obj, views, pixel_error, mode, offscreen_scale)
+        if key == rt.key and rt.valid.all():
+            return False
+        lv = local_views(obj, views, pixel_error, mode, offscreen_scale)
+        if not lv:
+            return False
+        t0 = time.perf_counter()
+        sigs = rt.asset.select(lv)
+        lod_colors = bool(obj.vgeo.lod_colors)
+        if rt.lod_colors != lod_colors:
+            rt.valid[:] = False
+            rt.lod_colors = lod_colors
+        changed = np.nonzero(~rt.valid | (sigs != rt.applied))[0]
+        rt.target_key = key
+        rt.target_stats = (int(rt.asset.last.triangles), int(rt.asset.last.clusters))
+        rt.target_t0 = t0
+        if len(changed) == 0:
+            rt.key = key
+            rt.triangles, rt.clusters = rt.target_stats
+            return False
+        rt.target = sigs.copy()
+        rt.todo = [int(c) for c in changed[::-1]]  # pop() takes them in order
+        rt.build_s = 0.0
+
+    t_start = time.perf_counter()
+    materials = tuple(obj.data.materials)
+    while rt.todo and time.perf_counter() - t_start < budget:
+        c = rt.todo.pop()
+        me = bpy.data.meshes.new(chunk_name(rt.uid, c) + ".next")
+        _sync_materials(me, materials)
+        fill_mesh(me, rt.asset.extract(c), materials, rt.lod_colors)
+        rt.pending[c] = me.name
+    rt.build_s += time.perf_counter() - t_start
+    if rt.todo:
+        return True
+
+    # everything is built: swap all changed chunks in one go
+    chunks = chunk_objects(obj, rt)
+    for c, name in rt.pending.items():
+        new = bpy.data.meshes.get(name)
+        if new is None:  # lost to undo: start over next tick
+            _discard_pending(rt)
+            rt.invalidate()
+            return True
+        ob = chunks[c]
+        old = ob.data
+        ob.data = new
+        if old is not None and old.users == 0:
+            bpy.data.meshes.remove(old)
+        new.name = chunk_name(rt.uid, c)
+        rt.applied[c] = rt.target[c]
+        rt.valid[c] = True
+    rt.last_rebuilt = len(rt.pending)
+    rt.pending.clear()
+    rt.target = None
+    rt.key = rt.target_key
+    rt.triangles, rt.clusters = rt.target_stats
+    rt.last_ms = rt.build_s * 1000.0
+    rt.latency_ms = (time.perf_counter() - rt.target_t0) * 1000.0
+    rt.updates += 1
+    return False
+
+
+def apply_cut(obj, views, pixel_error, mode="FULL", offscreen_scale=8.0, force=False):
+    """Select a cut for these (world-space) views and write changed chunks now.
+
+    Used for renders and scripts. mode: FULL, COARSEN (off-screen detail
+    reduced by offscreen_scale) or CULL. Returns the Runtime (with stats).
     """
     rt = runtime_for(obj)
     if rt.asset is None:
         return rt
-    key = _key(obj, views, pixel_error, frustum)
+    _discard_pending(rt)
+    key = _key(obj, views, pixel_error, mode, offscreen_scale)
     if not force and key == rt.key and rt.valid.all():
         return rt
     t0 = time.perf_counter()
-    lv = local_views(obj, views, pixel_error, frustum)
+    lv = local_views(obj, views, pixel_error, mode, offscreen_scale)
     if not lv:
         return rt
     sigs = rt.asset.select(lv)
@@ -325,6 +492,7 @@ def apply_level(obj, depth):
     rt = runtime_for(obj)
     if rt.asset is None:
         return rt
+    _discard_pending(rt)
     sigs = rt.asset.select_level(depth)
     chunks = chunk_objects(obj, rt)
     materials = tuple(obj.data.materials)
@@ -346,7 +514,9 @@ def update_for_render(scene, depsgraph=None):
     for obj in proxies(scene):
         if obj.hide_render:
             continue
-        apply_cut(obj, [view], obj.vgeo.render_pixel_error, frustum=False)
+        # final renders never cull: off-screen geometry still casts shadows and shows in reflections
+        mode = "FULL" if obj.vgeo.offscreen == "FULL" else "COARSEN"
+        apply_cut(obj, [view], obj.vgeo.render_pixel_error, mode, obj.vgeo.offscreen_scale)
 
 
 # ---------------------------------------------------------------- live loop
@@ -362,17 +532,20 @@ def _tick():
         if not views:
             return 0.25
         vl = bpy.context.view_layer
-        busy = False
+        visible = []
         for obj in objs:
             try:
-                if vl is not None and not obj.visible_get(view_layer=vl):
-                    continue
+                if vl is None or obj.visible_get(view_layer=vl):
+                    visible.append(obj)
             except RuntimeError:
                 continue
-            rt = apply_cut(obj, views, obj.vgeo.pixel_error, frustum=obj.vgeo.frustum_cull)
-            if rt is not None and rt.asset is not None and rt.last_rebuilt:
-                busy = True
-        return 0.05 if busy else TICK
+        busy = False
+        budget = TICK_BUDGET / max(1, len(visible))
+        for obj in visible:
+            v = obj.vgeo
+            busy |= stream_step(obj, views, v.pixel_error, v.offscreen, v.offscreen_scale, budget)
+        # keep cranking (UI events still run between ticks) until the swap lands
+        return 0.0 if busy else TICK
     except Exception as e:  # never let the timer die
         print("VGEO stream:", e)
         return 1.0

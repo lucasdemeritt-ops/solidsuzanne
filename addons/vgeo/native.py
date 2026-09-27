@@ -23,6 +23,8 @@ class BuildInput(ctypes.Structure):
         ("normals", ctypes.c_void_p),
         ("uvs", ctypes.c_void_p),
         ("materials", ctypes.c_void_p),
+        ("vertex_count", ctypes.c_uint32),
+        ("indices", ctypes.c_void_p),
         ("material_count", ctypes.c_uint32),
         ("material_names", ctypes.POINTER(ctypes.c_char_p)),
         ("max_triangles", ctypes.c_uint32),
@@ -67,7 +69,8 @@ class View(ctypes.Structure):
         ("threshold", ctypes.c_float),
         ("ortho", ctypes.c_int32),
         ("ortho_height", ctypes.c_float),
-        ("use_frustum", ctypes.c_int32),
+        ("frustum_mode", ctypes.c_int32),
+        ("offscreen_scale", ctypes.c_float),
         ("planes", (ctypes.c_float * 4) * 6),
     ]
 
@@ -90,6 +93,9 @@ class ChunkData(ctypes.Structure):
         ("corner_verts", ctypes.POINTER(ctypes.c_int32)),
         ("face_materials", ctypes.POINTER(ctypes.c_int32)),
         ("face_lod", ctypes.POINTER(ctypes.c_int32)),
+        ("edge_count", ctypes.c_uint32),
+        ("edge_verts", ctypes.POINTER(ctypes.c_int32)),
+        ("corner_edges", ctypes.POINTER(ctypes.c_int32)),
     ]
 
 
@@ -152,22 +158,32 @@ def _ptr(a):
 
 
 def build(path, positions, normals=None, uvs=None, materials=None, material_names=(),
-          max_triangles=128, target_chunks=0, progress=None):
-    """Build a .vgeo from per-corner arrays (tri_count*3 corners).
+          max_triangles=128, target_chunks=0, progress=None, indices=None):
+    """Build a .vgeo.
 
+    Without indices, positions/normals/uvs hold one row per triangle corner.
+    With indices (tri_count*3 vertex indices) they hold one row per vertex.
     progress(stage, fraction) -> truthy to cancel. Runs without holding the
     GIL (ctypes releases it), so it can be called from a worker thread.
     """
     L = lib()
     positions = np.ascontiguousarray(positions, dtype=np.float32).reshape(-1, 3)
-    corners = positions.shape[0]
-    if corners == 0 or corners % 3:
-        raise ValueError("positions must hold 3 corners per triangle")
-    tri_count = corners // 3
+    rows = positions.shape[0]
+    if indices is not None:
+        indices = np.ascontiguousarray(indices, dtype=np.uint32).ravel()
+        if indices.size == 0 or indices.size % 3:
+            raise ValueError("indices must hold 3 entries per triangle")
+        if int(indices.max()) >= rows:
+            raise ValueError("index out of range")
+        tri_count = indices.size // 3
+    else:
+        if rows == 0 or rows % 3:
+            raise ValueError("positions must hold 3 corners per triangle")
+        tri_count = rows // 3
     if normals is not None:
-        normals = np.ascontiguousarray(normals, dtype=np.float32).reshape(corners, 3)
+        normals = np.ascontiguousarray(normals, dtype=np.float32).reshape(rows, 3)
     if uvs is not None:
-        uvs = np.ascontiguousarray(uvs, dtype=np.float32).reshape(corners, 2)
+        uvs = np.ascontiguousarray(uvs, dtype=np.float32).reshape(rows, 2)
     if materials is not None:
         materials = np.ascontiguousarray(materials, dtype=np.uint16).reshape(tri_count)
     names = [str(n).encode("utf-8") for n in material_names]
@@ -179,6 +195,8 @@ def build(path, positions, normals=None, uvs=None, materials=None, material_name
     inp.normals = _ptr(normals)
     inp.uvs = _ptr(uvs)
     inp.materials = _ptr(materials)
+    inp.vertex_count = rows if indices is not None else 0
+    inp.indices = _ptr(indices)
     inp.material_count = len(names)
     inp.material_names = name_arr
     inp.max_triangles = max_triangles
@@ -273,12 +291,20 @@ class Asset:
             "corner_verts": grab(d.corner_verts, nt * 3, np.int32),
             "face_materials": grab(d.face_materials, nt, np.int32),
             "face_lod": grab(d.face_lod, nt, np.int32),
+            "edge_verts": grab(d.edge_verts, d.edge_count * 2, np.int32),
+            "corner_edges": grab(d.corner_edges, nt * 3, np.int32),
             "vertex_count": nv,
             "tri_count": nt,
+            "edge_count": d.edge_count,
         }
 
 
-def make_view(camera, proj, znear, threshold, ortho=False, ortho_height=1.0, planes=None):
+FRUSTUM_MODES = {"FULL": 0, "COARSEN": 1, "CULL": 2}
+
+
+def make_view(camera, proj, znear, threshold, ortho=False, ortho_height=1.0, planes=None,
+              mode="FULL", offscreen_scale=8.0):
+    """mode: FULL (ignore frustum), COARSEN (off-screen at threshold*offscreen_scale), CULL."""
     v = View()
     v.camera[:] = [float(x) for x in camera]
     v.proj = float(proj)
@@ -286,8 +312,9 @@ def make_view(camera, proj, znear, threshold, ortho=False, ortho_height=1.0, pla
     v.threshold = float(threshold)
     v.ortho = 1 if ortho else 0
     v.ortho_height = float(ortho_height)
+    v.offscreen_scale = float(offscreen_scale)
     if planes is not None:
-        v.use_frustum = 1
+        v.frustum_mode = FRUSTUM_MODES[mode]
         for i in range(6):
             for j in range(4):
                 v.planes[i][j] = float(planes[i][j])
