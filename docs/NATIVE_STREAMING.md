@@ -124,7 +124,10 @@ first use instead of by a scan at open (a bad cluster is skipped and
 indices to chunk-local ones (8 bytes per vertex of the asset) is now a hash
 sized to the chunk. Before extracting, the add-on calls `vgeo_prefetch` for
 the changed chunks, which asks the OS to start reading their index and
-vertex ranges in the background.
+vertex ranges. The hint runs on a background thread per handle (the OS call
+can block for seconds when pages are cold: done inline it produced 2-3 s
+frames), and vertex ranges of clusters whose vertices span most of the file
+are skipped.
 
 Terrain asset (1.2 GB, 33.5M triangles), two handles, plain Python
 (`tests/mapped_bench.py`):

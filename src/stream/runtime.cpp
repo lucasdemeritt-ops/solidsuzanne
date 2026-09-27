@@ -10,17 +10,62 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
+
+// Prefetch hints run on one background thread per handle: PrefetchVirtualMemory can block
+// for seconds when the pages are not in memory, which must never stall a caller's frame.
+struct Prefetcher {
+    std::thread worker;
+    std::mutex m;
+    std::condition_variable cv;
+    std::vector<uint64_t> pending;   // latest request wins: older ones are for views already gone
+    bool stop = false;
+    const vgeo_io::MappedFile* map = nullptr;
+
+    void request(const vgeo_io::MappedFile* file, std::vector<uint64_t>&& ranges) {
+        {
+            std::lock_guard<std::mutex> lk(m);
+            map = file;
+            pending = std::move(ranges);
+            if (!worker.joinable()) worker = std::thread([this] { run(); });
+        }
+        cv.notify_one();
+    }
+    void run() {
+        std::unique_lock<std::mutex> lk(m);
+        for (;;) {
+            cv.wait(lk, [this] { return stop || !pending.empty(); });
+            if (stop) return;
+            std::vector<uint64_t> r = std::move(pending);
+            pending.clear();
+            lk.unlock();
+            map->prefetch(r.data(), r.size() / 2);
+            lk.lock();
+        }
+    }
+    ~Prefetcher() {
+        {
+            std::lock_guard<std::mutex> lk(m);
+            stop = true;
+        }
+        cv.notify_one();
+        if (worker.joinable()) worker.join();
+    }
+};
 
 struct Asset {
     // the file is memory-mapped (read into `owned` only if mapping fails): pages load on first
     // touch, so opening costs nothing and memory is bounded by what the cuts actually use
     vgeo_io::MappedFile map;
+    Prefetcher prefetcher;          // after `map`: stopped (joined) before the file is unmapped
     std::vector<uint8_t> owned;
     const uint8_t* base = nullptr;
     uint64_t size = 0;
@@ -443,7 +488,9 @@ extern "C" VGEO_API int vgeo_prefetch(void* handle, const uint32_t* chunks, int 
             if (!a->selected[id]) continue;
             const vgeo2::Cluster& c = a->clusters[id];
             add(h.off_indices + uint64_t(c.index_offset) * 4, uint64_t(c.tri_count) * 12);
-            if (a->checked[id] == 1) {
+            // vertex data once the cluster was seen, and only when its vertices sit close together
+            // (a coarse cluster can span most of the file)
+            if (a->checked[id] == 1 && uint64_t(a->vmax[id] - a->vmin[id]) < 65536) {
                 uint64_t v0 = a->vmin[id], n = uint64_t(a->vmax[id]) - v0 + 1;
                 add(h.off_positions + v0 * 12, n * 12);
                 add(h.off_normals + v0 * 12, n * 12);
@@ -452,7 +499,7 @@ extern "C" VGEO_API int vgeo_prefetch(void* handle, const uint32_t* chunks, int 
             }
         }
     }
-    a->map.prefetch(r.data(), r.size() / 2);
+    a->prefetcher.request(&a->map, std::move(r));
     return 0;
 }
 
