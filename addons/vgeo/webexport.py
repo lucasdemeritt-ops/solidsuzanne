@@ -65,6 +65,40 @@ try {{
 """
 
 
+def build_web_asset(obj, path, depsgraph=None, max_triangles=128):
+    """Write a .vgeow for any mesh object; returns {"bytes", "source_triangles", "aabb_min", "aabb_max"}.
+
+    Public entry point for other add-ons (WebBlend's Streamed 3D target).
+    A virtualized proxy exports from its existing .vgeo; a plain mesh is
+    virtualized into a temporary .vgeo first (modifiers applied).
+    """
+    import tempfile
+    from . import build
+    if obj.type != 'MESH':
+        raise RuntimeError(f"'{obj.name}' is not a mesh")
+    if obj.vgeo.uid and obj.vgeo.path:
+        asset = native.Asset(stream.asset_path(obj))
+        tmpdir = None
+    else:
+        tmpdir = tempfile.mkdtemp(prefix="vgeo_web_")
+        src = os.path.join(tmpdir, "asset.vgeo")
+        arrays = build.mesh_arrays(obj, depsgraph or bpy.context.evaluated_depsgraph_get())
+        mats = arrays["material_list"]
+        native.build(src, arrays["positions"], arrays["normals"], arrays["uvs"], arrays["materials"],
+                     [m.name if m else "" for m in mats], max_triangles=max_triangles,
+                     indices=arrays["indices"], material_params=build.material_params(mats))
+        asset = native.Asset(src)
+    try:
+        size = asset.export_web(path)
+        info = asset.info
+        return {"bytes": size, "source_triangles": info["source_triangles"],
+                "aabb_min": list(info["aabb_min"]), "aabb_max": list(info["aabb_max"])}
+    finally:
+        asset.close()
+        if tmpdir:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def export(obj, directory, with_page=True):
     if not directory:
         raise RuntimeError("no output folder")

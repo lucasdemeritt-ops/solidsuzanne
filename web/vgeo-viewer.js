@@ -404,7 +404,9 @@ async function fetchWithProgress(url, onProgress) {
  * source: URL or ArrayBuffer of a .vgeo file.
  * options: pixelError (1), offscreenScale (8), materials ([{color:[r,g,b], roughness}] or by name),
  *          mode ('shaded' | 'lod' | 'clusters' | 'normals'), onProgress(fraction), onStats(stats),
- *          sun [x,y,z], exposure, fog density, background [r,g,b]
+ *          sun [x,y,z], exposure, fog density, background [r,g,b], interactive (true),
+ *          camera start: target [x,y,z], distance, yaw, pitch, fov (vertical degrees) or fovX
+ *          (horizontal degrees, vertical follows the canvas aspect), decoderUrl
  */
 export async function createViewer(canvas, source, options = {}) {
   if (!navigator.gpu) throw new Error("WebGPU is not available in this browser");
@@ -512,35 +514,37 @@ export async function createViewer(canvas, source, options = {}) {
   };
   writeLook();
 
-  // ---- input
-  let drag = null;
-  canvas.style.touchAction = "none";
-  canvas.addEventListener("pointerdown", (e) => {
-    drag = { x: e.clientX, y: e.clientY, pan: e.button === 2 || e.shiftKey };
-    canvas.setPointerCapture(e.pointerId);
-  });
-  canvas.addEventListener("pointermove", (e) => {
-    if (!drag) return;
-    const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
-    drag.x = e.clientX; drag.y = e.clientY;
-    if (drag.pan) {
-      const s = cam.distance * 0.0015;
-      const cy = Math.cos(cam.yaw), sy = Math.sin(cam.yaw);
-      cam.target[0] -= (cy * dx) * s; cam.target[1] -= (sy * dx) * s;
-      cam.target[2] += dy * s;
-    } else {
-      cam.yaw -= dx * 0.005;
-      cam.pitch = Math.max(-1.5, Math.min(1.5, cam.pitch + dy * 0.005));
-    }
-    state.dirty = true;
-  });
-  canvas.addEventListener("pointerup", () => { drag = null; });
-  canvas.addEventListener("contextmenu", (e) => e.preventDefault());
-  canvas.addEventListener("wheel", (e) => {
-    e.preventDefault();
-    cam.distance *= Math.exp(e.deltaY * 0.001);
-    state.dirty = true;
-  }, { passive: false });
+  // ---- input (options.interactive === false: a fixed view, e.g. a hero image on a page)
+  if (options.interactive !== false) {
+    let drag = null;
+    canvas.style.touchAction = "none";
+    canvas.addEventListener("pointerdown", (e) => {
+      drag = { x: e.clientX, y: e.clientY, pan: e.button === 2 || e.shiftKey };
+      canvas.setPointerCapture(e.pointerId);
+    });
+    canvas.addEventListener("pointermove", (e) => {
+      if (!drag) return;
+      const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
+      drag.x = e.clientX; drag.y = e.clientY;
+      if (drag.pan) {
+        const s = cam.distance * 0.0015;
+        const cy = Math.cos(cam.yaw), sy = Math.sin(cam.yaw);
+        cam.target[0] -= (cy * dx) * s; cam.target[1] -= (sy * dx) * s;
+        cam.target[2] += dy * s;
+      } else {
+        cam.yaw -= dx * 0.005;
+        cam.pitch = Math.max(-1.5, Math.min(1.5, cam.pitch + dy * 0.005));
+      }
+      state.dirty = true;
+    });
+    canvas.addEventListener("pointerup", () => { drag = null; });
+    canvas.addEventListener("contextmenu", (e) => e.preventDefault());
+    canvas.addEventListener("wheel", (e) => {
+      e.preventDefault();
+      cam.distance *= Math.exp(e.deltaY * 0.001);
+      state.dirty = true;
+    }, { passive: false });
+  }
 
   let depth = null;
   const camData = new Float32Array(64);
@@ -566,6 +570,9 @@ export async function createViewer(canvas, source, options = {}) {
       cam.target[1] + cam.distance * cp * Math.sin(cam.yaw + Math.PI / 2),
       cam.target[2] + cam.distance * Math.sin(cam.pitch)];
     const near = Math.max(radius * 1e-5, cam.distance * 1e-3);
+    if (options.fovX) {   // horizontal field of view given (Blender sensor fit): vertical follows the canvas
+      cam.fovy = 2 * Math.atan(Math.tan(options.fovX * Math.PI / 360) / (canvas.width / canvas.height));
+    }
     const proj = perspectiveReversedZ(cam.fovy, canvas.width / canvas.height, near);
     const view = lookAt(eye, cam.target, [0, 0, 1]);
     const vp = mul4(proj, view);
