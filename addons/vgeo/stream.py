@@ -710,6 +710,10 @@ def update_for_render(scene, depsgraph=None):
         # final renders never cull: off-screen geometry still casts shadows and shows in reflections
         mode = "FULL" if obj.vgeo.offscreen == "FULL" else "COARSEN"
         apply_cut(obj, [view], obj.vgeo.render_pixel_error, mode, obj.vgeo.offscreen_scale)
+    from . import instances
+    for inst in instances.instancers(scene):
+        if not inst.hide_render:
+            instances.update(inst, [view], inst.vgeo_inst.render_pixel_error)
 
 
 # ---------------------------------------------------------------- live loop
@@ -718,13 +722,23 @@ def _tick():
     if _rendering:
         return 0.25
     try:
+        from . import instances
         objs = [o for o in proxies() if not o.vgeo.freeze]
-        if not objs:
+        insts = [o for o in instances.instancers() if not o.vgeo_inst.freeze]
+        if not objs and not insts:
             return 0.5
         views = viewport_views()
         if not views:
             return 0.25
         vl = bpy.context.view_layer
+        for inst in insts:   # per-placement level choice: cheap, no geometry is rebuilt
+            try:
+                if vl is None or inst.visible_get(view_layer=vl):
+                    instances.update(inst, views, inst.vgeo_inst.pixel_error)
+            except RuntimeError:
+                continue
+        if not objs:
+            return TICK
         visible = []
         for obj in objs:
             try:

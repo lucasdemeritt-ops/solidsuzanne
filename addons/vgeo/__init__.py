@@ -18,7 +18,7 @@ bl_info = {
 import bpy
 from bpy.props import BoolProperty, EnumProperty, FloatProperty, IntProperty, PointerProperty, StringProperty
 
-from . import build, native, stream
+from . import build, instances, native, stream
 
 
 def _invalidate(self, _context):
@@ -54,6 +54,73 @@ class VGEOObjectSettings(bpy.types.PropertyGroup):
     lod_colors: BoolProperty(name="LOD Colors", default=False, update=_invalidate,
                              description="Write a 'vgeo_lod' color attribute (view it with Solid shading, "
                                          "Color: Attribute)")
+
+
+class VGEOInstanceSettings(bpy.types.PropertyGroup):
+    uid: StringProperty(name="Instancer ID", options={'HIDDEN'})
+    source: PointerProperty(type=bpy.types.Object, name="Asset",
+                            description="The virtualized object these placements show")
+    levels: PointerProperty(type=bpy.types.Collection, name="Levels")
+    pixel_error: FloatProperty(name="Viewport Error", default=1.0, min=0.1, soft_max=8.0, subtype='PIXEL')
+    render_pixel_error: FloatProperty(name="Render Error", default=0.5, min=0.05, soft_max=4.0, subtype='PIXEL')
+    min_level: IntProperty(name="Finest Level", default=0, min=0, soft_max=8,
+                           description="Never use levels finer than this (caps memory for very dense assets)")
+    freeze: BoolProperty(name="Freeze", default=False)
+    shown_triangles: IntProperty(name="Shown Triangles", options={'HIDDEN'})
+
+
+class VGEO_OT_scatter(bpy.types.Operator):
+    """Scatter copies of the active VGEO object over the other selected mesh; each copy picks its own LOD"""
+    bl_idname = "vgeo.scatter"
+    bl_label = "Scatter Instances"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    count: IntProperty(name="Count", default=500, min=1, max=1_000_000)
+    seed: IntProperty(name="Seed", default=0)
+    scale_min: FloatProperty(name="Scale Min", default=0.7, min=0.001)
+    scale_max: FloatProperty(name="Scale Max", default=1.3, min=0.001)
+    align: BoolProperty(name="Align to Surface", default=True)
+
+    @classmethod
+    def poll(cls, context):
+        ob = context.active_object
+        return (ob is not None and ob.vgeo.uid and
+                any(o is not ob and o.type == 'MESH' for o in context.selected_objects))
+
+    def execute(self, context):
+        source = context.active_object
+        surface = next(o for o in context.selected_objects if o is not source and o.type == 'MESH')
+        try:
+            inst = instances.create_instancer(context, source, surface, self.count, self.seed,
+                                              (self.scale_min, max(self.scale_min, self.scale_max)), self.align)
+        except (ValueError, RuntimeError) as e:
+            self.report({'ERROR'}, str(e))
+            return {'CANCELLED'}
+        views = stream.viewport_views() if context.window_manager.windows else []
+        if views:
+            instances.update(inst, views, inst.vgeo_inst.pixel_error)
+        for o in context.view_layer.objects:
+            o.select_set(False)
+        inst.select_set(True)
+        context.view_layer.objects.active = inst
+        self.report({'INFO'}, f"Scattered {self.count} instances of {source.name}")
+        return {'FINISHED'}
+
+
+class VGEO_OT_rebuild_levels(bpy.types.Operator):
+    """Rebuild the instancer's level meshes from its asset (after re-virtualizing or changing materials)"""
+    bl_idname = "vgeo.rebuild_levels"
+    bl_label = "Rebuild Levels"
+
+    @classmethod
+    def poll(cls, context):
+        ob = context.active_object
+        return ob is not None and ob.vgeo_inst.uid and ob.vgeo_inst.source is not None
+
+    def execute(self, context):
+        ob = context.active_object
+        instances.build_levels(ob, ob.vgeo_inst.source)
+        return {'FINISHED'}
 
 
 class VGEO_OT_virtualize(bpy.types.Operator):
@@ -254,6 +321,23 @@ class VGEO_PT_panel(bpy.types.Panel):
             layout.label(text="Native library missing", icon='ERROR')
             layout.label(text=native.library_path())
             return
+        if ob is not None and ob.vgeo_inst.uid:
+            vi = ob.vgeo_inst
+            box = layout.box()
+            col = box.column(align=True)
+            col.label(text=f"Instances of {vi.source.name if vi.source else '?'}", icon='OUTLINER_OB_POINTCLOUD')
+            col.label(text=f"Placements: {len(ob.data.vertices):,}")
+            col.label(text=f"Showing: {vi.shown_triangles:,} triangles")
+            tris = ob.get("vgeo_level_tris")
+            if tris:
+                col.label(text=f"All at full detail: {len(ob.data.vertices) * tris[0]:,}")
+            layout.prop(vi, "pixel_error")
+            layout.prop(vi, "render_pixel_error")
+            layout.prop(vi, "min_level")
+            row = layout.row(align=True)
+            row.prop(vi, "freeze", toggle=True, icon='FREEZE')
+            row.operator(VGEO_OT_rebuild_levels.bl_idname, icon='FILE_REFRESH')
+            return
         if ob is None or not ob.vgeo.uid:
             layout.operator(VGEO_OT_virtualize.bl_idname, icon='MOD_DECIM')
             if ob is not None and ob.type == 'MESH':
@@ -289,10 +373,11 @@ class VGEO_PT_panel(bpy.types.Panel):
         row.operator(VGEO_OT_refresh.bl_idname, icon='FILE_REFRESH')
         row.operator(VGEO_OT_restore.bl_idname, icon='LOOP_BACK')
         layout.operator(VGEO_OT_export_web.bl_idname, icon='WORLD')
+        layout.operator(VGEO_OT_scatter.bl_idname, icon='OUTLINER_OB_POINTCLOUD')
 
 
-classes = (VGEOObjectSettings, VGEO_OT_virtualize, VGEO_OT_restore, VGEO_OT_export_web, VGEO_OT_refresh,
-           VGEO_PT_panel)
+classes = (VGEOObjectSettings, VGEOInstanceSettings, VGEO_OT_virtualize, VGEO_OT_restore, VGEO_OT_export_web,
+           VGEO_OT_scatter, VGEO_OT_rebuild_levels, VGEO_OT_refresh, VGEO_PT_panel)
 
 
 def _menu(self, _context):
@@ -303,6 +388,7 @@ def register():
     for c in classes:
         bpy.utils.register_class(c)
     bpy.types.Object.vgeo = PointerProperty(type=VGEOObjectSettings)
+    bpy.types.Object.vgeo_inst = PointerProperty(type=VGEOInstanceSettings)
     bpy.types.VIEW3D_MT_object.append(_menu)
     stream.register()
 
@@ -310,6 +396,7 @@ def register():
 def unregister():
     stream.unregister()
     bpy.types.VIEW3D_MT_object.remove(_menu)
+    del bpy.types.Object.vgeo_inst
     del bpy.types.Object.vgeo
     for c in reversed(classes):
         bpy.utils.unregister_class(c)

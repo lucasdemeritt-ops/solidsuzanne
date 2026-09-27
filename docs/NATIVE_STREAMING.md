@@ -90,6 +90,34 @@ Terrain demo: 33.5M triangles from Geometry Nodes (`examples/terrain_demo.py`).
 | Cycles, same frame from the VGEO cut (9.8M triangles, 0.5 px) | 49-51 s |
 | Difference between the two images | mean 0.02/255, 99th percentile 1/255 |
 
+## Instancing (full scenes)
+
+`Scatter Instances` (active VGEO object + another selected mesh) creates an
+instancer: a point mesh whose vertices are placements with rotation and scale
+attributes. The asset's uniform LOD levels are built once into shared level
+meshes (each a complete, crack-free cut); every update picks, per placement,
+the coarsest level whose error stays under the pixel threshold, and writes it
+to an integer attribute that a Geometry Nodes Instance on Points tree reads.
+Navigating never rebuilds geometry, and EEVEE and Cycles get real instances.
+
+Scatter demo (`examples/scatter_demo.py`): 2,000 copies of a 1.3M-triangle
+boulder = 2.6 billion source triangles.
+
+| | |
+|---|---|
+| Build | virtualize 3.6 s, 15 level meshes 0.3 s |
+| Viewport cut at 1 px | 6.6M triangles (0.25 %) |
+| Final render at 0.5 px, 1600x900 | 19.4M triangles: EEVEE 1.7 s, Cycles 8.3 s (64 samples, OptiX) |
+| Viewport while flying | Solid ~117 fps, EEVEE ~68 fps, worst frame 45 ms |
+
+## On the web
+
+`web/vgeo-viewer.js` renders the same assets with WebGPU: a compute pass
+applies the same cut rule per cluster and one indirect draw renders the
+result; its cut matches the native runtime to the triangle. **Export for Web**
+writes a compact `.vgeow` (meshopt-compressed, positions on a global 21-bit
+grid so cuts stay watertight) with the viewer and a page. See `web/README.md`.
+
 ## Using it
 
 1. Build `vgeo_stream` (see below); the DLL lands in `addons/vgeo/bin/`.
@@ -129,7 +157,8 @@ cut selection if needed.
 
 ## Not yet
 
-- Instances: many copies of one asset, each with its own cut (full scenes).
+- Instances use whole-asset levels; a placement close enough to need a
+  streamed cut of its own (very large assets filling the view) is next.
 - Building without a full Blender mesh in memory (import straight from
   disk, or tiled builds), for sources beyond what Blender can hold.
 - Streaming clusters from disk (the file is read whole today).

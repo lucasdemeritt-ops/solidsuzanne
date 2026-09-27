@@ -373,6 +373,64 @@ def run():
     rt = stream.apply_cut(proxy, [stream.camera_view(bpy.context.scene)], 1.0)
     check("runtime reopens after load", rt.asset is not None and rt.triangles > 0, str(rt.triangles))
 
+    # ---- instancing: many copies, each at its own level
+    from vgeo import instances
+    scene = bpy.context.scene
+    bpy.ops.mesh.primitive_plane_add(size=80, location=(0, 30, -1))
+    ground = bpy.context.active_object
+    for o in bpy.context.view_layer.objects:
+        o.select_set(False)
+    ground.select_set(True)
+    proxy.select_set(True)
+    bpy.context.view_layer.objects.active = proxy
+    rc = bpy.ops.vgeo.scatter(count=400, seed=3, scale_min=0.6, scale_max=1.2)
+    inst = bpy.context.active_object
+    check("scatter creates an instancer", rc == {'FINISHED'} and inst.vgeo_inst.uid and len(inst.data.vertices) == 400)
+    errs = list(inst["vgeo_level_errors"])
+    lvl_tris = list(inst["vgeo_level_tris"])
+    check("one level mesh per LOD level", len(inst.vgeo_inst.levels.objects) == len(errs) == rt.asset.info["lod_levels"],
+          f"{len(errs)} levels, {lvl_tris[0]:,} -> {lvl_tris[-1]:,} tris")
+    check("level errors grow, triangles shrink", all(a <= b for a, b in zip(errs, errs[1:]))
+          and all(a >= b for a, b in zip(lvl_tris, lvl_tris[1:])) and errs[0] == 0.0)
+    camera((0, -12, 1.5), target=(0, 30, -1), lens=35)
+    instances.update(inst, [stream.camera_view(scene)], 1.0)
+    dg = bpy.context.evaluated_depsgraph_get()
+    n_inst = sum(1 for i in dg.object_instances if i.is_instance and i.parent and i.parent.original == inst)
+    check("every placement is a real instance", n_inst == 400, str(n_inst))
+    co = np.empty(1200, np.float32)
+    inst.data.vertices.foreach_get("co", co)
+    lv = np.empty(400, np.int32)
+    inst.data.attributes["vgeo_level"].data.foreach_get("value", lv)
+    dist = np.linalg.norm(co.reshape(-1, 3) - np.array([0, -12, 1.5]), axis=1)
+    order = np.argsort(dist)
+    near, far = lv[order[:40]].mean(), lv[order[-40:]].mean()
+    check("near copies finer than far copies", near < far, f"mean level near {near:.1f}, far {far:.1f}")
+    full = 400 * lvl_tris[0]
+    check("instances show a fraction of full detail", inst.vgeo_inst.shown_triangles < full * 0.25,
+          f"{inst.vgeo_inst.shown_triangles:,} of {full:,}")
+    check("unchanged view writes nothing", instances.update(inst, [stream.camera_view(scene)], 1.0) is False)
+    world = bpy.data.worlds.get("W") or bpy.data.worlds.new("W")
+    scene.world = world
+    if not any(o.type == 'LIGHT' for o in scene.objects):
+        sun = bpy.data.objects.new("Sun2", bpy.data.lights.new("Sun2", "SUN"))
+        sun.rotation_euler = (0.9, 0.2, 0.6)
+        scene.collection.objects.link(sun)
+    for eng, fname in (("BLENDER_EEVEE", "instances_eevee.png"), ("CYCLES", "instances_cycles.png")):
+        scene.render.engine = eng
+        if eng == "CYCLES":
+            scene.cycles.samples = 8
+        scene.render.filepath = os.path.join(OUT, fname)
+        bpy.ops.render.render(write_still=True)
+        check(f"{eng} renders the instancer", os.path.exists(scene.render.filepath))
+    shown_render = inst.vgeo_inst.shown_triangles
+    check("render cut uses the render error", shown_render > 0, f"{shown_render:,} tris at 0.5 px")
+    bpy.ops.wm.save_mainfile()
+    bpy.ops.wm.open_mainfile(filepath=os.path.join(OUT, "stream_test.blend"))
+    inst = next(o for o in bpy.data.objects if o.vgeo_inst.uid)
+    proxy = next(o for o in bpy.data.objects if o.vgeo.uid)
+    check("instancer survives save/load", len(inst.vgeo_inst.levels.objects) == len(errs)
+          and instances.choose_levels(inst, [stream.camera_view(bpy.context.scene)], 1.0).max() >= 0)
+
     # corrupt / missing file is reported, not a crash
     proxy.vgeo.path = "//vgeo/missing.vgeo"
     rt = stream.runtime_for(proxy)
@@ -450,12 +508,13 @@ def run():
     bpy.ops.vgeo.restore()
 
     # restore brings the source back
-    proxy.vgeo.path = proxy.vgeo.path  # keep
+    proxy_uid = proxy.vgeo.uid
     bpy.context.view_layer.objects.active = proxy
     rc = bpy.ops.vgeo.restore()
     src = bpy.data.objects.get("Icosphere")
     check("restore returns source", rc == {'FINISHED'} and src is not None and not src.hide_render)
-    check("restore removes chunks", not any(o.name.startswith("vgeo.") for o in bpy.data.objects))
+    check("restore removes its chunks (instancer levels stay)",
+          not any(o.name.startswith(f"vgeo.{proxy_uid}.") for o in bpy.data.objects))
 
 
 main()

@@ -295,6 +295,24 @@ extern "C" VGEO_API int vgeo_select_level(void* handle, int depth, uint64_t* chu
     return 0;
 }
 
+extern "C" VGEO_API int vgeo_level_errors(void* handle, float* out, int max_levels) {
+    Asset* a = static_cast<Asset*>(handle);
+    if (!a || !out || max_levels <= 0) return 0;
+    const int n = std::min<int>(max_levels, int(a->h.lod_levels));
+    std::vector<float> err(size_t(std::max(n, 1)), 0.f);
+    // clusters at depth L were produced by simplifying their refined group (depth L-1);
+    // that group's error bounds how far level L deviates from the source
+    for (uint32_t i = 0; i < a->h.cluster_count; ++i) {
+        const vgeo2::Cluster& c = a->clusters[i];
+        if (c.refined < 0 || int(c.depth) >= n) continue;
+        float e = a->groups[c.refined].error;
+        if (e < FLT_MAX) err[c.depth] = std::max(err[c.depth], e);
+    }
+    for (int L = 1; L < n; ++L) err[L] = std::max(err[L], err[L - 1]);  // monotonic
+    std::copy(err.begin(), err.begin() + n, out);
+    return n;
+}
+
 extern "C" VGEO_API int vgeo_extract(void* handle, uint32_t chunk, vgeo_chunk_data* out) {
     Asset* a = static_cast<Asset*>(handle);
     if (!a || !out || chunk >= a->h.chunk_count) return 1;

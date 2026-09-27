@@ -144,6 +144,8 @@ def lib():
     L.vgeo_extract.argtypes = [c.c_void_p, c.c_uint32, c.POINTER(ChunkData)]
     L.vgeo_export_web.argtypes = [c.c_void_p, c.c_char_p, c.POINTER(c.c_uint64), c.c_char_p, c.c_int]
     L.vgeo_export_web.restype = c.c_int
+    L.vgeo_level_errors.argtypes = [c.c_void_p, c.c_void_p, c.c_int]
+    L.vgeo_level_errors.restype = c.c_int
     _lib = L
     return L
 
@@ -276,6 +278,41 @@ class Asset:
         lib().vgeo_select_level(self._h, int(depth), _ptr(self.sigs), ctypes.byref(stats))
         self.last = stats
         return self.sigs
+
+    def level_errors(self):
+        """Geometric error (object units) of showing the asset at each uniform level."""
+        out = np.zeros(max(1, self.info["lod_levels"]), dtype=np.float32)
+        n = lib().vgeo_level_errors(self._h, _ptr(out), len(out))
+        return out[:n]
+
+    def level_mesh_data(self, depth):
+        """The whole asset at one uniform level, as one chunk-style dict (for instancing)."""
+        self.select_level(depth)
+        parts = [d for d in (self.extract(c) for c in range(self.chunk_count)) if d]
+        if not parts:
+            return None
+        out = {k: [] for k in ("positions", "normals", "uvs", "corner_verts", "face_materials", "face_lod",
+                               "edge_verts", "corner_edges")}
+        v_off = e_off = 0
+        for d in parts:
+            out["positions"].append(d["positions"])
+            out["normals"].append(d["normals"])
+            if d["uvs"] is not None:
+                out["uvs"].append(d["uvs"])
+            out["corner_verts"].append(d["corner_verts"] + v_off)
+            out["face_materials"].append(d["face_materials"])
+            out["face_lod"].append(d["face_lod"])
+            out["edge_verts"].append(d["edge_verts"] + v_off)
+            out["corner_edges"].append(d["corner_edges"] + e_off)
+            v_off += d["vertex_count"]
+            e_off += d["edge_count"]
+        res = {k: (np.concatenate(v) if v else None) for k, v in out.items()}
+        if len(out["uvs"]) != len(parts):
+            res["uvs"] = None
+        res["vertex_count"] = v_off
+        res["edge_count"] = e_off
+        res["tri_count"] = len(res["face_materials"])
+        return res
 
     def export_web(self, path):
         """Write the compact web variant (.vgeow); returns its size in bytes."""

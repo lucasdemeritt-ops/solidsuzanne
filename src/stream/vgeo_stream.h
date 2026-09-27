@@ -144,6 +144,12 @@ VGEO_API int vgeo_select(void* handle, const vgeo_view* views, int view_count,
 // Select the whole asset at a fixed DAG depth (-1 = coarsest, 0 = full detail).
 VGEO_API int vgeo_select_level(void* handle, int depth, uint64_t* chunk_sig, vgeo_cut_stats* stats);
 
+// Geometric error of drawing the whole asset at each uniform DAG level
+// (what vgeo_select_level(depth) shows): out[0] = 0, out[L] = largest
+// simplification error of the groups level L was simplified from. Writes
+// min(max_levels, lod_levels) values and returns that count.
+VGEO_API int vgeo_level_errors(void* handle, float* out, int max_levels);
+
 // Extract the currently selected geometry of one chunk.
 VGEO_API int vgeo_extract(void* handle, uint32_t chunk, vgeo_chunk_data* out);
 
