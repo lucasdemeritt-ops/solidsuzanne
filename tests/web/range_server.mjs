@@ -7,7 +7,9 @@ import { extname, join, normalize, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const TYPES = { ".html": "text/html", ".js": "text/javascript", ".mjs": "text/javascript", ".json": "application/json",
-  ".png": "image/png", ".wasm": "application/wasm" };
+  ".png": "image/png", ".wasm": "application/wasm", ".css": "text/css", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+  ".webp": "image/webp", ".svg": "image/svg+xml", ".webm": "video/webm", ".mp4": "video/mp4",
+  ".glb": "model/gltf-binary", ".gltf": "model/gltf+json" };
 
 export function startServer({ port = 8780, root = process.cwd(), ranges = true } = {}) {
   const stats = { requests: 0, bytes: 0, ranges: 0 };
